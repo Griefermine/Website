@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <meta
+      name="description"
+      content="Bot-Hub: Discord-Bots in Python, Java, JavaScript, Go, C#, Rust und mehr verwalten, starten und überwachen."
+    />
+    <title>Bot-Hub · Discord-Bots verwalten</title>
+  </head>
+  <body>
+    <div class="aurora" aria-hidden="true"></div>
+
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand__mark">◆</span>
+        <div>
+          <h1 class="brand__name">Bot-Hub</h1>
+          <p class="brand__sub">Mehrsprachige Discord-Bots zentral steuern</p>
+        </div>
+      </div>
+      <div class="topbar__actions">
+        <span id="connection" class="pill pill--idle">Verbinde …</span>
+        <button id="start-all" class="btn btn--ghost" type="button">
+          Alle starten
+        </button>
+        <button id="stop-all" class="btn btn--ghost" type="button">
+          Alle stoppen
+        </button>
+        <button id="new-bot" class="btn btn--primary" type="button">
+          + Bot anlegen
+        </button>
+      </div>
+    </header>
+
+    <section id="stats" class="stats" aria-label="Übersicht"></section>
+
+    <main class="layout">
+      <div class="panel">
+        <div class="panel__head">
+          <h2>Deine Bots</h2>
+          <div class="panel__tools">
+            <input
+              id="search"
+              class="input input--search"
+              type="search"
+              placeholder="Suchen …"
+              aria-label="Bots durchsuchen"
+            />
+            <div id="filters" class="chips">
+              <button class="chip is-active" data-filter="all" type="button">
+                Alle
+              </button>
+              <button class="chip" data-filter="running" type="button">
+                Läuft
+              </button>
+              <button class="chip" data-filter="stopped" type="button">
+                Gestoppt
+              </button>
+              <button class="chip" data-filter="crashed" type="button">
+                Abgestürzt
+              </button>
+            </div>
+          </div>
+        </div>
+        <div id="bot-grid" class="bot-grid"></div>
+        <div id="empty-state" class="empty" hidden>
+          <p class="empty__title">Noch keine Bots eingebunden</p>
+          <p class="empty__text">
+            Lege deinen ersten Bot an – wähle Python, JavaScript, Java, Kotlin,
+            Go, C#, Rust oder einen eigenen Startbefehl. Das Backend startet den
+            Prozess und streamt die Logs.
+          </p>
+          <button id="empty-new-bot" class="btn btn--primary" type="button">
+            Bot anlegen
+          </button>
+        </div>
+      </div>
+
+      <section id="log-panel" class="panel panel--logs">
+        <div class="panel__head">
+          <h2>Live-Logs <span id="log-source" class="panel__source"></span></h2>
+          <div class="panel__tools">
+            <select
+              id="log-scope"
+              class="input input--select"
+              aria-label="Bot auswählen"
+            ></select>
+            <select
+              id="log-level"
+              class="input input--select"
+              aria-label="Log-Level"
+            >
+              <option value="all">Alle Level</option>
+              <option value="error">Fehler</option>
+              <option value="warn">Warnungen</option>
+              <option value="info">Info</option>
+              <option value="debug">Debug</option>
+              <option value="system">System</option>
+            </select>
+            <button id="log-clear" class="btn btn--ghost btn--sm" type="button">
+              Leeren
+            </button>
+          </div>
+        </div>
+        <div id="log-view" class="log-view"></div>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <span
+        >Token bleiben lokal auf deinem Rechner – niemals im Browser
+        ausgeliefert.</span
+      >
+      <span
+        >Sprachen: Python · JavaScript · TypeScript · Java · Kotlin · Go · C# ·
+        Rust</span
+      >
+    </footer>
+
+    <div id="toasts" class="toasts" aria-live="polite"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

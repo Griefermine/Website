@@ -1,0 +1,26 @@
+{
+  "name": "bot-hub",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Moderne Weboberfläche, um Discord-Bots in verschiedenen Programmiersprachen zu verwalten, zu starten und zu überwachen.",
+  "scripts": {
+    "dev": "concurrently -n web,hub -c magenta,cyan \"vite\" \"node --watch server/index.js\"",
+    "dev:web": "vite",
+    "dev:hub": "node --watch server/index.js",
+    "build": "vite build",
+    "preview": "vite preview",
+    "start": "node server/index.js",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "node --test test/"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "prettier": "^3.3.1",
+    "vite": "^5.4.21"
+  },
+  "dependencies": {
+    "discord.js": "^14.27.0"
+  }
+}
