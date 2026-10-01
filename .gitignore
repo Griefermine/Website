@@ -28,3 +28,7 @@ dist-ssr
 *.sw?
 # Bot-Hub
 data
+dist/
+data/*
+node_modules/
+data/

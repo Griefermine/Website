@@ -173,11 +173,10 @@ const collectForm = (form, panel) => {
 /* ------------------------------------------------------------------ *
  * Bausteine
  * ------------------------------------------------------------------ */
-const pageUrl = (botId, href, token) =>
-  `/api/bots/${botId}/panel/file/${href
-    .split('/')
-    .map(encodeURIComponent)
-    .join('/')}#hub=${token}`;
+const standalonePageUrl = (botId, href) =>
+  `/api/bots/${encodeURIComponent(botId)}/panel/open?page=${encodeURIComponent(
+    href,
+  )}`;
 
 const code = (text) => el('pre', { class: 'code' }, el('code', {}, text));
 
@@ -205,6 +204,24 @@ const copyButton = (text) =>
 
 const section = (title, ...children) =>
   el('section', { class: 'panel__section' }, el('h3', {}, title), ...children);
+
+const openStandalonePage = (bot, panel) => {
+  const href = panel.entry || panel.pages[0]?.href;
+  if (!href) return false;
+  const page = window.open(
+    standalonePageUrl(bot.id, href),
+    '_blank',
+    'noopener,noreferrer',
+  );
+  if (!page) {
+    toast(
+      'Die Bot-Seite konnte nicht geöffnet werden. Bitte Pop-ups erlauben.',
+      'error',
+    );
+    return false;
+  }
+  return true;
+};
 
 /* ------------------------------------------------------------------ *
  * Reiter
@@ -473,7 +490,24 @@ const actionsTab = (bot, panel) => {
 /* ------------------------------------------------------------------ *
  * Fenster
  * ------------------------------------------------------------------ */
-export const openPanel = (bot) => {
+export const openPanel = (bot, permissions = []) => {
+  if (bot.panel?.entry || bot.panel?.pages?.length) {
+    const page = window.open(
+      standalonePageUrl(bot.id, bot.panel.entry || bot.panel.pages[0]?.href),
+      '_blank',
+      'noopener,noreferrer',
+    );
+    if (!page) {
+      toast(
+        'Die Bot-Seite konnte nicht geöffnet werden. Bitte Pop-ups erlauben.',
+        'error',
+      );
+      return;
+    }
+    return;
+  }
+
+  const canManage = permissions.includes('panel.manage');
   closePanel();
 
   const tabs = el('div', { class: 'chips chips--tabs' });
@@ -489,24 +523,26 @@ export const openPanel = (bot) => {
       { class: 'modal__head' },
       title,
       pill,
-      el(
-        'button',
-        {
-          class: 'icon-btn',
-          type: 'button',
-          title: 'Manifest neu einlesen',
-          onclick: async () => {
-            try {
-              await api.panelReload(bot.id);
-              await refresh();
-              toast('Manifest neu eingelesen', 'success');
-            } catch (error) {
-              toast(error.message, 'error');
-            }
-          },
-        },
-        '↻',
-      ),
+      canManage
+        ? el(
+            'button',
+            {
+              class: 'icon-btn',
+              type: 'button',
+              title: 'Manifest neu einlesen',
+              onclick: async () => {
+                try {
+                  await api.panelReload(bot.id);
+                  await refresh();
+                  toast('Manifest neu eingelesen', 'success');
+                } catch (error) {
+                  toast(error.message, 'error');
+                }
+              },
+            },
+            '↻',
+          )
+        : null,
       el(
         'button',
         { class: 'icon-btn', type: 'button', onclick: () => closePanel() },
@@ -518,20 +554,17 @@ export const openPanel = (bot) => {
   );
 
   let data = null;
-  let token = '';
   let active = 'link';
-  let frame = null;
-  let frameHost = null;
-  let frameBar = null;
 
   const options = () => {
     if (!data) return [];
     const items = [];
     if (data.entry || data.pages.length)
       items.push({ id: 'page', label: 'Seite' });
-    if (data.fields.length)
+    if (data.fields.length && canManage)
       items.push({ id: 'settings', label: 'Einstellungen' });
-    if (data.commands.length) items.push({ id: 'actions', label: 'Aktionen' });
+    if (data.commands.length && canManage)
+      items.push({ id: 'actions', label: 'Aktionen' });
     items.push({ id: 'link', label: 'Anbindung' });
     return items;
   };
@@ -556,31 +589,6 @@ export const openPanel = (bot) => {
     }
   };
 
-  const bridgePayload = () => ({
-    fields: data.fields,
-    settings: data.settings,
-    secrets: data.secrets,
-    state: data.state,
-    online: data.online,
-    // Nur die sichtbaren Angaben – der Pfad des Skripts bleibt im Hub.
-    commands: data.commands.map(({ id, label, description, danger }) => ({
-      id,
-      label,
-      description,
-      danger,
-    })),
-    bot: { id: bot.id, name: bot.name, emoji: bot.emoji },
-  });
-
-  /** Aktualisiert die eingebettete Seite, ohne sie neu zu laden. */
-  const pushToFrame = () => {
-    if (!frame?.isConnected || !data) return;
-    frame.contentWindow.postMessage(
-      { source: 'bot-hub', type: 'settings', payload: bridgePayload() },
-      '*',
-    );
-  };
-
   const render = () => {
     if (!data) {
       body.replaceChildren(
@@ -594,67 +602,46 @@ export const openPanel = (bot) => {
     renderTabs();
 
     if (active === 'page') {
-      const src = pageUrl(bot.id, data.entry || data.pages[0].href, token);
-      // Der Rahmen bleibt stehen, sonst lädt die Bot-Seite bei jedem Ereignis
-      // neu und verliert ihren Zustand.
-      if (!frameHost) {
-        frameBar = el('div', { class: 'panel__bar' });
-        frame = el('iframe', {
-          class: 'panel__frame',
-          title: `${bot.name} · eigene Seite`,
-          sandbox:
-            'allow-scripts allow-forms allow-modals allow-popups allow-downloads allow-pointer-lock',
-          referrerpolicy: 'no-referrer',
-        });
-        frameHost = el('div', { class: 'panel__stack' }, frameBar, frame);
-      }
-      frameBar.replaceChildren(
+      const buttons = [
         el(
-          'div',
-          { class: 'panel__tools' },
+          'button',
+          {
+            class: 'btn btn--primary',
+            type: 'button',
+            onclick: () => openStandalonePage(bot, data),
+          },
+          'Bot-Seite in eigener Seite öffnen',
+        ),
+      ];
+      if (data.pages.length > 1)
+        buttons.push(
           ...data.pages.map((page) =>
             el(
               'button',
               {
-                class: 'chip',
+                class: 'btn btn--ghost',
                 type: 'button',
                 onclick: () => {
-                  const next = pageUrl(bot.id, page.href, token);
-                  frame.dataset.src = next;
-                  frame.src = next;
+                  const next = { ...data, entry: page.href };
+                  openStandalonePage(bot, next);
                 },
               },
               page.label,
             ),
           ),
+        );
+      body.replaceChildren(
+        el(
+          'div',
+          { class: 'panel__stack' },
           el(
-            'button',
-            {
-              class: 'btn btn--sm btn--ghost',
-              type: 'button',
-              onclick: () => {
-                frame.src = frame.src;
-              },
-            },
-            'Neu laden',
+            'p',
+            { class: 'panel__text' },
+            'Die Bot-Seite wird aus Sicherheitsgründen als eigene, isolierte Webseite geöffnet.',
           ),
-          el(
-            'a',
-            {
-              class: 'btn btn--sm btn--ghost',
-              href: src,
-              target: '_blank',
-              rel: 'noopener',
-            },
-            'Neuer Tab',
-          ),
+          el('div', { class: 'panel__tools' }, ...buttons),
         ),
       );
-      if (frame.dataset.src !== src) {
-        frame.dataset.src = src;
-        frame.src = src;
-      }
-      if (frameHost.parentNode !== body) body.replaceChildren(frameHost);
       return;
     }
 
@@ -673,7 +660,6 @@ export const openPanel = (bot) => {
     try {
       const response = await api.panel(bot.id);
       data = response.panel;
-      token = response.bridge.token;
       pill.textContent = data.online ? 'Bot läuft' : 'Bot gestoppt';
       pill.className = `pill pill--${data.online ? 'ok' : 'idle'}`;
       render();
@@ -682,76 +668,16 @@ export const openPanel = (bot) => {
     }
   };
 
-  /* Brücke zur eingebetteten Seite – siehe bridge.js im Hub. */
-  const onMessage = async (event) => {
-    if (!frame || event.source !== frame.contentWindow) return;
-    const message = event.data ?? {};
-    if (message.source !== 'bot-hub-panel') return;
-    const send = (payload) =>
-      frame.contentWindow.postMessage(
-        { source: 'bot-hub', seq: message.seq, type: message.type, payload },
-        '*',
-      );
-
-    if (message.type === 'ready') {
-      frame.contentWindow.postMessage(
-        { source: 'bot-hub', type: 'hello', token, bot: { id: bot.id } },
-        '*',
-      );
-      send(bridgePayload());
-      return;
-    }
-
-    try {
-      if (message.type === 'settings:get') return send(bridgePayload());
-      if (message.type === 'settings:set') {
-        await api.panelSave(bot.id, message.values ?? {});
-        toast('Einstellungen gespeichert', 'success');
-        await refresh();
-        return send(bridgePayload());
-      }
-      if (message.type === 'command') {
-        const { result } = await api.panelCommand(
-          bot.id,
-          message.id,
-          message.args ?? {},
-        );
-        // Die Aktion kann Werte verändert haben – frisch laden und der Seite
-        // gleich den neuen Stand mitgeben, damit sie sich von selbst zieht.
-        await refresh();
-        return send({
-          ok: result.ok,
-          result: result.data ?? result,
-          payload: bridgePayload(),
-        });
-      }
-      if (message.type === 'state:set') {
-        await api.panelState(bot.id, message.state ?? {});
-        return send({ ok: true });
-      }
-      if (message.type === 'notify') {
-        toast(`${bot.emoji} ${message.message}`, message.kind ?? 'info');
-        return send({ ok: true });
-      }
-    } catch (error) {
-      send({ error: error.message });
-    }
-    return undefined;
-  };
-
   const unsubscribe = api.events((type, payload) => {
     if (!payload?.id || payload.id !== bot.id) return;
-    if (type === 'panel') refresh().then(pushToFrame);
+    if (type === 'panel') refresh();
     if (type === 'bot') {
       const running = payload.status === 'running';
       pill.textContent = running ? 'Bot läuft' : 'Bot gestoppt';
       pill.className = `pill pill--${running ? 'ok' : 'idle'}`;
     }
   });
-  window.addEventListener('message', onMessage);
-
   dialog.addEventListener('close', () => {
-    window.removeEventListener('message', onMessage);
     unsubscribe();
     dialog.remove();
     if (current?.dialog === dialog) current = null;

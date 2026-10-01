@@ -14,6 +14,7 @@ import { renderBots, renderStats } from './ui/dashboard.js';
 import { renderLogs } from './ui/logs.js';
 import { openBotForm } from './ui/botForm.js';
 import { openPanel } from './ui/panel.js';
+import { openAccess } from './ui/access.js';
 import { toast } from './ui/toast.js';
 
 const $ = (selector) => document.querySelector(selector);
@@ -68,6 +69,7 @@ const openForm = (bot) => {
 };
 
 const wireControls = () => {
+  $('#access').addEventListener('click', () => openAccess());
   $('#new-bot').addEventListener('click', () => openForm(null));
   $('#empty-new-bot').addEventListener('click', () => openForm(null));
 
@@ -100,7 +102,7 @@ const wireControls = () => {
         toast(`Installiere ${bot.framework} für ${bot.name} …`);
       });
     if (action === 'restart') return run(id, 'restart', button);
-    if (action === 'panel') return openPanel(bot);
+    if (action === 'panel') return openPanel(bot, getState().permissions);
     if (action === 'logs') {
       setState({ selectedBotId: state.selectedBotId === id ? null : id });
       document
@@ -195,6 +197,56 @@ const bootstrap = async () => {
   wireControls();
 
   try {
+    const auth = await api.authSession();
+    const accessButton = $('#access');
+    accessButton.hidden =
+      !auth.authenticated || !auth.permissions?.includes('access.manage');
+    setState({ permissions: auth.permissions ?? [] });
+    $('#new-bot').hidden = !auth.permissions?.includes('bots.manage');
+    $('#start-all').hidden = !auth.permissions?.includes('bots.control');
+    $('#stop-all').hidden = !auth.permissions?.includes('bots.control');
+    $('#log-panel').hidden = !auth.permissions?.includes('logs.read');
+    if (!auth.authenticated) {
+      document.body.classList.add('auth-required');
+      const account = $('#account');
+      account.hidden = false;
+      account.replaceChildren(
+        Object.assign(document.createElement('a'), {
+          className: 'btn btn--primary',
+          href: '/api/auth/discord/login',
+          textContent: 'Mit Discord einloggen',
+          title: auth.configured
+            ? 'Mit deinem Discord-Konto anmelden'
+            : 'DISCORD_CLIENT_ID und DISCORD_CLIENT_SECRET müssen serverseitig gesetzt werden',
+        }),
+      );
+      toast(
+        auth.configured
+          ? 'Bitte zuerst mit Discord einloggen.'
+          : 'Discord-Login ist noch nicht konfiguriert. Der Login-Button ist bereit.',
+        'error',
+      );
+      return;
+    }
+    const account = $('#account');
+    if (auth.authenticated) {
+      account.hidden = false;
+      account.replaceChildren(
+        Object.assign(document.createElement('span'), {
+          className: 'account__name',
+          textContent: `${auth.user.name} ·`,
+        }),
+        Object.assign(document.createElement('button'), {
+          className: 'btn btn--ghost btn--sm',
+          type: 'button',
+          textContent: 'Abmelden',
+        }),
+      );
+      account.querySelector('button').addEventListener('click', async () => {
+        await api.authLogout();
+        location.reload();
+      });
+    }
     const [{ languages }, { bots }] = await Promise.all([
       api.languages(),
       api.list(),
