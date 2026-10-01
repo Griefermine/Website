@@ -47,6 +47,7 @@ const waitForStatus = async (id, wanted, timeout = 30000) => {
 };
 
 before(async () => {
+  process.env.BOT_HUB_TEST_MODE = '1';
   root = mkdtempSync(join(tmpdir(), 'bot-hub-'));
   mkdirSync(join(root, 'worker'));
   writeFileSync(

@@ -29,6 +29,7 @@ import {
   statSync,
   unlinkSync,
   writeFileSync,
+  realpathSync,
 } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { httpError, MIME, readBody, sendJson, MASK } from './util.js';
@@ -82,9 +83,20 @@ const manifestCache = new Map();
 const botStreams = new Map();
 const discordAuthStates = new Map();
 const discordSessions = new Map();
+const discordPanelSessions = new Map();
 const DISCORD_API = 'https://discord.com/api/v10';
 const DISCORD_MANAGE_GUILD = 0x20n;
 const DISCORD_ADMINISTRATOR = 0x8n;
+const cleanupTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of discordAuthStates) {
+    if (value.expiresAt <= now) discordAuthStates.delete(key);
+  }
+  for (const [key, value] of discordSessions) {
+    if (value.expiresAt <= now) discordSessions.delete(key);
+  }
+}, 60_000);
+cleanupTimer.unref();
 
 /** Token für den laufenden Prozess – wird bei jedem Start neu vergeben. */
 export const issueRuntimeToken = (id) => {
@@ -132,7 +144,18 @@ const readToken = (req, url) => {
     return header.replace(/^bearer\s+/i, '').trim();
   const custom = req.headers['x-bot-hub-token'];
   if (custom) return String(custom).trim();
-  return String(url.searchParams.get('token') ?? '').trim();
+  const cookieName = `bot_hub_panel_access_${url.pathname.split('/')[3] ?? ''}`;
+  const cookieToken = String(req.headers.cookie ?? '')
+    .split(';')
+    .map((part) => part.trim().split('='))
+    .find(([key]) => key === cookieName)?.[1];
+  if (cookieToken) return cookieToken;
+  if (
+    process.env.NODE_ENV !== 'production' &&
+    process.env.BOT_HUB_ALLOW_QUERY_TOKEN === '1'
+  )
+    return String(url.searchParams.get('token') ?? '').trim();
+  return '';
 };
 
 /** Ermittelt, welcher Bot zu einer Anfrage gehört (Laufzeit- oder Panel-Token). */
@@ -154,7 +177,9 @@ export const hubBaseUrl = () =>
 const parseDotenv = (content) => {
   const values = {};
   for (const line of String(content).split(/\r?\n/)) {
-    const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+    const match = line.match(
+      /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/,
+    );
     if (!match) continue;
     let value = match[2].trim();
     if (
@@ -164,7 +189,10 @@ const parseDotenv = (content) => {
     ) {
       value = value.slice(1, -1);
       if (match[2].trim().startsWith('"'))
-        value = value.replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+        value = value
+          .replace(/\\n/g, '\n')
+          .replace(/\\"/g, '"')
+          .replace(/\\\\/g, '\\');
     } else {
       value = value.replace(/\s+#.*$/, '').trim();
     }
@@ -177,7 +205,10 @@ const discordConfig = (bot) => {
   // OAuth credentials belong to the bot panel, not to the hub globally.
   // Only the Python Echo panel is currently allowed to use Discord OAuth.
   const pythonBotDir = resolve(projectRoot(), 'bots/python-echo');
-  if (resolve(projectRoot(), bot.cwd || '.') !== pythonBotDir || bot.language !== 'python')
+  if (
+    resolve(projectRoot(), bot.cwd || '.') !== pythonBotDir ||
+    bot.language !== 'python'
+  )
     return { clientId: '', clientSecret: '' };
   const envPath = join(botDir(bot), '.env');
   try {
@@ -188,7 +219,10 @@ const discordConfig = (bot) => {
     };
   } catch (error) {
     if (error.code !== 'ENOENT')
-      console.error('[hub] Discord-Konfiguration konnte nicht gelesen werden:', error.message);
+      console.error(
+        '[hub] Discord-Konfiguration konnte nicht gelesen werden:',
+        error.message,
+      );
     return { clientId: '', clientSecret: '' };
   }
 };
@@ -199,10 +233,39 @@ const discordCookie = (req, botId) =>
     .map((part) => part.trim().split('='))
     .find(([key]) => key === `bot_hub_panel_${botId}`)?.[1] ?? '';
 
+const panelSessionKey = (req, botId) => {
+  const header = String(req.headers['x-bot-hub-token'] ?? '');
+  const cookieName = `bot_hub_panel_access_${botId}`;
+  const cookie = String(req.headers.cookie ?? '')
+    .split(';')
+    .map((part) => part.trim().split('='))
+    .find(([key]) => key === cookieName)?.[1];
+  const candidate = header || cookie || '';
+  const token = panelTokens.get(botId);
+  return token && sameToken(candidate, token) ? `${botId}:${token}` : '';
+};
+
 const discordSession = (req, botId) => {
-  const session = discordSessions.get(discordCookie(req, botId));
+  const cookieId = discordCookie(req, botId);
+  const sessionId =
+    cookieId || discordPanelSessions.get(panelSessionKey(req, botId));
+  const session = discordSessions.get(sessionId);
+  if (session?.expiresAt <= Date.now()) {
+    discordSessions.delete(sessionId);
+    const key = panelSessionKey(req, botId);
+    if (discordPanelSessions.get(key) === sessionId)
+      discordPanelSessions.delete(key);
+    return null;
+  }
   return session?.expiresAt > Date.now() ? session : null;
 };
+
+const panelCookie = (botId, value, maxAge = 7 * 24 * 60 * 60) =>
+  `bot_hub_panel_${botId}=${value}; Max-Age=${maxAge}; Path=/api/bots/${encodeURIComponent(
+    botId,
+  )}/panel; HttpOnly; SameSite=Lax${
+    process.env.NODE_ENV === 'production' ? '; Secure' : ''
+  }`;
 
 const discordGuildAllowed = (guild) => {
   try {
@@ -235,12 +298,7 @@ const botGuilds = async (bot) => {
 const discordOrigin = (req) => {
   const configured = String(process.env.BOT_HUB_URL ?? '').trim();
   if (configured) return configured.replace(/\/+$/, '');
-  const forwardedProto = String(req.headers['x-forwarded-proto'] ?? '')
-    .split(',')[0]
-    .trim();
-  const protocol = forwardedProto || (req.socket.encrypted ? 'https' : 'http');
-  const host = String(req.headers.host ?? '127.0.0.1:8787');
-  return `${protocol}://${host}`;
+  return `http://127.0.0.1:${process.env.PORT || 8787}`;
 };
 
 const panelDiscordAuth = async (bot, req, res, url, rest) => {
@@ -252,14 +310,22 @@ const panelDiscordAuth = async (bot, req, res, url, rest) => {
       redirectUri,
     });
   if (rest === 'discord/login' && req.method === 'GET') {
+    const panelKey = panelSessionKey(req, bot.id);
+    if (!panelKey) throw httpError(403, 'Panel-Token erforderlich');
     if (!clientId || !clientSecret)
       throw httpError(
         503,
         'Discord-Login ist für dieses Panel nicht konfiguriert',
       );
     const state = randomBytes(24).toString('hex');
+    const codeVerifier = randomBytes(32).toString('base64url');
+    const codeChallenge = createHash('sha256')
+      .update(codeVerifier)
+      .digest('base64url');
     discordAuthStates.set(state, {
       botId: bot.id,
+      panelKey,
+      codeVerifier,
       expiresAt: Date.now() + 10 * 60 * 1000,
     });
     const params = new URLSearchParams({
@@ -268,6 +334,8 @@ const panelDiscordAuth = async (bot, req, res, url, rest) => {
       response_type: 'code',
       scope: 'identify guilds',
       state,
+      code_challenge: codeChallenge,
+      code_challenge_method: 'S256',
       prompt: 'consent',
     });
     res.writeHead(302, {
@@ -282,6 +350,7 @@ const panelDiscordAuth = async (bot, req, res, url, rest) => {
     if (
       !state ||
       state.botId !== bot.id ||
+      state.panelKey !== panelSessionKey(req, bot.id) ||
       state.expiresAt <= Date.now() ||
       !code
     )
@@ -295,6 +364,7 @@ const panelDiscordAuth = async (bot, req, res, url, rest) => {
         grant_type: 'authorization_code',
         code,
         redirect_uri: redirectUri,
+        code_verifier: state.codeVerifier,
       }),
     });
     if (!tokenResponse.ok) throw httpError(502, 'Discord-Login fehlgeschlagen');
@@ -323,9 +393,11 @@ const panelDiscordAuth = async (bot, req, res, url, rest) => {
         })),
       expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
     });
+    const key = panelSessionKey(req, bot.id);
+    if (key) discordPanelSessions.set(key, sessionId);
     res.writeHead(302, {
       location: `/api/bots/${bot.id}/panel/file/panel/index.html?discord=connected`,
-      'set-cookie': `bot_hub_panel_${bot.id}=${sessionId}; Max-Age=604800; Path=/; HttpOnly; SameSite=Lax`,
+      'set-cookie': panelCookie(bot.id, sessionId),
     });
     return res.end();
   }
@@ -338,14 +410,69 @@ const panelDiscordAuth = async (bot, req, res, url, rest) => {
     });
   }
   if (rest === 'discord/logout' && req.method === 'POST') {
-    discordSessions.delete(discordCookie(req, bot.id));
-    res.setHeader(
-      'set-cookie',
-      `bot_hub_panel_${bot.id}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax`,
-    );
+    const sessionId =
+      discordCookie(req, bot.id) ||
+      discordPanelSessions.get(panelSessionKey(req, bot.id));
+    discordSessions.delete(sessionId);
+    const key = panelSessionKey(req, bot.id);
+    if (discordPanelSessions.get(key) === sessionId)
+      discordPanelSessions.delete(key);
+    res.setHeader('set-cookie', panelCookie(bot.id, '', 0));
     return sendJson(res, 200, { ok: true });
   }
   return false;
+};
+
+/**
+ * Verknüpft die zentrale Hub-Sitzung mit dem Panel, ohne OAuth-Codes oder
+ * Discord-Access-Tokens an die Bot-Seite zu übergeben.
+ */
+export const linkHubDiscordSession = async (
+  bot,
+  req,
+  res,
+  authSession,
+  panelAccessToken = '',
+) => {
+  if (!authSession?.user) return;
+  const cookieSessionId = discordCookie(req, bot.id);
+  const existing = discordSession(req, bot.id);
+  const panelKey = panelAccessToken
+    ? `${bot.id}:${panelAccessToken}`
+    : panelSessionKey(req, bot.id);
+  if (existing?.user?.id === authSession.user.id) {
+    const existingId =
+      cookieSessionId || discordPanelSessions.get(panelSessionKey(req, bot.id));
+    if (panelKey && existingId) discordPanelSessions.set(panelKey, existingId);
+    return;
+  }
+
+  const installedGuildIds = await botGuilds(bot);
+  const sessionId = randomUUID();
+  discordSessions.set(sessionId, {
+    user: {
+      id: authSession.user.id,
+      name: authSession.user.name,
+      username: authSession.user.username,
+      avatar: authSession.user.avatar ?? null,
+    },
+    guilds: (authSession.guilds ?? [])
+      .filter(discordGuildAllowed)
+      .filter((guild) => installedGuildIds.has(String(guild.id)))
+      .map(({ id, name, icon, owner, permissions }) => ({
+        id,
+        name,
+        icon: icon ?? null,
+        owner: Boolean(owner),
+        permissions: String(permissions ?? '0'),
+      })),
+    expiresAt: Math.min(
+      authSession.expiresAt,
+      Date.now() + 7 * 24 * 60 * 60 * 1000,
+    ),
+  });
+  if (panelKey) discordPanelSessions.set(panelKey, sessionId);
+  res.setHeader('set-cookie', panelCookie(bot.id, sessionId));
 };
 
 /* ------------------------------------------------------------------ *
@@ -434,11 +561,33 @@ const normaliseField = (raw) => {
 const normaliseCommand = (raw) => {
   const id = slug(raw?.id);
   if (!id) return null;
+  const structured = typeof raw?.executable === 'string';
+  const executable = text(raw?.executable, 120);
+  const args = Array.isArray(raw?.args)
+    ? raw.args.filter((arg) => typeof arg === 'string').map((arg) => text(arg, 240))
+    : [];
+  const legacy = text(raw?.run, 400);
+  const commandText = structured
+    ? [executable, ...args].join(' ')
+    : legacy;
+  if (/[;&|`$<>]/.test(commandText)) return null;
+  const parsed = structured
+    ? { executable, args }
+    : (() => {
+        const parts = commandText.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+        return {
+          executable: parts.shift()?.replace(/^(['"])|(['"])$/g, '') ?? '',
+          args: parts.map((part) => part.replace(/^(['"])|(['"])$/g, '')),
+        };
+      })();
+  if (!parsed.executable && commandText) return null;
   return {
     id,
     label: text(raw?.label, 60) || id,
     description: text(raw?.description, 200),
-    run: safeRelPath(raw?.run),
+    run: commandText,
+    executable: parsed.executable,
+    args: parsed.args,
     danger: Boolean(raw?.danger),
   };
 };
@@ -489,8 +638,9 @@ const projectRoot = () =>
   resolve(process.env.BOT_DASHBOARD_ROOT || process.cwd());
 
 const botDir = (bot) => {
-  const dir = resolve(projectRoot(), bot.cwd || '.');
-  const rel = relative(projectRoot(), dir);
+  const root = realpathSync(projectRoot());
+  const dir = realpathSync(resolve(root, bot.cwd || '.'));
+  const rel = relative(root, dir);
   if (rel.startsWith('..') || isAbsolute(rel))
     throw httpError(400, 'Arbeitsordner liegt außerhalb des Projekts');
   return dir;
@@ -935,7 +1085,26 @@ const runScript = (bot, command, args) =>
   new Promise((resolveRun) => {
     const dir = botDir(bot);
     const settings = effectiveSettings(bot);
-    const child = spawn('/bin/sh', ['-c', command.run], {
+    const executable = command.executable;
+    const commandArgs = command.args ?? [];
+    if (
+      isAbsolute(executable) ||
+      executable.includes('..') ||
+      commandArgs.some(
+        (arg) =>
+          isAbsolute(arg) ||
+          arg.split(/[\\/]/).includes('..') ||
+          /[;&|`$<>]/.test(arg),
+      )
+    ) {
+      resolveRun({
+        ok: false,
+        via: 'script',
+        error: 'Panel-Befehl enthält einen unzulässigen Pfad oder Shell-Operator',
+      });
+      return;
+    }
+    const child = spawn(executable, commandArgs, {
       cwd: dir,
       env: {
         ...envFor(bot, dir),
@@ -1109,21 +1278,61 @@ const sendFile = (res, path) => {
     'content-length': stat.size,
     'cache-control': 'no-store',
     'x-content-type-options': 'nosniff',
-    // Das iframe läuft in einer Sandbox (opake Origin), daher darf hier nichts
-    // auf 'self' eingeschränkt werden – die Sandbox ist die Absicherung.
+    // Panel-Dateien bleiben auch dann in einer opaken Origin, wenn jemand sie
+    // direkt statt im Dashboard-iframe öffnet.
     'content-security-policy':
-      "default-src * 'unsafe-inline' data: blob:; base-uri 'none'; frame-ancestors 'self'",
+      "sandbox allow-scripts allow-forms allow-modals allow-popups allow-downloads allow-pointer-lock; default-src 'none'; script-src 'self' 'unsafe-inline' https:; style-src 'self' 'unsafe-inline' https:; connect-src 'self' http: https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; base-uri 'none'; frame-ancestors 'self'",
   });
   res.end(readFileSync(path));
 };
 
-const servePanelFile = (bot, res, rest) => {
+const servePanelFile = (bot, res, rest, publicStatic = false) => {
   const rel = safeRelPath(decodeURIComponent(rest));
   if (!rel) throw httpError(400, 'Ungültiger Pfad');
-  const dir = botDir(bot);
-  const target = join(dir, rel);
+  if (publicStatic) {
+    const ext = rel.slice(rel.lastIndexOf('.')).toLowerCase();
+    if (
+      !new Set([
+        '.html',
+        '.css',
+        '.js',
+        '.mjs',
+        '.svg',
+        '.woff2',
+        '.png',
+        '.jpg',
+        '.jpeg',
+        '.gif',
+        '.webp',
+        '.ico',
+      ]).has(ext)
+    )
+      throw httpError(404, 'Datei nicht gefunden');
+    const entry =
+      bot.panel?.manifest?.entry || bot.panel?.manifest?.pages?.[0]?.href || '';
+    const root = entry.includes('/') ? entry.split('/')[0] : '';
+    if (root && rel !== root && !rel.startsWith(`${root}/`))
+      throw httpError(404, 'Datei nicht gefunden');
+  }
+  let dir;
+  let target;
+  try {
+    dir = realpathSync(botDir(bot));
+    target = realpathSync(join(dir, rel));
+  } catch {
+    throw httpError(404, 'Datei nicht gefunden');
+  }
   const inside = relative(dir, target);
-  if (inside.startsWith('..') || isAbsolute(inside))
+  const parts = inside.split(/[\\/]/);
+  const sensitiveName =
+    /^(?:\.env(?:\..*)?|\.git|\.npmrc|\.pypirc|id_(?:rsa|ed25519)|authorized_keys|known_hosts|.*(?:secret|credential|password|token).*)$/i;
+  if (
+    !inside ||
+    inside.startsWith('..') ||
+    isAbsolute(inside) ||
+    parts.some((part) => part.startsWith('.') || sensitiveName.test(part)) ||
+    /\.(?:pem|key|p12|pfx|jks|keystore)$/i.test(target)
+  )
     throw httpError(400, 'Ungültiger Pfad');
   sendFile(res, target);
 };
@@ -1176,6 +1385,7 @@ const request = async (url, method, body) => {
   const response = await fetch(url, {
     method,
     headers: { 'content-type': 'application/json', 'x-bot-hub-token': token },
+    credentials: 'include',
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const raw = await response.text();
@@ -1244,6 +1454,15 @@ const direct = {
     await request('/api/hub/notify', 'POST', { message, kind });
     return { ok: true };
   },
+  async 'discord:config'() {
+    return request(base + '/discord/config', 'GET');
+  },
+  async 'discord:session'() {
+    return request(base + '/discord/session', 'GET');
+  },
+  async 'discord:logout'() {
+    return request(base + '/discord/logout', 'POST', {});
+  },
 };
 
 const call = (type, extra) =>
@@ -1251,19 +1470,20 @@ const call = (type, extra) =>
 
 /* Der eigene Tab hört auf denselben Ereignisstrom wie das Dashboard und meldet
  * Änderungen über window – so verarbeitet die Seite beides gleich. */
-if (!embedded && typeof EventSource === 'function') {
-  new EventSource('/api/events').addEventListener('panel', (event) => {
-    let data;
+if (!embedded) {
+  let refreshing = false;
+  setInterval(async () => {
+    if (refreshing) return;
+    refreshing = true;
     try {
-      data = JSON.parse(event.data ?? '{}');
+      const payload = await direct['settings:get']();
+      if (payload) window.postMessage({ source: 'bot-hub', type: 'settings', payload }, '*');
     } catch {
-      return;
+      // Die Seite bleibt benutzbar, auch wenn der Bot vorübergehend stoppt.
+    } finally {
+      refreshing = false;
     }
-    if (data.id !== botId) return;
-    // Der Hub schickt entweder das ganze Panel oder nur neue Live-Werte.
-    const payload = view(data.panel ?? (last ? { ...last, state: data.state } : null));
-    if (payload) window.postMessage({ source: 'bot-hub', type: 'settings', payload }, '*');
-  });
+  }, 5000);
 }
 
 export const hub = {
@@ -1275,6 +1495,9 @@ export const hub = {
   command: (id, args = {}) => call('command', { id, args }),
   state: (state) => call('state:set', { state }),
   notify: (message, kind = 'info') => call('notify', { message, kind }),
+  discordConfig: () => call('discord:config'),
+  discordSession: () => call('discord:session'),
+  discordLogout: () => call('discord:logout'),
 };
 
 if (embedded) parent.postMessage({ source: 'bot-hub-panel', type: 'ready' }, '*');
@@ -1283,7 +1506,15 @@ if (embedded) parent.postMessage({ source: 'bot-hub-panel', type: 'ready' }, '*'
 /* ------------------------------------------------------------------ *
  * Routen: /api/bots/:id/panel/...
  * ------------------------------------------------------------------ */
-export const handlePanelRoutes = async (bot, req, res, url) => {
+export const handlePanelRoutes = async (
+  bot,
+  req,
+  res,
+  url,
+  authSession = null,
+  panelTokenAuth = false,
+  publicStatic = false,
+) => {
   const parts = url.pathname.split('/').filter(Boolean).slice(3); // ohne api/bots/:id
   if (parts[0] === 'panel') parts.shift();
   const rest = parts.join('/');
@@ -1292,7 +1523,25 @@ export const handlePanelRoutes = async (bot, req, res, url) => {
   const authResult = await panelDiscordAuth(bot, req, res, url, rest);
   if (authResult !== false) return authResult;
 
-  if (req.method === 'GET' && !rest)
+  if (
+    panelTokenAuth &&
+    !(
+      (req.method === 'GET' &&
+        (!rest ||
+          rest === 'settings' ||
+          rest === 'discord/session' ||
+          rest === 'discord/config' ||
+          rest === 'bridge.js' ||
+          rest.startsWith('file/'))) ||
+      (req.method === 'PUT' && (rest === 'settings' || rest === 'state')) ||
+      (req.method === 'POST' &&
+        (rest === 'discord/logout' || rest.startsWith('commands/')))
+    )
+  )
+    throw httpError(403, 'Diese Panel-Aktion ist nur im Dashboard erlaubt');
+
+  if (req.method === 'GET' && !rest) {
+    await linkHubDiscordSession(bot, req, res, authSession);
     return sendJson(res, 200, {
       panel: publicPanel(bot),
       // Für die Bot-Seite im neuen Tab: sie hat kein Elternfenster und braucht
@@ -1304,6 +1553,7 @@ export const handlePanelRoutes = async (bot, req, res, url) => {
         base: `/api/bots/${bot.id}/panel`,
       },
     });
+  }
 
   if (req.method === 'POST' && rest === 'reload') {
     const path = bot.panel?.path;
@@ -1332,7 +1582,7 @@ export const handlePanelRoutes = async (bot, req, res, url) => {
   }
 
   if (req.method === 'GET' && rest === 'settings')
-    return sendJson(res, 200, { settings: effectiveSettings(bot) });
+    return sendJson(res, 200, { settings: publicSettings(bot) });
 
   if (req.method === 'PUT' && rest === 'state') {
     const body = await readBody(req);
@@ -1356,7 +1606,7 @@ export const handlePanelRoutes = async (bot, req, res, url) => {
   }
 
   if (req.method === 'GET' && rest.startsWith('file/'))
-    return servePanelFile(bot, res, rest.slice('file/'.length));
+    return servePanelFile(bot, res, rest.slice('file/'.length), publicStatic);
 
   throw httpError(405, 'Methode nicht erlaubt');
 };
@@ -1364,7 +1614,7 @@ export const handlePanelRoutes = async (bot, req, res, url) => {
 /* ------------------------------------------------------------------ *
  * Routen: /api/hub/... (Aufrufer ist der Bot selbst)
  * ------------------------------------------------------------------ */
-const sessionOf = (bot) => ({
+const sessionOf = (bot, runtime) => ({
   bot: {
     id: bot.id,
     name: bot.name,
@@ -1379,7 +1629,7 @@ const sessionOf = (bot) => ({
   panelUrl: `${hubBaseUrl()}/api/bots/${bot.id}/panel`,
   manifestPath: bot.panel?.path ?? '',
   source: bot.panel?.source ?? null,
-  settings: effectiveSettings(bot),
+  settings: runtime ? effectiveSettings(bot) : publicSettings(bot),
   panelToken: panelToken(bot.id),
   commands: (bot.panel?.manifest?.commands ?? []).map(
     ({ id, label, description, danger }) => ({
@@ -1405,7 +1655,7 @@ export const handleHubRoutes = async (req, res, url, getBot) => {
   const runtime = identity.scope === 'runtime';
 
   if (req.method === 'GET' && (rest === '' || rest === '/session'))
-    return sendJson(res, 200, sessionOf(bot));
+    return sendJson(res, 200, sessionOf(bot, runtime));
 
   if (req.method === 'GET' && rest === '/settings')
     return sendJson(res, 200, {

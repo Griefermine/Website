@@ -5,13 +5,14 @@ const parts = location.pathname.split('/').filter(Boolean);
 const botId = parts[0] === 'api' && parts[1] === 'bots' ? parts[2] : '';
 const bridgeUrl = `/api/bots/${botId}/panel/bridge.js`;
 const panelBase = `/api/bots/${botId}/panel`;
+let discordPopup = null;
 const oauthComplete =
   new URLSearchParams(location.search).get('discord') === 'connected';
 
 if (oauthComplete && window.opener) {
   window.opener.postMessage(
     { source: 'python-panel-discord', type: 'connected' },
-    '*',
+    'null',
   );
   window.close();
 }
@@ -64,15 +65,11 @@ const cleared = new Set();
 const busy = new Set();
 let roles = [];
 
-const discordRequest = async (path, options = {}) => {
-  const response = await fetch(`${panelBase}/discord/${path}`, {
-    credentials: 'include',
-    ...options,
-  });
-  const data = await response.json();
-  if (!response.ok)
-    throw new Error(data.error ?? 'Discord-Anfrage fehlgeschlagen');
-  return data;
+const discordRequest = async (path) => {
+  if (path === 'config') return hub.discordConfig();
+  if (path === 'session') return hub.discordSession();
+  if (path === 'logout') return hub.discordLogout();
+  throw new Error('Unbekannte Discord-Anfrage');
 };
 
 const renderDiscord = (session) => {
@@ -104,7 +101,7 @@ const renderDiscord = (session) => {
     ),
   );
   userRow.lastElementChild.addEventListener('click', async () => {
-    await discordRequest('logout', { method: 'POST' });
+    await discordRequest('logout');
     renderDiscord({ authenticated: false, guilds: [] });
   });
   list.replaceChildren(
@@ -918,6 +915,7 @@ const startDiscordLogin = async () => {
       return;
     }
     if (popup) {
+      discordPopup = popup;
       popup.location.href = `${panelBase}/discord/login`;
       popup.focus();
     } else {
@@ -938,10 +936,13 @@ $('discord-modal-x').addEventListener('click', () => {
 });
 window.addEventListener('message', (event) => {
   if (
+    event.source !== discordPopup ||
+    event.origin !== 'null' ||
     event.data?.source !== 'python-panel-discord' ||
     event.data?.type !== 'connected'
   )
     return;
+  discordPopup = null;
   $('discord-modal').hidden = true;
   loadDiscord();
 });
@@ -981,12 +982,22 @@ window.addEventListener('message', (event) => {
 try {
   ({ hub } = await import(bridgeUrl));
   log('bridge.js geladen.', 'ok');
-  await load();
-  await loadDiscord();
 } catch (error) {
   $('conn').replaceChildren(h('span', { class: 'dot' }), 'Brücke fehlt');
   $('banner').hidden = false;
   $('banner-text').textContent =
     `bridge.js nicht erreichbar (${error.message}).`;
+  log(error.message, 'bad');
+}
+
+try {
+  if (!hub) throw new Error('Panel-Brücke konnte nicht initialisiert werden');
+  await load();
+  await loadDiscord();
+} catch (error) {
+  $('conn').replaceChildren(h('span', { class: 'dot' }), 'Anmeldung fehlt');
+  $('banner').hidden = false;
+  $('banner-text').textContent =
+    `Panel-Daten konnten nicht geladen werden (${error.message}).`;
   log(error.message, 'bad');
 }

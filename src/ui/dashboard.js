@@ -21,6 +21,7 @@ const DEPS_META = {
 };
 
 const BUSY = new Set(['checking', 'installing', 'restarting']);
+const can = (permissions, permission) => permissions.includes(permission);
 
 const statCard = (label, value, hint, tone = '') =>
   el(
@@ -35,6 +36,7 @@ const botCard = (bot, language, selected) => {
   const status = STATUS_META[bot.status] ?? STATUS_META.stopped;
   const deps = DEPS_META[bot.depsStatus] ?? DEPS_META.unknown;
   const busy = BUSY.has(bot.status);
+  const permissions = getState().permissions;
   return el(
     'article',
     {
@@ -67,7 +69,7 @@ const botCard = (bot, language, selected) => {
     bot.description
       ? el('p', { class: 'bot-card__desc' }, bot.description)
       : null,
-    bot.panel?.available
+    bot.panel?.available && can(permissions, 'panel.read')
       ? el(
           'button',
           {
@@ -122,15 +124,17 @@ const botCard = (bot, language, selected) => {
     el(
       'footer',
       { class: 'bot-card__actions' },
-      el(
-        'button',
-        {
-          class: `btn btn--sm ${bot.status === 'running' ? 'btn--danger' : 'btn--primary'}`,
-          dataset: { action: 'toggle', id: bot.id },
-        },
-        bot.status === 'running' ? 'Stoppen' : 'Starten',
-      ),
-      language?.check
+      can(permissions, 'bots.control')
+        ? el(
+            'button',
+            {
+              class: `btn btn--sm ${bot.status === 'running' ? 'btn--danger' : 'btn--primary'}`,
+              dataset: { action: 'toggle', id: bot.id },
+            },
+            bot.status === 'running' ? 'Stoppen' : 'Starten',
+          )
+        : null,
+      language?.check && can(permissions, 'bots.manage')
         ? el(
             'button',
             {
@@ -141,46 +145,56 @@ const botCard = (bot, language, selected) => {
             'Libs installieren',
           )
         : null,
-      el(
-        'button',
-        {
-          class: 'btn btn--sm btn--ghost',
-          dataset: { action: 'restart', id: bot.id },
-        },
-        'Neustart',
-      ),
-      el(
-        'button',
-        {
-          class: 'btn btn--sm btn--ghost',
-          dataset: { action: 'logs', id: bot.id },
-        },
-        'Logs',
-      ),
-      el(
-        'button',
-        {
-          class: 'btn btn--sm btn--ghost',
-          dataset: { action: 'panel', id: bot.id },
-        },
-        'Eigene Seite',
-      ),
-      el(
-        'button',
-        {
-          class: 'btn btn--sm btn--ghost',
-          dataset: { action: 'edit', id: bot.id },
-        },
-        'Bearbeiten',
-      ),
-      el(
-        'button',
-        {
-          class: 'btn btn--sm btn--ghost btn--danger-ghost',
-          dataset: { action: 'delete', id: bot.id },
-        },
-        'Löschen',
-      ),
+      can(permissions, 'bots.restart')
+        ? el(
+            'button',
+            {
+              class: 'btn btn--sm btn--ghost',
+              dataset: { action: 'restart', id: bot.id },
+            },
+            'Neustart',
+          )
+        : null,
+      can(permissions, 'logs.read')
+        ? el(
+            'button',
+            {
+              class: 'btn btn--sm btn--ghost',
+              dataset: { action: 'logs', id: bot.id },
+            },
+            'Logs',
+          )
+        : null,
+      can(permissions, 'panel.read')
+        ? el(
+            'button',
+            {
+              class: 'btn btn--sm btn--ghost',
+              dataset: { action: 'panel', id: bot.id },
+            },
+            'Eigene Seite',
+          )
+        : null,
+      can(permissions, 'bots.manage')
+        ? el(
+            'button',
+            {
+              class: 'btn btn--sm btn--ghost',
+              dataset: { action: 'edit', id: bot.id },
+            },
+            'Bearbeiten',
+          )
+        : null,
+      can(permissions, 'bots.delete')
+        ? el(
+            'button',
+            {
+              class: 'btn btn--sm btn--ghost btn--danger-ghost',
+              dataset: { action: 'delete', id: bot.id },
+            },
+            'Löschen',
+          )
+        : null,
     ),
   );
 };
@@ -227,5 +241,11 @@ export const renderBots = () => {
       ),
     );
   }
-  if (empty) empty.hidden = bots.length > 0;
+  if (empty) {
+    empty.hidden =
+      bots.length > 0 || !state.permissions.includes('bots.manage');
+    const emptyButton = document.getElementById('empty-new-bot');
+    if (emptyButton)
+      emptyButton.hidden = !state.permissions.includes('bots.manage');
+  }
 };

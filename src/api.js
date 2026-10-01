@@ -45,6 +45,13 @@ const openStream = () => {
 };
 
 export const api = {
+  authSession: () => request('/auth/session'),
+  authLogout: () => request('/auth/logout', { method: 'POST' }),
+  access: () => request('/access'),
+  updateAccess: (id, body) =>
+    request(`/access/${encodeURIComponent(id)}`, { method: 'PATCH', body }),
+  removeAccess: (id) =>
+    request(`/access/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   health: () => request('/health'),
   languages: () => request('/languages'),
   list: () => request('/bots'),
@@ -62,6 +69,10 @@ export const api = {
     request(`${id ? `/bots/${id}` : ''}/logs?tail=${tail}`),
 
   panel: (id) => request(`/bots/${id}/panel`),
+  panelDiscordConfig: (id) => request(`/bots/${id}/panel/discord/config`),
+  panelDiscordSession: (id) => request(`/bots/${id}/panel/discord/session`),
+  panelDiscordLogout: (id) =>
+    request(`/bots/${id}/panel/discord/logout`, { method: 'POST' }),
   panelReload: (id) => request(`/bots/${id}/panel/reload`, { method: 'POST' }),
   panelReset: (id) => request(`/bots/${id}/panel`, { method: 'DELETE' }),
   panelState: (id, state) =>

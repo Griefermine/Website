@@ -144,6 +144,24 @@ h3 {
   align-items: center;
 }
 
+.account {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.account__error {
+  color: var(--danger);
+}
+
+.auth-required .stats,
+.auth-required .layout,
+.auth-required .foot {
+  display: none;
+}
+
 /* ----------------------------- Buttons ------------------------------ */
 .btn {
   appearance: none;
@@ -772,6 +790,14 @@ select.input {
   gap: 10px;
   padding: 16px 20px;
   background: rgba(255, 255, 255, 0.03);
+}
+
+.access-user {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding: 14px;
 }
 
 .modal__head h2 {

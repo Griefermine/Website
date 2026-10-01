@@ -18,18 +18,20 @@ const call = async (path, options = {}) => {
   return { status: response.status, data: await response.json() };
 };
 
-const callWithToken = (token) => (path, options = {}) =>
-  call(path, {
-    ...options,
-    headers: {
-      'content-type': 'application/json',
-      authorization: `Bearer ${token}`,
-      ...(options.headers ?? {}),
-    },
-  });
+const callWithToken =
+  (token) =>
+  (path, options = {}) =>
+    call(path, {
+      ...options,
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${token}`,
+        ...(options.headers ?? {}),
+      },
+    });
 
-const createBot = async (body) => (await call('/bots', { method: 'POST', body })).data
-  .bot;
+const createBot = async (body) =>
+  (await call('/bots', { method: 'POST', body })).data.bot;
 
 const waitFor = async (id, wanted, timeout = 20000) => {
   const started = Date.now();
@@ -50,7 +52,8 @@ const logText = async (id) => {
 /** Liest den SSE-Strom des Bots bis `count` Settings-Ereignisse da sind. */
 const readBotEvents = async (token, count, timeout = 6000) => {
   const controller = new AbortController();
-  const response = await fetch(`${baseUrl}/api/hub/events?token=${token}`, {
+  const response = await fetch(`${baseUrl}/api/hub/events`, {
+    headers: { 'x-bot-hub-token': token },
     signal: controller.signal,
   });
   const reader = response.body.getReader();
@@ -62,7 +65,8 @@ const readBotEvents = async (token, count, timeout = 6000) => {
       const { value, done } = await reader.read();
       if (done) break;
       frames.push(decoder.decode(value));
-      if ((frames.join('').match(/event: settings/g) ?? []).length >= count) break;
+      if ((frames.join('').match(/event: settings/g) ?? []).length >= count)
+        break;
     }
   } catch {
     /* Abbruch nach Timeout */
@@ -103,14 +107,40 @@ const MANIFEST = {
 };
 
 before(async () => {
+  process.env.BOT_HUB_TEST_MODE = '1';
   root = mkdtempSync(join(tmpdir(), 'bot-hub-panel-'));
   mkdirSync(join(root, 'worker'));
   mkdirSync(join(root, 'nackt'));
-  writeFileSync(join(root, 'worker', 'bot.sh'), 'echo "hub=$BOT_HUB_URL"\necho "token=$BOT_HUB_TOKEN"\necho "settings=$BOT_HUB_SETTINGS"\necho "setting=$BOT_HUB_SETTING_LOG_CHANNEL"\nsleep 30\n');
+  writeFileSync(
+    join(root, 'worker', 'bot.sh'),
+    'echo "hub=$BOT_HUB_URL"\necho "token=$BOT_HUB_TOKEN"\necho "settings=$BOT_HUB_SETTINGS"\necho "setting=$BOT_HUB_SETTING_LOG_CHANNEL"\nsleep 30\n',
+  );
   writeFileSync(join(root, 'worker', 'bot-hub.json'), JSON.stringify(MANIFEST));
-  writeFileSync(join(root, 'worker', 'page.html'), '<!doctype html><h1>Seite</h1>');
-  writeFileSync(join(root, 'worker', 'extra.html'), '<!doctype html><h1>Extra</h1>');
-  writeFileSync(join(root, 'nackt', 'bot.sh'), 'sleep 30\n');
+  writeFileSync(
+    join(root, 'worker', 'page.html'),
+    '<!doctype html><h1>Seite</h1>',
+  );
+  writeFileSync(
+    join(root, 'worker', 'panel.css'),
+    'body { background: rgb(1, 2, 3); }',
+  );
+  mkdirSync(join(root, 'worker', 'panel'));
+  writeFileSync(
+    join(root, 'worker', 'panel', 'index.html'),
+    '<!doctype html><link rel="stylesheet" href="panel.css">',
+  );
+  writeFileSync(
+    join(root, 'worker', 'panel', 'panel.css'),
+    'body { color: rgb(4, 5, 6); }',
+  );
+  writeFileSync(
+    join(root, 'worker', 'extra.html'),
+    '<!doctype html><h1>Extra</h1>',
+  );
+  writeFileSync(
+    join(root, 'nackt', 'bot.sh'),
+    'echo "token=$BOT_HUB_TOKEN"\nsleep 30\n',
+  );
 
   process.env.BOT_DASHBOARD_ROOT = root;
   const { createServer: createApp } = await import('../server/manager.js');
@@ -163,10 +193,23 @@ describe('Bot-Seite aus einem Manifest', () => {
     assert.equal(page.status, 200);
     assert.match(page.headers.get('content-type'), /text\/html/);
     assert.match(await page.text(), /<h1>Seite<\/h1>/);
-
-    const bridge = await fetch(
-      `${baseUrl}/api/bots/${bot.id}/panel/bridge.js`,
+    const stylesheet = await fetch(
+      `${baseUrl}/api/bots/${bot.id}/panel/file/panel.css`,
     );
+    assert.equal(stylesheet.status, 200);
+    assert.match(stylesheet.headers.get('content-type'), /^text\/css/);
+    const publicPage = await fetch(
+      `${baseUrl}/api/bots/${bot.id}/panel/file/page.html`,
+      { headers: { origin: 'null' } },
+    );
+    assert.equal(publicPage.status, 200);
+    const publicSensitiveType = await fetch(
+      `${baseUrl}/api/bots/${bot.id}/panel/file/worker/package.json`,
+      { headers: { origin: 'null' } },
+    );
+    assert.equal(publicSensitiveType.status, 404);
+
+    const bridge = await fetch(`${baseUrl}/api/bots/${bot.id}/panel/bridge.js`);
     assert.equal(bridge.status, 200);
     assert.match(await bridge.text(), /export const hub/);
 
@@ -183,6 +226,37 @@ describe('Bot-Seite aus einem Manifest', () => {
         `${evil} wurde nicht blockiert (${blocked.status})`,
       );
     }
+  });
+
+  it('öffnet die Bot-Seite über eine geschützte Weiterleitung', async () => {
+    const response = await fetch(
+      `${baseUrl}/api/bots/${bot.id}/panel/open?page=page.html`,
+      { redirect: 'manual' },
+    );
+    assert.equal(response.status, 302);
+    const location = response.headers.get('location');
+    assert.match(
+      location,
+      new RegExp(`/api/bots/${bot.id}/panel/file/page\\.html`),
+    );
+    assert.match(location, /#hub=[a-f0-9]{48}$/);
+    const cookie = response.headers.get('set-cookie');
+    assert.match(cookie, new RegExp(`bot_hub_panel_access_${bot.id}=`));
+    assert.match(cookie, /HttpOnly/);
+    assert.match(cookie, /SameSite=Lax/);
+    const pageResponse = await fetch(`${baseUrl}${location.split('#')[0]}`, {
+      headers: { cookie },
+    });
+    assert.equal(pageResponse.status, 200);
+    const nestedStylesheet = await fetch(
+      `${baseUrl}/api/bots/${bot.id}/panel/file/panel/panel.css`,
+      { headers: { cookie } },
+    );
+    assert.equal(nestedStylesheet.status, 200);
+    assert.equal(
+      nestedStylesheet.headers.get('content-type'),
+      'text/css; charset=utf-8',
+    );
   });
 
   it('speichert Einstellungen, maskiert Geheimnisse und wirft sie um', async () => {
@@ -231,10 +305,10 @@ describe('Bot-Seite aus einem Manifest', () => {
   });
 
   it('führt eine Aktion als Skript aus und meldet fehlende Skripte', async () => {
-    const { data: ping } = await call(
-      `/bots/${bot.id}/panel/commands/ping`,
-      { method: 'POST', body: {} },
-    );
+    const { data: ping } = await call(`/bots/${bot.id}/panel/commands/ping`, {
+      method: 'POST',
+      body: {},
+    });
     assert.equal(ping.result.ok, true);
     assert.equal(ping.result.data, 'pong');
 
@@ -267,9 +341,13 @@ describe('Bot-Seite aus einem Manifest', () => {
       `BOT_HUB_SETTING_* fehlt: ${lines.join(' | ')}`,
     );
     assert.ok(
-      lines.some((line) => line.startsWith('hub=') && line.includes('127.0.0.1')),
+      lines.some(
+        (line) => line.startsWith('hub=') && line.includes('127.0.0.1'),
+      ),
     );
-    assert.ok(lines.some((line) => line.includes('"log_channel":"start-kanal"')));
+    assert.ok(
+      lines.some((line) => line.includes('"log_channel":"start-kanal"')),
+    );
     await call(`/bots/${bot.id}/stop`, { method: 'POST' });
   });
 });
@@ -314,7 +392,7 @@ describe('Bot-Seite aus dem laufenden Prozess', () => {
       body: {
         panel: {
           title: 'Laufzeit-Seite',
-          fields: [{ key: 'modus', type: 'text', default: 'ruhig' }],
+          settings: [{ key: 'modus', type: 'text', default: 'ruhig' }],
         },
       },
     });
@@ -362,6 +440,36 @@ describe('Bot-Seite aus dem laufenden Prozess', () => {
 
     const { data: panel } = await call(`/bots/${bot.id}/panel`);
     const page = callWithToken(panel.bridge.token);
+    const standalone = await fetch(`${baseUrl}/api/bots/${bot.id}/panel`, {
+      headers: {
+        origin: 'null',
+        'x-bot-hub-token': panel.bridge.token,
+      },
+    });
+    assert.equal(standalone.status, 200);
+    assert.equal(standalone.headers.get('access-control-allow-origin'), 'null');
+    assert.equal(
+      (
+        await fetch(
+          `${baseUrl}/api/hub/session?token=${encodeURIComponent(
+            panel.bridge.token,
+          )}`,
+        )
+      ).status,
+      401,
+    );
+    assert.equal(
+      (
+        await fetch(`${baseUrl}/api/bots/${bot.id}/panel/reload`, {
+          method: 'POST',
+          headers: {
+            origin: 'null',
+            'x-bot-hub-token': panel.bridge.token,
+          },
+        })
+      ).status,
+      403,
+    );
     assert.equal((await page('/hub/session')).status, 200);
     const denied = await page('/hub/panel', {
       method: 'POST',
@@ -375,18 +483,26 @@ describe('Bot-Seite aus dem laufenden Prozess', () => {
     assert.equal(write.status, 403);
     // Lesen darf die Seite aber
     const { data: read } = await page('/hub/settings');
-    assert.deepEqual(read.settings, {});
+    assert.deepEqual(read.settings, { modus: 'ruhig' });
   });
 
   it('vergibt das Manifest Vorrang vor der Laufzeit-Anmeldung', async () => {
-    writeFileSync(join(root, 'nackt', 'bot-hub.json'), JSON.stringify(MANIFEST));
+    writeFileSync(
+      join(root, 'nackt', 'bot-hub.json'),
+      JSON.stringify(MANIFEST),
+    );
     await call(`/bots/${bot.id}/panel/reload`, { method: 'POST' });
     const { data: panel } = await call(`/bots/${bot.id}/panel`);
     assert.equal(panel.panel.source, 'manifest');
 
     const clash = await callWithToken(token)('/hub/panel', {
       method: 'POST',
-      body: { panel: { title: 'Laufzeit gewinnt' } },
+      body: {
+        panel: {
+          title: 'Laufzeit gewinnt',
+          settings: [{ key: 'modus', type: 'text' }],
+        },
+      },
     });
     assert.equal(clash.status, 409);
   });
@@ -420,7 +536,6 @@ describe('Herkunft und Mandant', () => {
     const sandbox = await fetch(`${baseUrl}/api/bots/${bot.id}/panel`, {
       headers: { origin: 'null' },
     });
-    assert.equal(sandbox.status, 200);
-    assert.equal(sandbox.headers.get('access-control-allow-origin'), 'null');
+    assert.equal(sandbox.status, 403);
   });
 });

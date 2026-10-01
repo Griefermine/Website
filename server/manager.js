@@ -7,6 +7,7 @@ import {
   mkdirSync,
   readdirSync,
   statSync,
+  realpathSync,
 } from 'node:fs';
 import {
   dirname,
@@ -25,16 +26,70 @@ import {
   handlePanelRoutes,
   hubEnv,
   hydratePanel,
+  identify,
+  linkHubDiscordSession,
+  panelToken,
   publicPanel,
   revokeRuntimeToken,
   syncBotEnv,
 } from './panel.js';
+import {
+  accessState,
+  configureAccess,
+  currentAuthSession,
+  currentUser,
+  handleAuthRoutes,
+  hasPermission,
+  removeAccess,
+  requiresAuthentication,
+  updateAccess,
+} from './auth.js';
 
 const PROJECT_ROOT = resolve(process.env.BOT_DASHBOARD_ROOT || process.cwd());
 const DATA_FILE = join(PROJECT_ROOT, 'data', 'bots.json');
+const ACCESS_FILE = join(PROJECT_ROOT, 'data', 'access.json');
 const MAX_LOG_LINES = 800;
 const MAX_BOTS = 24;
 const INSTALL_TIMEOUT = 15 * 60 * 1000;
+const rateBuckets = new Map();
+const rateLimit = (req, url) => {
+  if (process.env.BOT_HUB_TEST_MODE === '1') return null;
+  const path = url.pathname;
+  let limit = 0;
+  if (/^\/api\/auth\/discord\/(?:login|callback)$/.test(path)) limit = 30;
+  else if (
+    /\/panel\/commands(?:\/|$)/.test(path) ||
+    /\/(?:start|restart|install)(?:\/|$)/.test(path)
+  )
+    limit = 60;
+  else if (/^\/api\/hub(?:\/|$)/.test(path)) limit = 120;
+  else return null;
+  const now = Date.now();
+  const ip = String(req.headers['x-forwarded-for'] ?? req.socket.remoteAddress ?? '')
+    .split(',')[0]
+    .trim();
+  const botId = path.split('/')[3] ?? '';
+  const key = `${ip}:${botId}:${path.split('/').slice(0, 6).join('/')}`;
+  const bucket = rateBuckets.get(key);
+  if (!bucket || bucket.expiresAt <= now) {
+    rateBuckets.set(key, { count: 1, expiresAt: now + 60_000 });
+    return null;
+  }
+  bucket.count += 1;
+  if (bucket.count > limit) {
+    const error = httpError(429, 'Zu viele Anfragen');
+    error.retryAfter = Math.ceil((bucket.expiresAt - now) / 1000);
+    return error;
+  }
+  return null;
+};
+const rateCleanup = setInterval(() => {
+  const now = Date.now();
+  for (const [key, bucket] of rateBuckets) {
+    if (bucket.expiresAt <= now) rateBuckets.delete(key);
+  }
+}, 60_000);
+rateCleanup.unref();
 
 const bots = new Map();
 const listeners = new Set();
@@ -82,7 +137,26 @@ const safeProjectPath = (input, fallback = '.') => {
   const full = resolve(candidate);
   const rel = relative(PROJECT_ROOT, full);
   if (rel.startsWith('..') || isAbsolute(rel)) return null;
-  return full;
+  try {
+    const root = realpathSync(PROJECT_ROOT);
+    const trusted = realpathSync(full);
+    const trustedRel = relative(root, trusted);
+    if (trustedRel.startsWith('..') || isAbsolute(trustedRel)) return null;
+    const workspaceBase = join(root, 'bots');
+    if (existsSync(workspaceBase)) {
+      const workspaceRoot = realpathSync(workspaceBase);
+      const workspaceRel = relative(workspaceRoot, trusted);
+      if (
+        workspaceRel.startsWith('..') ||
+        isAbsolute(workspaceRel) ||
+        !workspaceRel
+      )
+        return null;
+    }
+    return trusted;
+  } catch {
+    return null;
+  }
 };
 
 const SECRET_KEYS = /^(.*(token|secret|password|passwort|key|dsn|webhook).*)$/i;
@@ -330,9 +404,21 @@ const botEnv = (bot, dir, { runtime = false } = {}) => {
       )
     : [];
   const pathVar = process.platform === 'win32' ? 'Path' : 'PATH';
-  const currentPath = process.env[pathVar] ?? process.env.PATH ?? '';
+  const safeEnv = {};
+  for (const key of [
+    pathVar,
+    ...(pathVar === 'Path' ? ['PATH'] : []),
+    'HOME',
+    'LANG',
+    'TMPDIR',
+    'TEMP',
+    'TMP',
+  ]) {
+    if (process.env[key] !== undefined) safeEnv[key] = process.env[key];
+  }
+  const currentPath = safeEnv[pathVar] ?? safeEnv.PATH ?? '';
   return {
-    ...process.env,
+    ...safeEnv,
     ...bot.env,
     ...(binDirs.length
       ? { [pathVar]: [...binDirs, currentPath].join(delimiter) }
@@ -569,6 +655,14 @@ const prepareStart = (bot) => {
     throw httpError(409, `"${bot.name}" installiert gerade Abhängigkeiten`);
   const dir = safeProjectPath(bot.cwd, '.');
   if (!dir) throw httpError(400, 'Arbeitsordner liegt außerhalb des Projekts');
+  if (process.env.BOT_HUB_TEST_MODE !== '1')
+    for (const other of bots.values()) {
+      if (other.id !== bot.id && safeProjectPath(other.cwd, '.') === dir)
+        throw httpError(
+          409,
+          'Arbeitsordner wird bereits von einem anderen Bot verwendet',
+        );
+    }
   if (!existsSync(dir) || !statSync(dir).isDirectory()) {
     throw httpError(400, `Ordner "${bot.cwd}" existiert nicht`);
   }
@@ -713,21 +807,87 @@ const handleApi = async (req, res, url) => {
   const segments = url.pathname.split('/').filter(Boolean); // ['api', ...]
   const [, resource, id, action] = segments;
 
+  if (resource === 'auth') {
+    const handled = await handleAuthRoutes(req, res, url, sendJson, httpError);
+    if (handled !== false) return handled;
+    throw httpError(404, 'Unbekannter Auth-Endpunkt');
+  }
+
+  const panelIdentity =
+    resource === 'bots' && id && action === 'panel' ? identify(req, url) : null;
+  const panelTokenAuth =
+    panelIdentity?.scope === 'panel' && panelIdentity.id === id;
+  const isPanelDiscordAuthRoute =
+    req.method === 'GET' &&
+    /^\/api\/bots\/[^/]+\/panel\/discord\/(?:config|login|callback)$/.test(
+      url.pathname,
+    );
+  const isPanelStaticAsset =
+    req.method === 'GET' &&
+    /^\/api\/bots\/[^/]+\/panel\/(?:bridge\.js|file\/.+)$/.test(url.pathname);
+
+  if (
+    req.headers.origin === 'null' &&
+    /^\/api\/bots\/[^/]+\/panel(?:\/|$)/.test(url.pathname) &&
+    !panelTokenAuth &&
+    !isPanelDiscordAuthRoute &&
+    !isPanelStaticAsset
+  )
+    throw httpError(403, 'Panel-Token erforderlich');
+
+  // Panel- und Unterseiten bleiben immer an die zentrale Hub-Session
+  // gebunden. Das Panel-Token ergänzt nur die Rechte der eingebetteten
+  // Bot-Seite; es ersetzt die Hauptanmeldung nicht.
+  if (requiresAuthentication(req, url))
+    throw httpError(401, 'Discord-Anmeldung erforderlich');
+
+  const permission = (name) => {
+    if (!hasPermission(req, name))
+      throw httpError(403, `Berechtigung fehlt: ${name}`);
+  };
+
+  if (resource === 'access') {
+    permission('access.manage');
+    if (!id && req.method === 'GET')
+      return sendJson(res, 200, accessState(req));
+    if (id && req.method === 'PATCH') {
+      const body = await readBody(req);
+      try {
+        return sendJson(res, 200, {
+          user: updateAccess(id, body, currentUser(req)?.id),
+        });
+      } catch (error) {
+        throw httpError(400, error.message);
+      }
+    }
+    if (id && req.method === 'DELETE') {
+      try {
+        removeAccess(id, currentUser(req)?.id);
+        return sendJson(res, 200, { ok: true });
+      } catch (error) {
+        throw httpError(400, error.message);
+      }
+    }
+    throw httpError(405, 'Methode nicht erlaubt');
+  }
+
   if (resource === 'health')
     return sendJson(res, 200, {
       ok: true,
-      projectRoot: PROJECT_ROOT,
       bots: bots.size,
     });
 
-  if (resource === 'languages')
+  if (resource === 'languages') {
+    permission('bots.read');
     return sendJson(res, 200, { languages: LANGUAGES });
+  }
 
   // Vom Bot selbst aufgerufen – Identität läuft über BOT_HUB_TOKEN.
   if (resource === 'hub')
     return handleHubRoutes(req, res, url, (id) => bots.get(id));
 
   if (resource === 'events') {
+    permission('bots.read');
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-store',
@@ -748,6 +908,7 @@ const handleApi = async (req, res, url) => {
   }
 
   if (resource === 'logs') {
+    permission('logs.read');
     const tail = Math.min(500, Number(url.searchParams.get('tail') ?? 200));
     const scope = id ? bots.get(id) : null;
     if (id && !scope) throw httpError(404, 'Bot nicht gefunden');
@@ -760,9 +921,11 @@ const handleApi = async (req, res, url) => {
 
   if (resource === 'bots') {
     if (!id) {
+      if (req.method === 'GET') permission('bots.read');
       if (req.method === 'GET')
         return sendJson(res, 200, { bots: [...bots.values()].map(publicBot) });
       if (req.method === 'POST') {
+        permission('bots.manage');
         if (bots.size >= MAX_BOTS)
           throw httpError(429, `Maximal ${MAX_BOTS} Bots`);
         const body = await readBody(req);
@@ -782,9 +945,11 @@ const handleApi = async (req, res, url) => {
     const bot = bots.get(id);
     if (!bot) throw httpError(404, 'Bot nicht gefunden');
 
+    if (!action && req.method === 'GET') permission('bots.read');
     if (!action && req.method === 'GET')
       return sendJson(res, 200, { bot: publicBot(bot) });
     if (!action && req.method === 'PATCH') {
+      permission('bots.manage');
       const body = await readBody(req);
       const config = normaliseConfig(body, bot);
       const nextBot = { ...bot, ...config };
@@ -798,6 +963,7 @@ const handleApi = async (req, res, url) => {
       return sendJson(res, 200, { bot: updated });
     }
     if (!action && req.method === 'DELETE') {
+      permission('bots.delete');
       stopBot(id, { signal: 'SIGKILL' });
       bots.delete(id);
       dirty.add(id);
@@ -806,6 +972,7 @@ const handleApi = async (req, res, url) => {
       return sendJson(res, 200, { ok: true });
     }
     if (action === 'start' && req.method === 'POST') {
+      permission('bots.control');
       prepareStart(bot);
       setStatus(bot, 'checking', { pid: null, stoppedAt: Date.now() });
       startBot(id).catch((error) => {
@@ -815,6 +982,7 @@ const handleApi = async (req, res, url) => {
       return sendJson(res, 202, { bot: publicBot(bot) });
     }
     if (action === 'install' && req.method === 'POST') {
+      permission('bots.manage');
       const dir = safeProjectPath(bot.cwd, '.');
       if (!dir)
         throw httpError(400, 'Arbeitsordner liegt außerhalb des Projekts');
@@ -836,11 +1004,16 @@ const handleApi = async (req, res, url) => {
       );
       return sendJson(res, 202, { bot: publicBot(bot) });
     }
-    if (action === 'stop' && req.method === 'POST')
+    if (action === 'stop' && req.method === 'POST') {
+      permission('bots.control');
       return sendJson(res, 200, { bot: stopBot(id) });
-    if (action === 'kill' && req.method === 'POST')
+    }
+    if (action === 'kill' && req.method === 'POST') {
+      permission('bots.control');
       return sendJson(res, 200, { bot: stopBot(id, { signal: 'SIGKILL' }) });
+    }
     if (action === 'restart' && req.method === 'POST') {
+      permission('bots.restart');
       stopBot(id, { signal: 'SIGTERM' });
       const target = bots.get(id);
       if (target) {
@@ -856,10 +1029,82 @@ const handleApi = async (req, res, url) => {
       return sendJson(res, 200, { bot: publicBot(bots.get(id)) });
     }
     if (action === 'logs' && req.method === 'GET') {
+      permission('logs.read');
       const tail = Math.min(500, Number(url.searchParams.get('tail') ?? 300));
       return sendJson(res, 200, { lines: bot.logs.slice(-tail) });
     }
-    if (action === 'panel') return handlePanelRoutes(bot, req, res, url);
+    if (action === 'panel') {
+      if (req.method === 'GET' && url.pathname.endsWith('/panel/open')) {
+        permission('panel.read');
+        ensurePanel(bot);
+        const manifest = bot.panel?.manifest;
+        const requested = url.searchParams.get('page') ?? '';
+        const allowed = [
+          manifest?.entry,
+          ...(manifest?.pages ?? []).map((page) => page.href),
+        ].filter(Boolean);
+        const href = allowed.includes(requested) ? requested : allowed[0];
+        if (!href) throw httpError(404, 'Keine Bot-Seite verfügbar');
+        const path = href
+          .split('/')
+          .map((part) => encodeURIComponent(part))
+          .join('/');
+        await linkHubDiscordSession(
+          bot,
+          req,
+          res,
+          currentAuthSession(req),
+          panelToken(bot.id),
+        );
+        const linkedCookies = res.getHeader('set-cookie');
+        res.writeHead(302, {
+          location: `/api/bots/${encodeURIComponent(
+            bot.id,
+          )}/panel/file/${path}#hub=${panelToken(bot.id)}`,
+          'set-cookie': [
+            `bot_hub_panel_access_${bot.id}=${panelToken(
+              bot.id,
+            )}; Max-Age=3600; Path=/api/bots/${encodeURIComponent(
+              bot.id,
+            )}/panel; HttpOnly; SameSite=Lax${
+              process.env.NODE_ENV === 'production' ? '; Secure' : ''
+            }`,
+            ...(Array.isArray(linkedCookies)
+              ? linkedCookies
+              : linkedCookies
+                ? [linkedCookies]
+                : []),
+          ],
+          'cache-control': 'no-store',
+          'referrer-policy': 'no-referrer',
+        });
+        return res.end();
+      }
+      if (isPanelDiscordAuthRoute) {
+        permission('panel.read');
+        return handlePanelRoutes(bot, req, res, url, currentAuthSession(req));
+      }
+      if (isPanelStaticAsset) {
+        if (!panelTokenAuth) permission('panel.read');
+        return handlePanelRoutes(
+          bot,
+          req,
+          res,
+          url,
+          panelTokenAuth ? null : currentAuthSession(req),
+          panelTokenAuth,
+          true,
+        );
+      }
+      if (panelTokenAuth)
+        return handlePanelRoutes(bot, req, res, url, null, true);
+      const panelLogout =
+        req.method === 'POST' && /\/panel\/discord\/logout$/.test(url.pathname);
+      permission(
+        req.method === 'GET' || panelLogout ? 'panel.read' : 'panel.manage',
+      );
+      return handlePanelRoutes(bot, req, res, url, currentAuthSession(req));
+    }
     throw httpError(405, 'Methode nicht erlaubt');
   }
 
@@ -868,13 +1113,43 @@ const handleApi = async (req, res, url) => {
 
 const serveStatic = (req, res, url) => {
   const dist = join(PROJECT_ROOT, 'dist');
-  const requested = decodeURIComponent(url.pathname);
+  let requested;
+  let root;
+  try {
+    requested = decodeURIComponent(url.pathname);
+    root = realpathSync(dist);
+  } catch (error) {
+    if (error instanceof URIError) throw httpError(400, 'Ungültiger URL-Pfad');
+    res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+    return res.end('Frontend nicht gebaut – bitte "npm run build" ausführen.');
+  }
+
   const candidate =
-    requested === '/' ? join(dist, 'index.html') : join(dist, requested);
+    requested === '/'
+      ? join(root, 'index.html')
+      : resolve(root, `.${requested}`);
+  const candidateRelative = relative(root, candidate);
+  if (candidateRelative.startsWith('..') || isAbsolute(candidateRelative)) {
+    res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+    return res.end('Datei nicht gefunden.');
+  }
+
+  let resolvedCandidate;
+  try {
+    resolvedCandidate = realpathSync(candidate);
+  } catch {
+    resolvedCandidate = null;
+  }
+  const resolvedRelative = resolvedCandidate
+    ? relative(root, resolvedCandidate)
+    : '';
   const target =
-    existsSync(candidate) && statSync(candidate).isFile()
-      ? candidate
-      : join(dist, 'index.html');
+    resolvedCandidate &&
+    !resolvedRelative.startsWith('..') &&
+    !isAbsolute(resolvedRelative) &&
+    statSync(resolvedCandidate).isFile()
+      ? resolvedCandidate
+      : join(root, 'index.html');
   if (!existsSync(target)) {
     res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
     return res.end('Frontend nicht gebaut – bitte "npm run build" ausführen.');
@@ -889,16 +1164,9 @@ const serveStatic = (req, res, url) => {
 };
 
 /* ------------------------------------------------------------------ *
- * CORS
- *
- * Der Hub läuft auf dem eigenen Rechner. Seiten fremder Herkunft (und der
- * Sandboxed-Bot mit Origin "null") dürfen nur die token-geschützten
- * Hub-/Panel-Endpunkte ansprechen – alles andere bleibt Same-Origin.
+ * Browser-API-Aufrufe bleiben Same-Origin. Opaque Panel-Dokumente erhalten
+ * CORS nur für statische Dateien, die sie zum Laden von ES-Modulen brauchen.
  * ------------------------------------------------------------------ */
-const isPanelRoute = (pathname) =>
-  pathname.startsWith('/api/hub') ||
-  /\/api\/bots\/[^/]+\/panel(\/|$)/.test(pathname);
-
 const sameHost = (origin, host) => {
   try {
     return new URL(origin).host === host;
@@ -907,23 +1175,31 @@ const sameHost = (origin, host) => {
   }
 };
 
+const isPanelStaticRoute = (pathname) =>
+  /^\/api\/bots\/[^/]+\/panel\/(?:bridge\.js|file\/.+)$/.test(pathname);
+
+const isPanelApiRoute = (pathname) =>
+  /^\/api\/bots\/[^/]+\/panel(?:\/|$)/.test(pathname);
+
 const applyCors = (req, res, url) => {
   const origin = req.headers.origin;
   if (!origin) return true; // kein Browser (Bot, curl, Tests)
   if (sameHost(origin, req.headers.host)) return true; // Same-Origin
-  if (isPanelRoute(url.pathname)) {
-    res.setHeader('access-control-allow-origin', origin);
+  if (
+    origin === 'null' &&
+    (isPanelStaticRoute(url.pathname) || isPanelApiRoute(url.pathname))
+  ) {
+    res.setHeader('access-control-allow-origin', 'null');
     res.setHeader('access-control-allow-credentials', 'true');
-    res.setHeader('vary', 'origin');
     res.setHeader(
       'access-control-allow-headers',
-      'content-type, authorization, x-bot-hub-token',
+      'content-type, x-bot-hub-token',
     );
     res.setHeader(
       'access-control-allow-methods',
-      'GET,POST,PUT,PATCH,DELETE,OPTIONS',
+      'GET, POST, PUT, DELETE, OPTIONS',
     );
-    res.setHeader('access-control-max-age', '600');
+    res.setHeader('vary', 'origin');
     return true;
   }
   return false;
@@ -932,6 +1208,12 @@ const applyCors = (req, res, url) => {
 export const createServer = () => {
   load();
   return async (req, res) => {
+    res.setHeader('x-content-type-options', 'nosniff');
+    res.setHeader('referrer-policy', 'no-referrer');
+    res.setHeader(
+      'permissions-policy',
+      'camera=(), geolocation=(), microphone=(), payment=(), usb=()',
+    );
     const url = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
     if (!applyCors(req, res, url)) {
       res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' });
@@ -947,14 +1229,18 @@ export const createServer = () => {
       return res.end();
     }
     try {
+      const limited = rateLimit(req, url);
+      if (limited) throw limited;
       if (url.pathname.startsWith('/api/'))
         return await handleApi(req, res, url);
       return serveStatic(req, res, url);
     } catch (error) {
       const status = error.status ?? 500;
       if (status >= 500) console.error('[hub]', error);
-      if (!res.headersSent)
+      if (!res.headersSent) {
+        if (error.retryAfter) res.setHeader('retry-after', error.retryAfter);
         return sendJson(res, status, { error: error.message });
+      }
       return res.end();
     }
   };
@@ -969,5 +1255,7 @@ configurePanel({
     schedulePersist();
   },
 });
+
+configureAccess(ACCESS_FILE);
 
 export { stopAllBots };

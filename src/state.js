@@ -9,6 +9,7 @@ const state = {
   query: '',
   selectedBotId: null,
   logLevelFilter: 'all',
+  permissions: [],
 };
 
 const subscribers = new Set();
