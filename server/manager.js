@@ -2,9 +2,12 @@ import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import {
   existsSync,
+  chmodSync,
+  cpSync,
   readFileSync,
   writeFileSync,
   mkdirSync,
+  rmSync,
   readdirSync,
   statSync,
   realpathSync,
@@ -15,10 +18,25 @@ import {
   resolve,
   isAbsolute,
   relative,
+  sep,
   delimiter,
 } from 'node:path';
 import { LANGUAGES, fillDeps, getFramework, getLanguage } from './languages.js';
-import { httpError, readBody, sendJson, MIME, MASK } from './util.js';
+import {
+  cleanupTempEnvFiles,
+  dotenvKey,
+  readSecretValues,
+  storeSecretValues,
+} from './secrets.js';
+import {
+  httpError,
+  isEvalFlag,
+  parseDotenv,
+  readBody,
+  sendJson,
+  MIME,
+  MASK,
+} from './util.js';
 import {
   configurePanel,
   ensurePanel,
@@ -27,7 +45,8 @@ import {
   hubEnv,
   hydratePanel,
   identify,
-  linkHubDiscordSession,
+  issuePanelBootstrapToken,
+  panelPageOrigin,
   panelToken,
   publicPanel,
   revokeRuntimeToken,
@@ -36,14 +55,21 @@ import {
 import {
   accessState,
   configureAccess,
-  currentAuthSession,
   currentUser,
   handleAuthRoutes,
   hasPermission,
   removeAccess,
   requiresAuthentication,
+  secureCookies,
   updateAccess,
 } from './auth.js';
+import {
+  containerRuntimeEnabled,
+  containerRuntimeName,
+  ensureContainer,
+  execArgs,
+  stopContainer,
+} from './containers.js';
 
 const PROJECT_ROOT = resolve(process.env.BOT_DASHBOARD_ROOT || process.cwd());
 const DATA_FILE = join(PROJECT_ROOT, 'data', 'bots.json');
@@ -65,8 +91,18 @@ const rateLimit = (req, url) => {
   else if (/^\/api\/hub(?:\/|$)/.test(path)) limit = 120;
   else return null;
   const now = Date.now();
-  const ip = String(req.headers['x-forwarded-for'] ?? req.socket.remoteAddress ?? '')
-    .split(',')[0]
+  const trustedProxies = new Set(
+    String(process.env.BOT_HUB_TRUSTED_PROXIES ?? '')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean),
+  );
+  const remoteAddress = String(req.socket.remoteAddress ?? '');
+  const forwarded =
+    trustedProxies.has(remoteAddress) && req.headers['x-forwarded-for'];
+  const ip = String(forwarded || remoteAddress)
+    .split(',')
+    .pop()
     .trim();
   const botId = path.split('/')[3] ?? '';
   const key = `${ip}:${botId}:${path.split('/').slice(0, 6).join('/')}`;
@@ -108,21 +144,95 @@ const flush = () => {
   dirty.clear();
   try {
     mkdirSync(dirname(DATA_FILE), { recursive: true });
-    writeFileSync(DATA_FILE, `${JSON.stringify(toFile(), null, 2)}\n`);
+    writeFileSync(DATA_FILE, `${JSON.stringify(toFile(), null, 2)}\n`, {
+      mode: 0o600,
+    });
+    chmodSync(DATA_FILE, 0o600);
   } catch (error) {
     console.error('[hub] Speichern fehlgeschlagen:', error.message);
   }
 };
 
+/* ------------------------------------------------------------------ *
+ * Geheimnisse: nur in data/secrets/<bot-id>.env (0600), nie in bots.json
+ * ------------------------------------------------------------------ */
+
+const readSecretFile = (id) => readSecretValues(PROJECT_ROOT, id);
+
+/**
+ * Liest die Geheimnisse eines Bots und holt sie in die Datei mit 0600 Rechten.
+ * Der Wert aus bots.json hat Vorrang, weil die Datei sonst einen älteren
+ * Stand zurückschreiben würde; anschließend wandert er aus bots.json heraus.
+ */
+const migrateSecrets = (config) => {
+  const legacyEnv = { ...(config.secretEnv ?? {}) };
+  const legacyPanel = { ...(config.panel?.secretSettings ?? {}) };
+  const envKeys = new Set([
+    ...Object.keys(legacyEnv),
+    ...(Array.isArray(config.secretKeys) ? config.secretKeys : []),
+  ]);
+  const panelKeys = new Set([
+    ...Object.keys(legacyPanel),
+    ...(Array.isArray(config.panel?.secretKeys) ? config.panel.secretKeys : []),
+  ]);
+  if (!envKeys.size && !panelKeys.size)
+    return { secretEnv: {}, secretSettings: {} };
+
+  const stored = readSecretFile(config.id);
+  const secretEnv = {};
+  const secretSettings = {};
+  const carryOver = {};
+  // Gleiche Normalisierung wie beim Schreiben der .env – sonst findet der
+  // Hub ein geheimes Panel-Feld nach dem ersten Speichern nicht wieder.
+  for (const key of envKeys) {
+    const fileKey = dotenvKey(key);
+    const value = legacyEnv[key] ?? stored[fileKey];
+    if (value === undefined) continue;
+    secretEnv[key] = String(value);
+    carryOver[fileKey] = String(value);
+  }
+  for (const key of panelKeys) {
+    const fileKey = dotenvKey(key);
+    const value = legacyPanel[key] ?? stored[fileKey];
+    if (value === undefined) continue;
+    secretSettings[key] = String(value);
+    carryOver[fileKey] = String(value);
+  }
+  try {
+    storeSecretValues(PROJECT_ROOT, config.id, carryOver);
+    return { secretEnv, secretSettings };
+  } catch (error) {
+    // Ohne sichere Ablage bleiben die Werte im Speicher, werden aber nicht
+    // aus bots.json entfernt - sonst waeren sie verloren.
+    console.error(
+      `[hub] Geheimnisse für ${config.name} konnten nicht in data/secrets gesichert werden:`,
+      error.message,
+    );
+    return { secretEnv: { ...secretEnv, ...config.secretEnv }, secretSettings };
+  }
+};
+
+/**
+ * `bots.json` ist die Übersicht der Bots, nicht der Geheimnisspeicher. Werte
+ * gehen nicht hinein, nur die Namen der Schlüssel - die liegen in
+ * `data/secrets/<id>.env` (Verzeichnis 0700, Datei 0600).
+ */
 const toFile = () =>
   [...bots.values()].map(({ child, busy, logs, restartTimer, ...rest }) => {
-    const { secretEnv, ...safeSecretEnv } = rest.secretEnv;
+    const secretKeys = Object.keys(rest.secretEnv ?? {});
     // Live-Zustand der Bot-Seite gehört nicht in die Datei.
-    const { state, ...panel } = rest.panel ?? {};
+    const { state, secretSettings, ...panel } = rest.panel ?? {};
     return {
       ...rest,
-      secretEnv: safeSecretEnv,
-      panel: rest.panel ? panel : rest.panel,
+      secretEnv: {},
+      secretKeys,
+      panel: rest.panel
+        ? {
+            ...panel,
+            secretSettings: {},
+            secretKeys: Object.keys(secretSettings ?? {}),
+          }
+        : rest.panel,
     };
   });
 
@@ -159,18 +269,137 @@ const safeProjectPath = (input, fallback = '.') => {
   }
 };
 
-const SECRET_KEYS = /^(.*(token|secret|password|passwort|key|dsn|webhook).*)$/i;
-
-const maskValue = (value) => {
-  const text = String(value ?? '');
-  if (text.length < 9) return '••••••••';
-  return `${text.slice(0, 4)}…${text.slice(-4)}`;
+const legacyWorkspace = (input) => {
+  if (!input || isAbsolute(String(input))) return null;
+  const candidate = resolve(PROJECT_ROOT, String(input));
+  const botsRoot = resolve(PROJECT_ROOT, 'bots');
+  const relativeToBots = relative(botsRoot, candidate);
+  if (
+    !relativeToBots ||
+    relativeToBots.startsWith('..') ||
+    isAbsolute(relativeToBots)
+  )
+    return null;
+  const [botDirectory] = relativeToBots.split(sep);
+  if (!botDirectory || botDirectory === '.') return null;
+  const workspace = resolve(botsRoot, botDirectory);
+  try {
+    const trustedBotsRoot = realpathSync(botsRoot);
+    const trustedWorkspace = realpathSync(workspace);
+    const trustedRelative = relative(trustedBotsRoot, trustedWorkspace);
+    if (
+      !trustedRelative ||
+      trustedRelative.startsWith('..') ||
+      isAbsolute(trustedRelative) ||
+      trustedRelative.split(sep).length !== 1
+    )
+      return null;
+    return { workspace: trustedWorkspace, candidate };
+  } catch {
+    return null;
+  }
 };
 
+const sensitiveWorkspaceEntry = (source) =>
+  /^(?:\.env(?:\..*)?|\.git|\.npmrc|\.pypirc|id_(?:rsa|ed25519)|authorized_keys|known_hosts|.*(?:secret|credential|password|token).*)$/i.test(
+    source,
+  );
+
+const migrateWorkspace = (id, source, target) => {
+  try {
+    mkdirSync(target, { recursive: true, mode: 0o700 });
+    cpSync(source, target, {
+      recursive: true,
+      force: false,
+      errorOnExist: false,
+      dereference: false,
+      filter: (entry) => !sensitiveWorkspaceEntry(entry.split(sep).pop() || ''),
+    });
+    const envFile = join(source, '.env');
+    // Die .env des Bots wandert mit in den geschützten Bereich, damit sie
+    // weder im Workspace liegen bleibt noch beim nächsten Speichern verloren
+    // geht. Vorhandene Geheimnisse werden dabei nicht überschrieben.
+    if (existsSync(envFile))
+      storeSecretValues(
+        PROJECT_ROOT,
+        id,
+        parseDotenv(readFileSync(envFile, 'utf8')),
+      );
+  } catch (error) {
+    console.error(
+      `[hub] Workspace-Migration für ${id} fehlgeschlagen:`,
+      error.message,
+    );
+  }
+};
+
+const safeBotPath = (bot, input = '.') => {
+  if (process.env.BOT_HUB_TEST_MODE === '1') return safeProjectPath(input, '.');
+  const workspaceInput = bot.workspaceRoot || `bots/${bot.id}/workspace`;
+  if (isAbsolute(workspaceInput)) return null;
+  const workspace = resolve(PROJECT_ROOT, workspaceInput);
+  const relativeInput = String(input || '.');
+  if (isAbsolute(relativeInput) || relativeInput === '~') return null;
+  const candidate = resolve(workspace, relativeInput);
+  const lexical = relative(workspace, candidate);
+  if (lexical.startsWith('..') || isAbsolute(lexical)) return null;
+  try {
+    const trustedBotsRoot = realpathSync(resolve(PROJECT_ROOT, 'bots'));
+    const trustedWorkspace = realpathSync(workspace);
+    const workspaceRelative = relative(trustedBotsRoot, trustedWorkspace);
+    if (
+      !workspaceRelative ||
+      workspaceRelative.startsWith('..') ||
+      isAbsolute(workspaceRelative)
+    )
+      return null;
+    const trustedCandidate = realpathSync(candidate);
+    const trustedRelative = relative(trustedWorkspace, trustedCandidate);
+    if (trustedRelative.startsWith('..') || isAbsolute(trustedRelative))
+      return null;
+    return trustedCandidate;
+  } catch {
+    return null;
+  }
+};
+
+const workspaceConfig = (config) => {
+  const dedicatedRoot = `bots/${config.id}/workspace`;
+  if (config.workspaceRoot === dedicatedRoot) {
+    return {
+      workspaceRoot: dedicatedRoot,
+      cwd: String(config.cwd || '.'),
+    };
+  }
+  const configuredRoot = config.workspaceRoot || config.cwd;
+  const migrated = legacyWorkspace(configuredRoot);
+  if (migrated) {
+    const sourceRoot = migrated.workspace;
+    const targetRoot = resolve(PROJECT_ROOT, dedicatedRoot);
+    migrateWorkspace(config.id, sourceRoot, targetRoot);
+    return {
+      workspaceRoot: dedicatedRoot,
+      cwd: relative(sourceRoot, migrated.candidate) || '.',
+    };
+  }
+  return {
+    workspaceRoot: dedicatedRoot,
+    cwd: String(config.cwd || '.'),
+  };
+};
+
+const SECRET_KEYS = /^(.*(token|secret|password|passwort|key|dsn|webhook).*)$/i;
+
+/**
+ * Geheimnisse werden vollständig maskiert. Ein Teil des Wertes (etwa die
+ * ersten vier Zeichen eines Discord-Tokens) verrät Struktur und Länge und
+ * verringert die Entropie – als Anzeige reicht die Maske, die der Browser
+ * bereits als "unverändert lassen" interpretiert.
+ */
 const maskEnv = (env) => {
   const out = {};
   for (const [key, value] of Object.entries(env)) {
-    out[key] = SECRET_KEYS.test(key) ? maskValue(value) : value;
+    out[key] = SECRET_KEYS.test(key) ? MASK : value;
   }
   return out;
 };
@@ -302,39 +531,63 @@ const setStatus = (bot, status, extra = {}) => {
   broadcast('bot', publicBot(bot));
 };
 
-const hydrate = (config) => ({
-  id: config.id,
-  name: config.name,
-  emoji: config.emoji || '🤖',
-  description: config.description || '',
-  language: config.language,
-  framework: config.framework || '',
-  entrypoint: config.entrypoint || '',
-  command: config.command || '',
-  commandResolved: config.commandResolved || '',
-  cwd: config.cwd || '.',
-  guildId: config.guildId || '',
-  autoRestart: Boolean(config.autoRestart),
-  autoInstall: config.autoInstall !== false,
-  depsCheck: config.depsCheck || '',
-  depsInstall: config.depsInstall || '',
-  maxRestarts: Number.isFinite(config.maxRestarts) ? config.maxRestarts : 5,
-  env: config.env ?? {},
-  secretEnv: config.secretEnv ?? {},
-  status: 'stopped',
-  pid: null,
-  exitCode: config.exitCode ?? null,
-  restartCount: config.restartCount ?? 0,
-  startedAt: null,
-  stoppedAt: null,
-  depsStatus: 'unknown',
-  depsCommand: '',
-  createdAt: config.createdAt ?? Date.now(),
-  updatedAt: Date.now(),
-  logs: [],
-  child: null,
-  panel: hydratePanel(config.panel),
-});
+const hydrate = (config) => {
+  const workspace = workspaceConfig(config);
+  const secrets = migrateSecrets(config);
+  return {
+    id: config.id,
+    name: config.name,
+    emoji: config.emoji || '🤖',
+    description: config.description || '',
+    language: config.language,
+    framework: config.framework || '',
+    entrypoint: config.entrypoint || '',
+    command: config.command || '',
+    commandResolved: config.commandResolved || '',
+    cwd: workspace.cwd,
+    workspaceRoot: workspace.workspaceRoot,
+    guildId: config.guildId || '',
+    autoRestart: Boolean(config.autoRestart),
+    autoInstall: config.autoInstall !== false,
+    depsCheck: config.depsCheck || '',
+    depsInstall: config.depsInstall || '',
+    maxRestarts: Number.isFinite(config.maxRestarts) ? config.maxRestarts : 5,
+    env: config.env ?? {},
+    secretEnv: secrets.secretEnv,
+    secretKeys: [
+      ...new Set([
+        ...Object.keys(secrets.secretEnv),
+        ...(Array.isArray(config.secretKeys) ? config.secretKeys : []),
+      ]),
+    ],
+    status: 'stopped',
+    pid: null,
+    exitCode: config.exitCode ?? null,
+    restartCount: config.restartCount ?? 0,
+    startedAt: null,
+    stoppedAt: null,
+    depsStatus: 'unknown',
+    depsCommand: '',
+    createdAt: config.createdAt ?? Date.now(),
+    updatedAt: Date.now(),
+    logs: [],
+    child: null,
+    // Die geheimen Felder des Panels kommen aus dem Secret-Speicher, nicht
+    // aus bots.json.
+    panel: hydratePanel({
+      ...config.panel,
+      secretSettings: secrets.secretSettings,
+      secretKeys: [
+        ...new Set([
+          ...Object.keys(secrets.secretSettings),
+          ...(Array.isArray(config.panel?.secretKeys)
+            ? config.panel.secretKeys
+            : []),
+        ]),
+      ],
+    }),
+  };
+};
 
 /* ----------------------------- Prozesse ----------------------------- */
 const killTree = (child, signal) => {
@@ -364,13 +617,24 @@ const ensureEnv = async (bot, dir, info) => {
     existsSync(join(base, 'bin', 'python3')) ||
     existsSync(join(base, 'bin', 'python')) ||
     existsSync(join(base, 'Scripts', 'python.exe'));
-  if (exists) return true;
+  if (exists) {
+    const probe = await runCommand(bot, 'python3 -m pip --version', {
+      dir,
+      silent: true,
+      timeout: 30000,
+    });
+    if (probe.code === 0) return true;
+    pushLine(bot.id, 'system', `✗ ${venv} ist unvollständig – repariere pip …`);
+    rmSync(base, { recursive: true, force: true });
+  } else {
+    pushLine(bot.id, 'system', `Richte ${venv} ein …`);
+  }
 
-  pushLine(bot.id, 'system', `Richte ${venv} ein …`);
   const { code } = await runCommand(bot, prepare, {
     dir,
     silent: true,
     timeout: 180000,
+    systemPython: true,
   });
   if (code === 0) {
     pushLine(bot.id, 'system', `✓ ${venv} bereit`);
@@ -390,13 +654,21 @@ const depsFor = (bot) => {
   const venv = language.venv || '';
   const deps = { package: framework.package, module: framework.module, venv };
   const check = fillDeps(bot.depsCheck || language.check, deps);
-  const install = fillDeps(bot.depsInstall || language.install, deps);
+  const installRaw = bot.depsInstall || language.install;
+  // Unterstütze sowohl String- als auch strukturierte Befehle
+  const install = typeof installRaw === 'string'
+    ? fillDeps(installRaw, deps)
+    : installRaw;
   const prepare = fillDeps(language.prepare, deps);
   return { language, framework, deps, check, install, prepare, venv };
 };
 
-const botEnv = (bot, dir, { runtime = false } = {}) => {
-  const venv = venvOf(bot);
+const botEnv = (
+  bot,
+  dir,
+  { runtime = false, includeSecrets = runtime, useVenv = true } = {},
+) => {
+  const venv = useVenv ? venvOf(bot) : '';
   const base = venv && dir ? venvDir(dir, venv) : '';
   const binDirs = base
     ? [join(base, 'bin'), join(base, 'Scripts')].filter((path) =>
@@ -424,25 +696,162 @@ const botEnv = (bot, dir, { runtime = false } = {}) => {
       ? { [pathVar]: [...binDirs, currentPath].join(delimiter) }
       : {}),
     VIRTUAL_ENV: base || undefined,
-    DISCORD_BOT_TOKEN: bot.secretEnv.DISCORD_BOT_TOKEN ?? '',
     DISCORD_GUILD_ID: bot.guildId,
     BOT_NAME: bot.name,
     PIP_DISABLE_PIP_VERSION_CHECK: '1',
     npm_config_yes: 'true',
     // Nur der echte Bot-Prozess darf sich am Hub anmelden.
+    ...(includeSecrets
+      ? { DISCORD_BOT_TOKEN: bot.secretEnv.DISCORD_BOT_TOKEN ?? '' }
+      : {}),
     ...(runtime ? hubEnv(bot, dir) : {}),
   };
 };
 
 /** Hilfsbefehl ausführen und die Ausgabe in die Logs spiegeln. */
-const runCommand = (bot, command, { dir, silent = false, timeout = 120000 }) =>
+const parseCommand = (command) => {
+  const tokens = [];
+  let current = '';
+  let quote = '';
+  for (const char of String(command ?? '').trim()) {
+    if (quote) {
+      if (char === quote) quote = '';
+      else current += char;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) {
+        tokens.push(current);
+        current = '';
+      }
+      continue;
+    }
+    if (';&|`$<>'.includes(char)) return null;
+    current += char;
+  }
+  if (quote) return null;
+  if (current) tokens.push(current);
+  return tokens.length ? tokens : null;
+};
+
+const commandSpec = (bot, command, dir, purpose = 'start') => {
+  const tokens = parseCommand(command);
+  if (!tokens) throw httpError(400, 'Ungültiger Befehl');
+  const [executable, ...args] = tokens;
+  if (
+    isAbsolute(executable) ||
+    executable.includes('/') ||
+    executable.includes('\\')
+  )
+    throw httpError(
+      400,
+      'Das Programm muss aus dem freigegebenen Runtime stammen',
+    );
+  const language = getLanguage(bot.language);
+  const allowed = new Set(
+    [
+      language.runtime,
+      ...(bot.language === 'typescript' ? ['npx', 'node'] : []),
+      ...(bot.language === 'custom'
+        ? ['bash', 'sh', 'node', 'python3', 'python']
+        : []),
+      ...(purpose === 'dependency'
+        ? [
+            'test',
+            'touch',
+            'ls',
+            'grep',
+            'go',
+            'cargo',
+            'npm',
+            'pip',
+            'mvn',
+            'dotnet',
+            'gradle',
+          ]
+        : []),
+    ].filter(Boolean),
+  );
+  if (!allowed.has(executable))
+    throw httpError(
+      400,
+      'Programm ist für diese Bot-Sprache nicht freigegeben',
+    );
+  const framework = getFramework(bot.language, bot.framework);
+  const deps = {
+    package: framework.package,
+    module: framework.module,
+    venv: language.venv || '',
+  };
+  const expectedCheck = fillDeps(language.check, deps);
+  const expectedPrepare = fillDeps(language.prepare, deps);
+  const expectedInstall = fillDeps(language.install, deps);
+  const isExpectedDependencyCheck =
+    purpose === 'dependency' && command === expectedCheck;
+  const isExpectedDependencyCommand =
+    purpose === 'dependency' &&
+    [expectedPrepare, expectedInstall].includes(command);
+  const isPythonPipProbe =
+    purpose === 'dependency' && command === 'python3 -m pip --version';
+  if (
+    args.some((arg) => isEvalFlag(arg)) &&
+    !isExpectedDependencyCheck &&
+    !isExpectedDependencyCommand &&
+    !isPythonPipProbe
+  )
+    throw httpError(400, 'Interpreter-Evaluationsflags sind nicht erlaubt');
+  const safeArgs = args.map((arg) => {
+    if (!arg.includes('/') && !arg.startsWith('.')) return arg;
+    const candidate = resolve(dir, arg);
+    let trusted = candidate;
+    try {
+      if (existsSync(candidate)) trusted = realpathSync(candidate);
+    } catch {
+      trusted = candidate;
+    }
+    if (
+      relative(dir, trusted).startsWith('..') ||
+      isAbsolute(relative(dir, trusted))
+    )
+      throw httpError(400, 'Befehl verweist außerhalb des Bot-Workspace');
+    return relative(dir, trusted);
+  });
+  return { executable, args: safeArgs };
+};
+
+const runCommand = (
+  bot,
+  command,
+  { dir, silent = false, timeout = 120000, systemPython = false },
+) =>
   new Promise((resolveRun) => {
     if (!silent) pushLine(bot.id, 'system', `$ ${command}`);
-    const child = spawn('/bin/sh', ['-c', command], {
-      cwd: dir,
-      env: botEnv(bot, dir),
-      stdio: ['ignore', 'pipe', 'pipe'],
+    let spec;
+    try {
+      spec = commandSpec(bot, command, dir, 'dependency');
+    } catch (error) {
+      pushLine(bot.id, 'system', `Befehl abgelehnt: ${error.message}`);
+      resolveRun({ code: -1 });
+      return;
+    }
+    const env = botEnv(bot, dir, {
+      includeSecrets: false,
+      useVenv: !systemPython,
     });
+    const inContainer = containerRuntimeEnabled();
+    const child = spawn(
+      inContainer ? containerRuntimeName() : spec.executable,
+      inContainer ? execArgs(bot, PROJECT_ROOT, dir, spec, env) : spec.args,
+      {
+        cwd: inContainer ? PROJECT_ROOT : dir,
+        env: inContainer ? process.env : env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
     bot.busy = child;
 
     let pendingOut = '';
@@ -492,7 +901,8 @@ const checkDependencies = async (bot, dir) => {
   if (!info.check) return { ...info, ok: true, check: '', install: '' };
 
   setStatus(bot, 'checking', { depsStatus: 'checking' });
-  await ensureEnv(bot, dir, info);
+  const envReady = await ensureEnv(bot, dir, info);
+  if (!envReady) return { ...info, ok: false };
   pushLine(bot.id, 'system', `Prüfe ${info.framework.name} …`);
   const { code } = await runCommand(bot, info.check, {
     dir,
@@ -524,13 +934,37 @@ const installDependencies = async (bot, dir, { state, force = false } = {}) => {
 
   setStatus(bot, 'installing', {
     depsStatus: 'installing',
-    depsCommand: info.install,
+    depsCommand: typeof info.install === 'string' ? info.install : 'structured',
   });
   pushLine(
     bot.id,
     'system',
     `Installiere ${info.framework.name} – je nach Sprache kann das ein paar Minuten dauern …`,
   );
+
+  // Unterstütze strukturierte Befehle (fallback-Array)
+  if (typeof info.install === 'object' && info.install.fallback) {
+    for (const cmd of info.install.fallback) {
+      const cmdStr = [cmd.executable, ...cmd.args].join(' ');
+      const { code } = await runCommand(bot, cmdStr, {
+        dir,
+        timeout: INSTALL_TIMEOUT,
+      });
+      if (code === 0) {
+        pushLine(bot.id, 'system', `✓ ${info.framework.name} installiert`);
+        setStatus(bot, 'stopped', { depsStatus: 'ready' });
+        return { ...info, installed: true, ok: true };
+      }
+    }
+    pushLine(
+      bot.id,
+      'system',
+      `✗ Installation fehlgeschlagen – alle Befehle fehlgeschlagen`,
+    );
+    setStatus(bot, 'stopped', { depsStatus: 'failed' });
+    return { ...info, installed: true, ok: false };
+  }
+
   const { code } = await runCommand(bot, info.install, {
     dir,
     timeout: INSTALL_TIMEOUT,
@@ -560,15 +994,29 @@ const spawnBot = (bot, dir, language) => {
 
   let child;
   try {
-    child = spawn('/bin/sh', ['-c', command], {
-      cwd: dir,
-      env: {
-        ...botEnv(bot, dir, { runtime: true }),
-        FORCE_COLOR: '1',
-      },
+    const spec = commandSpec(bot, command, dir, 'start');
+    const runtimeEnv = {
+      ...botEnv(bot, dir, { runtime: true }),
+      FORCE_COLOR: '1',
+    };
+    const inContainer = containerRuntimeEnabled();
+    const spawnOptions = {
+      cwd: inContainer ? PROJECT_ROOT : dir,
+      env: inContainer ? process.env : runtimeEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: true,
-    });
+    };
+    const uid = Number(process.env.BOT_HUB_BOT_UID);
+    const gid = Number(process.env.BOT_HUB_BOT_GID);
+    if (Number.isInteger(uid) && uid > 0) spawnOptions.uid = uid;
+    if (Number.isInteger(gid) && gid > 0) spawnOptions.gid = gid;
+    child = spawn(
+      inContainer ? containerRuntimeName() : spec.executable,
+      inContainer
+        ? execArgs(bot, PROJECT_ROOT, dir, spec, runtimeEnv)
+        : spec.args,
+      spawnOptions,
+    );
   } catch (error) {
     setStatus(bot, 'error', { exitCode: -1 });
     pushLine(bot.id, 'system', `Start fehlgeschlagen: ${error.message}`);
@@ -602,6 +1050,7 @@ const spawnBot = (bot, dir, language) => {
     if (pendingErr.trim()) pushLine(bot.id, 'stderr', pendingErr);
     pendingOut = '';
     pendingErr = '';
+    if (containerRuntimeEnabled()) stopContainer(bot).catch(() => {});
     pushLine(
       bot.id,
       'system',
@@ -653,11 +1102,15 @@ const prepareStart = (bot) => {
   if (bot.child) throw httpError(409, `"${bot.name}" läuft bereits`);
   if (bot.busy)
     throw httpError(409, `"${bot.name}" installiert gerade Abhängigkeiten`);
-  const dir = safeProjectPath(bot.cwd, '.');
-  if (!dir) throw httpError(400, 'Arbeitsordner liegt außerhalb des Projekts');
+  const dir = safeBotPath(bot, bot.cwd);
+  if (!dir)
+    throw httpError(
+      400,
+      'Arbeitsordner liegt außerhalb des Bot-Workspace (außerhalb des Projekts)',
+    );
   if (process.env.BOT_HUB_TEST_MODE !== '1')
     for (const other of bots.values()) {
-      if (other.id !== bot.id && safeProjectPath(other.cwd, '.') === dir)
+      if (other.id !== bot.id && safeBotPath(other, other.cwd) === dir)
         throw httpError(
           409,
           'Arbeitsordner wird bereits von einem anderen Bot verwendet',
@@ -677,6 +1130,24 @@ async function startBot(id, { manual = true } = {}) {
   bot.manual = manual;
   bot.env = { ...bot.env };
   const { language } = depsFor(bot);
+  if (containerRuntimeEnabled()) {
+    try {
+      await ensureContainer(bot, PROJECT_ROOT);
+      pushLine(
+        bot.id,
+        'system',
+        `Container-Umgebung für ${bot.name} ist bereit`,
+      );
+    } catch (error) {
+      setStatus(bot, 'error', { exitCode: -1 });
+      pushLine(
+        bot.id,
+        'system',
+        `Container konnte nicht gestartet werden: ${error.message}`,
+      );
+      return publicBot(bot);
+    }
+  }
 
   if (language.check) {
     const state = await checkDependencies(bot, dir);
@@ -688,10 +1159,14 @@ async function startBot(id, { manual = true } = {}) {
           `${state.framework.name} fehlt – automatische Installation ist abgeschaltet.`,
         );
         setStatus(bot, 'stopped', { depsStatus: 'missing' });
+        if (containerRuntimeEnabled()) stopContainer(bot).catch(() => {});
         return publicBot(bot);
       }
       const installed = await installDependencies(bot, dir, { state });
-      if (!installed.ok) return publicBot(bot);
+      if (!installed.ok) {
+        if (containerRuntimeEnabled()) stopContainer(bot).catch(() => {});
+        return publicBot(bot);
+      }
     } else {
       setStatus(bot, 'stopped', { depsStatus: 'ready' });
     }
@@ -713,6 +1188,7 @@ function stopBot(id, { signal = 'SIGTERM' } = {}) {
     pushLine(bot.id, 'system', 'Installation abgebrochen');
   }
   if (!bot.child) {
+    if (containerRuntimeEnabled()) stopContainer(bot).catch(() => {});
     if (bot.status !== 'stopped')
       setStatus(bot, 'stopped', { pid: null, stoppedAt: Date.now() });
     return publicBot(bot);
@@ -740,17 +1216,33 @@ const stopAllBots = () => {
     }
     killTree(bot.child, 'SIGTERM');
     killTree(bot.busy, 'SIGTERM');
+    if (containerRuntimeEnabled()) stopContainer(bot).catch(() => {});
   }
 };
 
 const load = () => {
+  // Reste abgebrochener Schreibvorgänge enthalten vollständige Geheimnisse.
+  cleanupTempEnvFiles(join(PROJECT_ROOT, 'data', 'secrets'));
   if (!existsSync(DATA_FILE)) return;
   try {
     const parsed = JSON.parse(readFileSync(DATA_FILE, 'utf8'));
     if (!Array.isArray(parsed)) return;
+    // Enthielt bots.json noch Geheimnisse, werden sie jetzt in data/secrets
+    // gesichert und die Datei anschließend ohne Werte neu geschrieben.
+    const withSecrets = parsed.some(
+      (config) =>
+        Object.keys(config?.secretEnv ?? {}).length ||
+        Object.keys(config?.panel?.secretSettings ?? {}).length,
+    );
     for (const config of parsed.slice(0, MAX_BOTS)) {
       if (!config?.id || !config?.name) continue;
       bots.set(config.id, hydrate(config));
+    }
+    if (withSecrets) {
+      schedulePersist();
+      console.warn(
+        '[hub] Geheimnisse aus bots.json nach data/secrets verschoben.',
+      );
     }
   } catch (error) {
     console.error('[hub] bots.json unlesbar:', error.message);
@@ -838,7 +1330,10 @@ const handleApi = async (req, res, url) => {
   // Panel- und Unterseiten bleiben immer an die zentrale Hub-Session
   // gebunden. Das Panel-Token ergänzt nur die Rechte der eingebetteten
   // Bot-Seite; es ersetzt die Hauptanmeldung nicht.
-  if (requiresAuthentication(req, url))
+  // Ein gültiger Panel-Token darf die Bot-Seite auch ohne zentrale
+  // Hub-Anmeldung öffnen. Ein Panel mit lokaler OAuth-Konfiguration erzwingt
+  // seine eigene Discord-Anmeldung gezielt an den schreibenden Aktionen.
+  if (requiresAuthentication(req, url) && !panelTokenAuth)
     throw httpError(401, 'Discord-Anmeldung erforderlich');
 
   const permission = (name) => {
@@ -931,6 +1426,19 @@ const handleApi = async (req, res, url) => {
         const body = await readBody(req);
         const config = normaliseConfig(body, null);
         const id = randomUUID();
+        if (process.env.BOT_HUB_TEST_MODE !== '1') {
+          const workspaceRoot = `bots/${id}/workspace`;
+          mkdirSync(resolve(PROJECT_ROOT, workspaceRoot), {
+            recursive: true,
+            mode: 0o700,
+          });
+          config.workspaceRoot = workspaceRoot;
+          if (!safeBotPath({ id, workspaceRoot }, config.cwd))
+            throw httpError(
+              400,
+              'Arbeitsordner muss im eigenen Workspace liegen',
+            );
+        }
         const bot = hydrate({ ...config, id });
         syncBotEnv(bot);
         bots.set(id, bot);
@@ -952,6 +1460,8 @@ const handleApi = async (req, res, url) => {
       permission('bots.manage');
       const body = await readBody(req);
       const config = normaliseConfig(body, bot);
+      if (!safeBotPath(bot, config.cwd))
+        throw httpError(400, 'Arbeitsordner muss im eigenen Workspace liegen');
       const nextBot = { ...bot, ...config };
       syncBotEnv(nextBot);
       Object.assign(bot, config, { updatedAt: Date.now() });
@@ -983,9 +1493,9 @@ const handleApi = async (req, res, url) => {
     }
     if (action === 'install' && req.method === 'POST') {
       permission('bots.manage');
-      const dir = safeProjectPath(bot.cwd, '.');
+      const dir = safeBotPath(bot, bot.cwd);
       if (!dir)
-        throw httpError(400, 'Arbeitsordner liegt außerhalb des Projekts');
+        throw httpError(400, 'Arbeitsordner liegt außerhalb des Bot-Workspace');
       if (bot.busy) throw httpError(409, 'Installation läuft bereits');
       const body = await readBody(req);
       const { language, install } = depsFor(bot);
@@ -1049,31 +1559,22 @@ const handleApi = async (req, res, url) => {
           .split('/')
           .map((part) => encodeURIComponent(part))
           .join('/');
-        await linkHubDiscordSession(
-          bot,
-          req,
-          res,
-          currentAuthSession(req),
-          panelToken(bot.id),
-        );
-        const linkedCookies = res.getHeader('set-cookie');
+        // Absolut und auf der Adresse, die auch den Discord-Callback bekommt:
+        // Das Voranmeldungs-Cookie des Logins gilt nur für diesen Host.
         res.writeHead(302, {
-          location: `/api/bots/${encodeURIComponent(
+          location: `${panelPageOrigin(bot)}/api/bots/${encodeURIComponent(
             bot.id,
-          )}/panel/file/${path}#hub=${panelToken(bot.id)}`,
+          )}/panel/file/${path}?bootstrap=${encodeURIComponent(
+            issuePanelBootstrapToken(bot.id),
+          )}`,
           'set-cookie': [
             `bot_hub_panel_access_${bot.id}=${panelToken(
               bot.id,
             )}; Max-Age=3600; Path=/api/bots/${encodeURIComponent(
               bot.id,
             )}/panel; HttpOnly; SameSite=Lax${
-              process.env.NODE_ENV === 'production' ? '; Secure' : ''
+              secureCookies() ? '; Secure' : ''
             }`,
-            ...(Array.isArray(linkedCookies)
-              ? linkedCookies
-              : linkedCookies
-                ? [linkedCookies]
-                : []),
           ],
           'cache-control': 'no-store',
           'referrer-policy': 'no-referrer',
@@ -1081,35 +1582,47 @@ const handleApi = async (req, res, url) => {
         return res.end();
       }
       if (isPanelDiscordAuthRoute) {
-        permission('panel.read');
-        return handlePanelRoutes(bot, req, res, url, currentAuthSession(req));
+        if (!panelTokenAuth) permission('panel.read');
+        return handlePanelRoutes(bot, req, res, url);
       }
       if (isPanelStaticAsset) {
-        if (!panelTokenAuth) permission('panel.read');
-        return handlePanelRoutes(
-          bot,
-          req,
-          res,
-          url,
-          panelTokenAuth ? null : currentAuthSession(req),
-          panelTokenAuth,
-          true,
-        );
+        // Statische Dateien werden in standalone Seiten ohne Origin-Header
+        // sowie in Sandbox-Dokumenten ohne Session-Cookie geladen. Die
+        // Route prüft Pfad, Dateiendung und sensible Dateinamen separat;
+        // Panel-API und Schreibzugriffe bleiben token-/sessiongeschützt.
+        return handlePanelRoutes(bot, req, res, url, panelTokenAuth, true);
       }
-      if (panelTokenAuth)
-        return handlePanelRoutes(bot, req, res, url, null, true);
+      if (panelTokenAuth) return handlePanelRoutes(bot, req, res, url, true);
       const panelLogout =
         req.method === 'POST' && /\/panel\/discord\/logout$/.test(url.pathname);
       permission(
         req.method === 'GET' || panelLogout ? 'panel.read' : 'panel.manage',
       );
-      return handlePanelRoutes(bot, req, res, url, currentAuthSession(req));
+      return handlePanelRoutes(bot, req, res, url);
     }
     throw httpError(405, 'Methode nicht erlaubt');
   }
 
   throw httpError(404, 'Unbekannter API-Endpunkt');
 };
+
+/**
+ * Die Oberfläche lädt ausschließlich eigene Dateien. `frame-ancestors 'none'`
+ * verhindert zusätzlich, dass eine fremde Seite das Dashboard einbettet und
+ * dort Klicks auf Start, Stopp oder Löschen vortäuscht.
+ */
+const APP_CSP = [
+  "default-src 'none'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data:",
+  "font-src 'self'",
+  "connect-src 'self'",
+  "form-action 'self'",
+  "base-uri 'none'",
+  "object-src 'none'",
+  "frame-ancestors 'none'",
+].join('; ');
 
 const serveStatic = (req, res, url) => {
   const dist = join(PROJECT_ROOT, 'dist');
@@ -1158,6 +1671,8 @@ const serveStatic = (req, res, url) => {
   res.writeHead(200, {
     'content-type': MIME[ext] ?? 'application/octet-stream',
     'cache-control': ext === '.html' ? 'no-store' : 'public, max-age=3600',
+    'content-security-policy': APP_CSP,
+    'x-frame-options': 'DENY',
   });
   if (req.method === 'HEAD') return res.end();
   return res.end(readFileSync(target));
@@ -1193,7 +1708,7 @@ const applyCors = (req, res, url) => {
     res.setHeader('access-control-allow-credentials', 'true');
     res.setHeader(
       'access-control-allow-headers',
-      'content-type, x-bot-hub-token',
+      'content-type, x-bot-hub-token, x-bot-hub-bootstrap',
     );
     res.setHeader(
       'access-control-allow-methods',

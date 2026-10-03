@@ -12,10 +12,9 @@
  */
 
 import { createServer } from 'node:http';
+import { botHubApi as api } from './api.js';
 
-const hubUrl = (process.env.BOT_HUB_URL ?? '').replace(/\/+$/, '');
-const hubToken = process.env.BOT_HUB_TOKEN ?? '';
-const connected = Boolean(hubUrl && hubToken);
+const connected = api.connected;
 const token = process.env.DISCORD_BOT_TOKEN;
 const guildId = process.env.DISCORD_GUILD_ID;
 const levels = ['debug', 'info', 'info', 'info', 'warn', 'error'];
@@ -29,27 +28,11 @@ let echoes = 0;
 let latency = null;
 let guilds = 0;
 
-/** Ein Aufruf gegen den Hub. Ohne Hub (manueller Start) passiert nichts. */
-const hub = async (path, payload) => {
-  if (!connected) return null;
-  const response = await fetch(`${hubUrl}/api/hub/${path}`, {
-    method: payload ? 'POST' : 'GET',
-    headers: {
-      authorization: `Bearer ${hubToken}`,
-      'content-type': 'application/json',
-    },
-    body: payload ? JSON.stringify(payload) : undefined,
-    signal: AbortSignal.timeout(8000),
-  });
-  if (!response.ok) throw new Error(await response.text());
-  return response.json();
-};
-
 /** Kurze Meldung als Toast im Dashboard. */
 const notify = (message, kind = 'info') =>
-  hub('notify', { message, kind }).catch((error) =>
-    log('warn', `notify fehlgeschlagen: ${error.message}`),
-  );
+  api
+    .notify(message, kind)
+    .catch((error) => log('warn', `notify fehlgeschlagen: ${error.message}`));
 
 /** Empfangene Einstellungen landen hier. */
 let config = {
@@ -131,7 +114,7 @@ const startCallbackServer = () =>
 
         try {
           if (call.id === 'reload') {
-            const fresh = await hub('settings');
+            const fresh = await api.settings();
             config = { ...config, ...(fresh?.settings ?? {}) };
             log('info', `Einstellungen neu geladen: ${JSON.stringify(config)}`);
             await publish();
@@ -157,10 +140,10 @@ const startCallbackServer = () =>
 
 /** Meldet Seite, Einstellungen und Aktionen beim Hub an. */
 const register = async () => {
-  await hub('panel', { panel: MANIFEST });
+  await api.registerPanel(MANIFEST);
   const url = await startCallbackServer();
-  await hub('callback', { url, token: hubToken });
-  const { settings } = await hub('settings');
+  await api.callback(url);
+  const { settings } = await api.settings();
   log('info', `Seite angemeldet – Aktionen laufen über ${url}`);
   log('info', `Einstellungen: ${JSON.stringify(settings ?? {})}`);
   return settings ?? {};
@@ -180,52 +163,10 @@ const publish = async () => {
     uptime: `${Math.floor((Date.now() - started) / 1000)} s`,
   };
   if (!connected) return state;
-  await hub('state', { state }).catch((error) =>
-    log('warn', `state fehlgeschlagen: ${error.message}`),
-  );
+  await api
+    .publish(state)
+    .catch((error) => log('warn', `state fehlgeschlagen: ${error.message}`));
   return state;
-};
-
-/** Zerlegt einen SSE-Block in Name und Nutzlast. Kommentare fallen weg. */
-const parseEvent = (raw) => {
-  let name = 'message';
-  const data = [];
-  for (const line of raw.split('\n')) {
-    if (line.startsWith('event:')) name = line.slice(6).trim();
-    else if (line.startsWith('data:')) data.push(line.slice(5).trim());
-  }
-  if (!data.length) return null;
-  try {
-    return { name, data: JSON.parse(data.join('\n')) };
-  } catch {
-    return null;
-  }
-};
-
-/** Liest den Ereignis-Stream, bis der Hub die Verbindung kappt. */
-const readEvents = async (handle) => {
-  const response = await fetch(`${hubUrl}/api/hub/events`, {
-    headers: {
-      accept: 'text/event-stream',
-      authorization: `Bearer ${hubToken}`,
-    },
-  });
-  if (!response.ok || !response.body) throw new Error(await response.text());
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let cut;
-    while ((cut = buffer.indexOf('\n\n')) !== -1) {
-      const event = parseEvent(buffer.slice(0, cut));
-      buffer = buffer.slice(cut + 2);
-      if (event) handle(event.name, event.data);
-    }
-  }
 };
 
 /**
@@ -236,14 +177,14 @@ const watch = async () => {
   let wait = 2000;
   for (;;) {
     try {
-      await readEvents((name, data) => {
+      for await (const { name, data } of api.events()) {
         if (name === 'refresh') {
           publish().catch(() => {});
-          return;
+          continue;
         }
         config = { ...config, ...(data?.settings ?? {}) };
         log('info', `Einstellungen: ${JSON.stringify(config)}`);
-      });
+      }
       wait = 2000;
     } catch (error) {
       log('warn', `Ereignis-Stream beendet (${error.message})`);
@@ -357,7 +298,7 @@ const realBot = async () => {
 log('info', `javascript-echo startet (Node ${process.version})`);
 
 if (connected) {
-  log('info', `Bot-Hub erkannt (${hubUrl})`);
+  log('info', 'Bot-Hub erkannt');
   try {
     config = { ...config, ...(await register()) };
   } catch (error) {

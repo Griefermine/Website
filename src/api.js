@@ -46,6 +46,9 @@ const openStream = () => {
 
 export const api = {
   authSession: () => request('/auth/session'),
+  authDiscordLogin: () => {
+    window.location.assign('/api/auth/discord/login');
+  },
   authLogout: () => request('/auth/logout', { method: 'POST' }),
   access: () => request('/access'),
   updateAccess: (id, body) =>
@@ -70,6 +73,10 @@ export const api = {
 
   panel: (id) => request(`/bots/${id}/panel`),
   panelDiscordConfig: (id) => request(`/bots/${id}/panel/discord/config`),
+  panelDiscordLogin: (id, panelToken = '') =>
+    request(`/bots/${id}/panel/discord/login?format=json`, {
+      headers: panelToken ? { 'x-bot-hub-token': panelToken } : undefined,
+    }),
   panelDiscordSession: (id) => request(`/bots/${id}/panel/discord/session`),
   panelDiscordLogout: (id) =>
     request(`/bots/${id}/panel/discord/logout`, { method: 'POST' }),

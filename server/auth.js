@@ -1,8 +1,21 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 
 const DISCORD_API = 'https://discord.com/api/v10';
+// Nur bekannte Discord-Codes zurückgeben, niemals den Parameterwert spiegeln.
+const KNOWN_DISCORD_ERRORS = new Set([
+  'access_denied',
+  'invalid_request',
+  'server_error',
+  'temporarily_unavailable',
+]);
 const SESSION_COOKIE = 'bot_hub_session';
 const STATE_TTL = 10 * 60 * 1000;
 const SESSION_TTL = 7 * 24 * 60 * 60 * 1000;
@@ -124,14 +137,21 @@ const session = (req) => {
   return current;
 };
 
+/* `Secure` ist Pflicht, sobald der Hub über HTTPS erreichbar ist. Im
+ * Reverse-Proxy-Betrieb ist NODE_ENV nicht verlässlich gesetzt, deshalb gibt
+ * es dafür einen eigenen Schalter. */
+const secureCookies = () =>
+  process.env.NODE_ENV === 'production' ||
+  process.env.BOT_HUB_SECURE_COOKIES === '1';
+
 const cookie = (value, maxAge) =>
   `${SESSION_COOKIE}=${value}; Max-Age=${maxAge}; Path=/; HttpOnly; SameSite=Lax${
-    process.env.NODE_ENV === 'production' ? '; Secure' : ''
+    secureCookies() ? '; Secure' : ''
   }`;
 
 const preAuthCookie = (value, maxAge) =>
   `${PREAUTH_COOKIE}=${value}; Max-Age=${maxAge}; Path=/api/auth/discord; HttpOnly; SameSite=Lax${
-    process.env.NODE_ENV === 'production' ? '; Secure' : ''
+    secureCookies() ? '; Secure' : ''
   }`;
 
 const cleanup = () => {
@@ -158,7 +178,10 @@ const saveAccess = () => {
   if (!accessFile) return;
   try {
     mkdirSync(dirname(accessFile), { recursive: true });
-    writeFileSync(accessFile, `${JSON.stringify(access, null, 2)}\n`);
+    writeFileSync(accessFile, `${JSON.stringify(access, null, 2)}\n`, {
+      mode: 0o600,
+    });
+    chmodSync(accessFile, 0o600);
   } catch (error) {
     console.error(
       '[hub] Zugriffsrechte konnten nicht gespeichert werden:',
@@ -247,7 +270,15 @@ export const hasPermission = (req, permission) => {
   const user = currentUser(req);
   if (!user) return false;
   const entry = ensureAccessUser(user);
-  return entry.role === 'owner' || entry.permissions.includes(permission);
+  return effectivePermissions(entry).includes(permission);
+};
+
+const effectivePermissions = (entry) => {
+  if (!entry || !Object.hasOwn(ACCESS_ROLES, entry.role)) return [];
+  const allowed = new Set(ACCESS_ROLES[entry.role]);
+  return [...new Set(entry.permissions)].filter((permission) =>
+    allowed.has(permission),
+  );
 };
 
 export const publicAccess = (userId) => {
@@ -258,13 +289,13 @@ export const publicAccess = (userId) => {
     name: entry.name,
     username: entry.username,
     role: entry.role,
-    permissions: [...entry.permissions],
+    permissions: effectivePermissions(entry),
     updatedAt: entry.updatedAt,
   };
 };
 
 export const accessState = (req) => ({
-  permissions: [...(ensureAccessUser(currentUser(req))?.permissions ?? [])],
+  permissions: effectivePermissions(ensureAccessUser(currentUser(req))),
   role: ensureAccessUser(currentUser(req))?.role ?? null,
   users: Object.values(access.users).map((entry) => publicAccess(entry.id)),
   roles: Object.fromEntries(
@@ -305,7 +336,7 @@ export const updateAccess = (id, input, actorId) => {
     if (!otherOwner)
       throw new Error('Der letzte Eigentümer kann nicht herabgestuft werden');
   }
-  const permissions = Array.isArray(input.permissions)
+  const requestedPermissions = Array.isArray(input.permissions)
     ? [
         ...new Set(
           input.permissions.filter((item) =>
@@ -314,8 +345,10 @@ export const updateAccess = (id, input, actorId) => {
         ),
       ]
     : ACCESS_ROLES[role];
-  if (role === 'owner')
-    permissions.splice(0, permissions.length, ...ACCESS_ROLES.owner);
+  const allowed = new Set(ACCESS_ROLES[role]);
+  const permissions = [...new Set(requestedPermissions)].filter((permission) =>
+    allowed.has(permission),
+  );
   existing.role = role;
   existing.permissions = permissions;
   existing.updatedAt = Date.now();
@@ -348,7 +381,7 @@ export const authSession = (req) => {
     authenticated: Boolean(current),
     user: current?.user ?? null,
     guilds: current?.guilds ?? [],
-    permissions: permissions?.permissions ?? [],
+    permissions: effectivePermissions(permissions),
     role: permissions?.role ?? null,
   };
 };
@@ -379,7 +412,7 @@ export const handleAuthRoutes = async (req, res, url, sendJson, httpError) => {
       client_id: clientId,
       redirect_uri: redirectUri,
       response_type: 'code',
-      scope: 'identify guilds guilds.members.read',
+      scope: 'identify guilds',
       state,
       code_challenge: codeChallenge,
       code_challenge_method: 'S256',
@@ -399,15 +432,39 @@ export const handleAuthRoutes = async (req, res, url, sendJson, httpError) => {
     states.delete(stateKey);
     const code = url.searchParams.get('code');
     const browserSession = cookieValue(req, PREAUTH_COOKIE);
-    if (
-      !state ||
-      state.used ||
-      state.expiresAt <= Date.now() ||
-      !code ||
-      !browserSession ||
-      state.preAuthSessionId !== browserSession
-    )
-      throw httpError(400, 'Ungültige Discord-Anmeldung');
+    const discordError = String(url.searchParams.get('error') ?? '');
+    // Der pending state liegt nur im Arbeitsspeicher. Wird der Hub zwischen
+    // dem Klick und der Rückkehr neu gestartet – im Entwicklungsbetrieb passiert
+    // das bei jeder gespeicherten Datei –, ist er nicht mehr auffindbar. Die
+    // verschiedenen Gründe bekommen eigene Meldungen, sonst ist ein
+    // fehlgeschlagener Login nicht nachvollziehbar.
+    let reason;
+    if (discordError && KNOWN_DISCORD_ERRORS.has(discordError))
+      reason = ['abgebrochen', `von Discord abgelehnt (${discordError})`];
+    else if (!state || state.used)
+      reason = [
+        'abgelaufen',
+        'der Hub wurde zwischen Anmeldung und Rückkehr neu gestartet oder der Link ist zu alt – bitte erneut anmelden',
+      ];
+    else if (state.expiresAt <= Date.now())
+      reason = [
+        'abgelaufen',
+        'die Anmeldung war älter als 10 Minuten – bitte erneut anmelden',
+      ];
+    else if (!browserSession || state.preAuthSessionId !== browserSession)
+      reason = [
+        'kein Cookie',
+        'der Browser hat das Anmelde-Cookie nicht mitgeschickt – bitte Cookies für diese Adresse erlauben',
+      ];
+    else if (!code)
+      reason = [
+        'kein Code',
+        'Discord hat keinen Autorisierungscode geliefert – bitte erneut anmelden',
+      ];
+    if (reason) {
+      console.warn(`[hub] Discord-Anmeldung abgewiesen (${reason[0]})`);
+      throw httpError(400, `Ungültige Discord-Anmeldung: ${reason[1]}.`);
+    }
     state.used = true;
 
     const tokenResponse = await fetch(`${DISCORD_API}/oauth2/token`, {
@@ -484,4 +541,4 @@ export const requiresAuthentication = (req, url) => {
   return !session(req);
 };
 
-export { SESSION_COOKIE };
+export { SESSION_COOKIE, secureCookies };

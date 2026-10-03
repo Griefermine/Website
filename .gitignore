@@ -32,3 +32,7 @@ dist/
 data/*
 node_modules/
 data/
+data/secrets/
+# Vom Bot erzeugter Bytecode
+__pycache__/
+*.pyc

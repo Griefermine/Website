@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { createServer } from 'node:http';
@@ -47,9 +48,17 @@ const waitForStatus = async (id, wanted, timeout = 30000) => {
 };
 
 before(async () => {
+  // Der Testmodus ist nur mit NODE_ENV=test erlaubt (server/index.js).
+  process.env.NODE_ENV = 'test';
   process.env.BOT_HUB_TEST_MODE = '1';
   root = mkdtempSync(join(tmpdir(), 'bot-hub-'));
   mkdirSync(join(root, 'worker'));
+  // Damit serveStatic eine Oberfläche findet und die Header geprüft werden können.
+  mkdirSync(join(root, 'dist'), { recursive: true });
+  writeFileSync(
+    join(root, 'dist', 'index.html'),
+    '<!doctype html><title>Hub</title>',
+  );
   writeFileSync(
     join(root, 'worker', 'job.sh'),
     'echo "zeile 1"\necho "warnung: test" >&2\nsleep 30\n',
@@ -104,8 +113,10 @@ describe('Bot-Hub API', () => {
     });
     assert.equal(bot.status, 'stopped');
     const masked = bot.secretEnv.DISCORD_BOT_TOKEN;
-    assert.ok(masked.startsWith('MTIz') && masked.endsWith('alue'), masked);
-    assert.ok(!masked.includes('verySecretTokenValue'));
+    // Kein Teil des Geheimnisses verlässt den Server.
+    assert.equal(masked, '••••••••');
+    assert.ok(!JSON.stringify(bot).includes('verySecretTokenValue'));
+    assert.deepEqual(bot.secretKeys, ['DISCORD_BOT_TOKEN']);
     assert.equal(bot.env.LOG_LEVEL, 'info');
     const envFile = readFileSync(join(root, '.env'), 'utf8');
     assert.match(
@@ -113,6 +124,21 @@ describe('Bot-Hub API', () => {
       /DISCORD_BOT_TOKEN="MTIzNDU2Nzg5MDEyMzQ1Njc4\.GaBcDe\.verySecretTokenValue"/,
     );
     assert.match(envFile, /LOG_LEVEL="info"/);
+
+    // Der Wert gehört in data/secrets/<id>.env (0600), nicht in bots.json.
+    const secretPath = join(root, 'data', 'secrets', `${bot.id}.env`);
+    assert.match(
+      readFileSync(secretPath, 'utf8'),
+      /DISCORD_BOT_TOKEN="MTIzNDU2Nzg5MDEyMzQ1Njc4\.GaBcDe\.verySecretTokenValue"/,
+    );
+    assert.equal(statSync(secretPath).mode & 0o777, 0o600);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const botsFile = readFileSync(join(root, 'data', 'bots.json'), 'utf8');
+    assert.ok(
+      !botsFile.includes('verySecretTokenValue'),
+      'bots.json enthält noch das Geheimnis',
+    );
+    assert.match(botsFile, /"secretKeys": \[\s*"DISCORD_BOT_TOKEN"\s*\]/);
   });
 
   it('startet einen Bot, streamt Logs und stoppt ihn wieder', async () => {
@@ -184,7 +210,7 @@ describe('Bot-Hub API', () => {
       command: 'python3 {entrypoint}',
       cwd: 'worker',
       depsCheck: 'python3 -c "import pyc_dummy"',
-      depsInstall: 'echo "pip install discord.py" && touch pyc_dummy.py',
+      depsInstall: 'touch pyc_dummy.py',
     });
     rmSync(join(root, 'worker', 'pyc_dummy.py'), { force: true });
 
@@ -202,10 +228,6 @@ describe('Bot-Hub API', () => {
     assert.ok(
       texts.some((text) => text.includes('Installiere discord.py')),
       'Installationsmeldung fehlt',
-    );
-    assert.ok(
-      texts.includes('pip install discord.py'),
-      'Installationsausgabe fehlt',
     );
     await call(`/bots/${bot.id}/stop`, { method: 'POST' });
   });
@@ -246,7 +268,7 @@ describe('Bot-Hub API', () => {
       command: 'python3 {entrypoint}',
       cwd: 'worker',
       depsCheck: 'test -f on_demand.flag',
-      depsInstall: 'echo "installiere …" && touch on_demand.flag',
+      depsInstall: 'touch on_demand.flag',
     });
 
     const { status } = await call(`/bots/${bot.id}/install`, {
@@ -310,11 +332,76 @@ describe('Bot-Hub API', () => {
       command: 'echo hi',
       cwd: '../../etc',
     });
+
     const { status, data } = await call(`/bots/${bot.id}/start`, {
       method: 'POST',
     });
     assert.equal(status, 400);
     assert.match(data.error, /außerhalb des Projekts/);
+  });
+
+  it('lehnt Interpreter-Evaluation beim Bot-Start ab', async () => {
+    const marker = join(root, 'python-eval-pwned');
+    const bot = await createBot({
+      name: 'Eval-Block',
+      language: 'custom',
+      framework: 'Eigenes Script',
+      entrypoint: 'worker/job.sh',
+      command: `python3 -c "open('${marker}', 'w').write('pwned')"`,
+      cwd: '.',
+      autoInstall: false,
+    });
+
+    const { status } = await call(`/bots/${bot.id}/start`, { method: 'POST' });
+    assert.equal(status, 202);
+    const result = await waitForStatus(bot.id, ['error', 'stopped']);
+    assert.equal(result.status, 'error');
+    assert.equal(existsSync(marker), false);
+  });
+
+  it('lehnt Evaluationsflags mit angehängtem Wert ab', async () => {
+    const marker2 = join(root, 'python-eval2-pwned');
+    const marker3 = join(root, 'shell-eval-pwned');
+    // `python3 -c"…"` landet als ein einziges Argument `-c…` im Parser –
+    // ein Vergleich auf exakt `-c` ließe den Code durch.
+    for (const command of [
+      `python3 -c"open('${marker2}', 'w').write('pwned')"`,
+      `python3 --eval="open('${marker2}', 'w').write('pwned')"`,
+      `sh -c"touch ${marker3}"`,
+      `sh -c"touch ${marker3}"`,
+    ]) {
+      const sneaky = await createBot({
+        name: 'Eval-Umgehung',
+        language: 'custom',
+        framework: 'Eigenes Script',
+        command,
+        cwd: 'worker',
+        autoInstall: false,
+      });
+      await call(`/bots/${sneaky.id}/start`, { method: 'POST' });
+      await waitForStatus(sneaky.id, ['error', 'stopped']);
+      const { data } = await call(`/bots/${sneaky.id}/logs?tail=10`);
+      assert.match(
+        data.lines.map((line) => line.text).join(' | '),
+        /Interpreter-Evaluationsflags sind nicht erlaubt/,
+        `${command} wurde nicht abgewiesen`,
+      );
+      await call(`/bots/${sneaky.id}`, { method: 'DELETE' });
+    }
+    assert.equal(existsSync(marker2), false);
+    assert.equal(existsSync(marker3), false);
+  });
+
+  it('schickt Sicherheitsheader für die Oberfläche mit', async () => {
+    const page = await fetch(`${baseUrl}/`);
+    assert.equal(page.status, 200);
+    const csp = page.headers.get('content-security-policy');
+    assert.match(csp, /default-src 'none'/);
+    assert.match(csp, /script-src 'self'/);
+    // Klickjacken: die Oberfläche darf nicht eingebettet werden.
+    assert.match(csp, /frame-ancestors 'none'/);
+    assert.equal(page.headers.get('x-frame-options'), 'DENY');
+    assert.equal(page.headers.get('x-content-type-options'), 'nosniff');
   });
 
   it('löscht einen Bot', async () => {

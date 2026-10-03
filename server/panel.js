@@ -24,6 +24,7 @@ import {
 import {
   chmodSync,
   existsSync,
+  mkdirSync,
   readFileSync,
   renameSync,
   statSync,
@@ -32,7 +33,31 @@ import {
   realpathSync,
 } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
-import { httpError, MIME, readBody, sendJson, MASK } from './util.js';
+import {
+  httpError,
+  isEvalFlag,
+  MIME,
+  parseDotenv,
+  readBody,
+  sendJson,
+  MASK,
+} from './util.js';
+import { getLanguage } from './languages.js';
+import { secureCookies } from './auth.js';
+import { database } from './database.js';
+import {
+  dotenvKey,
+  formatDotenv,
+  readSecretValues,
+  storeSecretValues,
+} from './secrets.js';
+import {
+  containerRuntimeEnabled,
+  containerRuntimeName,
+  ensureContainer,
+  execArgs,
+  stopContainer,
+} from './containers.js';
 
 const MANIFEST_NAMES = ['bot-hub.json', 'hub.json', 'bot-hub.panel.json'];
 const MANIFEST_MAX_BYTES = 128 * 1024;
@@ -78,13 +103,28 @@ export const configurePanel = ({ env, broadcast, touch } = {}) => {
 const newToken = () => randomBytes(24).toString('hex');
 const runTokens = new Map();
 const panelTokens = new Map();
+const panelBootstrapTokens = new Map();
+const panelSessionTokens = new Map();
 const callbacks = new Map();
 const manifestCache = new Map();
 const botStreams = new Map();
 const discordAuthStates = new Map();
+/** Einmalige Start-Erlaubnis für den Discord-Login (60 s, siehe discord/login). */
+const discordLoginTickets = new Map();
 const discordSessions = new Map();
 const discordPanelSessions = new Map();
-const DISCORD_API = 'https://discord.com/api/v10';
+/**
+ * Basis-URL der Discord-API. Ueberschreibbar nur im Testbetrieb, damit sich
+ * der komplette OAuth-Flow ohne echtes Discord prüfen lässt - in Produktion
+ * ist die Umleitung nicht erreichbar.
+ */
+const DISCORD_API =
+  process.env.NODE_ENV === 'test' &&
+  /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?\//.test(
+    String(process.env.BOT_HUB_DISCORD_API ?? ''),
+  )
+    ? String(process.env.BOT_HUB_DISCORD_API).replace(/\/+$/, '')
+    : 'https://discord.com/api/v10';
 const DISCORD_MANAGE_GUILD = 0x20n;
 const DISCORD_ADMINISTRATOR = 0x8n;
 const cleanupTimer = setInterval(() => {
@@ -94,6 +134,12 @@ const cleanupTimer = setInterval(() => {
   }
   for (const [key, value] of discordSessions) {
     if (value.expiresAt <= now) discordSessions.delete(key);
+  }
+  for (const [key, value] of panelBootstrapTokens) {
+    if (value.expiresAt <= now) panelBootstrapTokens.delete(key);
+  }
+  for (const [key, value] of panelSessionTokens) {
+    if (value.expiresAt <= now) panelSessionTokens.delete(key);
   }
 }, 60_000);
 cleanupTimer.unref();
@@ -128,6 +174,28 @@ export const panelToken = (id) => {
   return token;
 };
 
+export const issuePanelBootstrapToken = (botId) => {
+  const token = newToken();
+  panelBootstrapTokens.set(token, {
+    botId,
+    expiresAt: Date.now() + 60_000,
+  });
+  return token;
+};
+
+const consumePanelBootstrapToken = (botId, token) => {
+  const entry = panelBootstrapTokens.get(String(token ?? ''));
+  panelBootstrapTokens.delete(String(token ?? ''));
+  if (!entry || entry.botId !== botId || entry.expiresAt <= Date.now())
+    return false;
+  const sessionToken = newToken();
+  panelSessionTokens.set(sessionToken, {
+    botId,
+    expiresAt: Date.now() + 60 * 60 * 1000,
+  });
+  return sessionToken;
+};
+
 const sameToken = (a, b) => {
   const left = Buffer.from(String(a ?? ''));
   const right = Buffer.from(String(b ?? ''));
@@ -144,6 +212,14 @@ const readToken = (req, url) => {
     return header.replace(/^bearer\s+/i, '').trim();
   const custom = req.headers['x-bot-hub-token'];
   if (custom) return String(custom).trim();
+  const bootstrap = req.headers['x-bot-hub-bootstrap'];
+  if (bootstrap) {
+    const sessionToken = consumePanelBootstrapToken(
+      url.pathname.split('/')[3] ?? '',
+      bootstrap,
+    );
+    if (sessionToken) return sessionToken;
+  }
   const cookieName = `bot_hub_panel_access_${url.pathname.split('/')[3] ?? ''}`;
   const cookieToken = String(req.headers.cookie ?? '')
     .split(';')
@@ -166,56 +242,49 @@ export const identify = (req, url) => {
     if (sameToken(token, value)) return { id, scope: 'runtime' };
   for (const [id, value] of panelTokens)
     if (sameToken(token, value)) return { id, scope: 'panel' };
+  const session = panelSessionTokens.get(token);
+  if (session?.expiresAt > Date.now())
+    return { id: session.botId, scope: 'panel' };
   return null;
 };
 
 export const hubBaseUrl = () =>
   String(
-    process.env.BOT_HUB_URL || `http://127.0.0.1:${process.env.PORT || 8787}`,
+    process.env.BOT_HUB_CONTAINER_URL ||
+      process.env.BOT_HUB_URL ||
+      `http://127.0.0.1:${process.env.PORT || 8787}`,
   ).replace(/\/+$/, '');
-
-const parseDotenv = (content) => {
-  const values = {};
-  for (const line of String(content).split(/\r?\n/)) {
-    const match = line.match(
-      /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/,
-    );
-    if (!match) continue;
-    let value = match[2].trim();
-    if (
-      value.length >= 2 &&
-      ((value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'")))
-    ) {
-      value = value.slice(1, -1);
-      if (match[2].trim().startsWith('"'))
-        value = value
-          .replace(/\\n/g, '\n')
-          .replace(/\\"/g, '"')
-          .replace(/\\\\/g, '\\');
-    } else {
-      value = value.replace(/\s+#.*$/, '').trim();
-    }
-    values[match[1]] = value;
-  }
-  return values;
-};
 
 const discordConfig = (bot) => {
   // OAuth credentials belong to the bot panel, not to the hub globally.
-  // Only the Python Echo panel is currently allowed to use Discord OAuth.
-  const pythonBotDir = resolve(projectRoot(), 'bots/python-echo');
-  if (
-    resolve(projectRoot(), bot.cwd || '.') !== pythonBotDir ||
-    bot.language !== 'python'
-  )
-    return { clientId: '', clientSecret: '' };
-  const envPath = join(botDir(bot), '.env');
   try {
-    const values = parseDotenv(readFileSync(envPath, 'utf8'));
+    const localPaths = [
+      join(workspaceDir(bot), '.env'),
+      join(botDir(bot), '.env'),
+    ];
+    const securePath = join(projectRoot(), 'data', 'secrets', `${bot.id}.env`);
+    // Die Datei des Hubs (0600, außerhalb des Bot-Workspace) hat Vorrang.
+    // Der Workspace selbst gehört dem Bot und ist in Containerbetrieb
+    // schreibbar – ein Bot darf die OAuth-App seines Panels nicht umschreiben.
+    const envPath = [securePath, ...localPaths].find((path) =>
+      existsSync(path),
+    );
+    const values = envPath ? parseDotenv(readFileSync(envPath, 'utf8')) : {};
+    const oauthUrl = String(values.DISCORD_OAUTH_URL ?? '').trim();
+    let oauthClientId = '';
+    try {
+      oauthClientId = new URL(oauthUrl).searchParams.get('client_id') ?? '';
+    } catch {
+      // Die URL wird beim eigentlichen Login separat validiert.
+    }
     return {
-      clientId: String(values.DISCORD_CLIENT_ID ?? '').trim(),
-      clientSecret: String(values.DISCORD_CLIENT_SECRET ?? '').trim(),
+      clientId:
+        String(values.DISCORD_CLIENT_ID ?? '').trim() || oauthClientId.trim(),
+      clientSecret: String(
+        values.DISCORD_CLIENT_SECRET ?? values.DISCORD_CLIENT_TOKEN ?? '',
+      ).trim(),
+      oauthUrl,
+      redirectUri: String(values.DISCORD_REDIRECT_URI ?? '').trim(),
     };
   } catch (error) {
     if (error.code !== 'ENOENT')
@@ -223,8 +292,25 @@ const discordConfig = (bot) => {
         '[hub] Discord-Konfiguration konnte nicht gelesen werden:',
         error.message,
       );
-    return { clientId: '', clientSecret: '' };
+    return { clientId: '', clientSecret: '', redirectUri: '' };
   }
+};
+
+const requiresPanelDiscordLogin = (bot) => {
+  const { clientId, clientSecret } = discordConfig(bot);
+  return Boolean(clientId || clientSecret);
+};
+
+const requirePanelDiscordLogin = (bot, req) => {
+  if (!requiresPanelDiscordLogin(bot)) return;
+  const { clientId, clientSecret } = discordConfig(bot);
+  if (!clientId || !clientSecret)
+    throw httpError(
+      503,
+      'Bot-Anmeldung ist in der lokalen Bot-.env nicht vollständig konfiguriert',
+    );
+  if (!discordSession(req, bot.id))
+    throw httpError(401, 'Bitte zuerst in diesem Bot-Panel anmelden');
 };
 
 const discordCookie = (req, botId) =>
@@ -242,7 +328,11 @@ const panelSessionKey = (req, botId) => {
     .find(([key]) => key === cookieName)?.[1];
   const candidate = header || cookie || '';
   const token = panelTokens.get(botId);
-  return token && sameToken(candidate, token) ? `${botId}:${token}` : '';
+  if (token && sameToken(candidate, token)) return `${botId}:${token}`;
+  const session = panelSessionTokens.get(candidate);
+  return session?.botId === botId && session.expiresAt > Date.now()
+    ? `${botId}:${candidate}`
+    : '';
 };
 
 const discordSession = (req, botId) => {
@@ -263,9 +353,27 @@ const discordSession = (req, botId) => {
 const panelCookie = (botId, value, maxAge = 7 * 24 * 60 * 60) =>
   `bot_hub_panel_${botId}=${value}; Max-Age=${maxAge}; Path=/api/bots/${encodeURIComponent(
     botId,
-  )}/panel; HttpOnly; SameSite=Lax${
-    process.env.NODE_ENV === 'production' ? '; Secure' : ''
-  }`;
+  )}/panel; HttpOnly; SameSite=Lax${secureCookies() ? '; Secure' : ''}`;
+
+/**
+ * Voranmeldung-Kennung: bindet den Callback an den Browser, der den Login
+ * gestartet hat. Ohne diese Bindung kann ein Angreifer seinen eigenen
+ * Callback-Url an ein Opfer weiterreichen; dessen Browser übernimmt dann die
+ * Discord-Sitzung des Angreifers (Login-CSRF / Account-Switching). PKCE allein
+ * genügt nicht dafür - es beweist nur, dass der Code zum selben Flow gehört.
+ */
+const PRE_AUTH_TTL_MS = 10 * 60 * 1000;
+
+const preAuthCookie = (botId, value, maxAge = PRE_AUTH_TTL_MS / 1000) =>
+  `bot_hub_preauth_${botId}=${value}; Max-Age=${maxAge}; Path=/api/bots/${encodeURIComponent(
+    botId,
+  )}/panel; HttpOnly; SameSite=Lax${secureCookies() ? '; Secure' : ''}`;
+
+const preAuthId = (req, botId) =>
+  String(req.headers.cookie ?? '')
+    .split(';')
+    .map((part) => part.trim().split('='))
+    .find(([key]) => key === `bot_hub_preauth_${botId}`)?.[1] ?? '';
 
 const discordGuildAllowed = (guild) => {
   try {
@@ -288,6 +396,27 @@ const discordRequest = async (path, accessToken, scheme = 'Bearer') => {
   return response.json();
 };
 
+/**
+ * Verwirft ein Access-Token, dessen Nutzer abgelehnt wurde. Best effort: der
+ * Aufruf darf den Abbruch nicht verhindern, wenn Discord nicht erreichbar ist.
+ */
+const revokeDiscordToken = async (clientId, clientSecret, accessToken) => {
+  try {
+    await fetch(`${DISCORD_API}/oauth2/token/revoke`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        token: String(accessToken),
+      }),
+      signal: AbortSignal.timeout(3000),
+    });
+  } catch {
+    /* Das Token verfällt ohnehin von selbst. */
+  }
+};
+
 const botGuilds = async (bot) => {
   const token = String(bot.secretEnv?.DISCORD_BOT_TOKEN ?? '').trim();
   if (!token) return new Set();
@@ -301,32 +430,144 @@ const discordOrigin = (req) => {
   return `http://127.0.0.1:${process.env.PORT || 8787}`;
 };
 
+/**
+ * Adresse, unter der die Bot-Seite laufen muss.
+ *
+ * Der Discord-Login bindet den Callback an den Browser über ein Cookie, und
+ * Cookies gelten nur für den Host, bei dem sie gesetzt wurden. Das Cookie
+ * entsteht auf der Bot-Seite, der Callback kommt über die bei Discord
+ * registrierte Redirect-Adresse zurück. Landen beide auf verschiedenen Hosts
+ * (typisch im Entwicklungsbetrieb: Dashboard auf localhost:5173, Redirect auf
+ * 127.0.0.1:8787), findet der Callback das Cookie nicht und die Anmeldung
+ * scheitert. Deshalb hängt der Hub die Bot-Seite an genau die Adresse, die
+ * später auch den Callback bekommt.
+ */
+export const panelPageOrigin = (bot) => {
+  const { redirectUri } = discordConfig(bot);
+  if (redirectUri && validRedirectUri(redirectUri, bot.id)) {
+    try {
+      return new URL(redirectUri).origin;
+    } catch {
+      /* unten liegt der Fallback */
+    }
+  }
+  return discordOrigin();
+};
+
+const validRedirectUri = (value, botId) => {
+  let redirect;
+  try {
+    redirect = new URL(value);
+  } catch {
+    return false;
+  }
+  if (
+    !['https:', 'http:'].includes(redirect.protocol) ||
+    redirect.username ||
+    redirect.password ||
+    redirect.search ||
+    redirect.hash ||
+    redirect.pathname !==
+      `/api/bots/${encodeURIComponent(botId)}/panel/discord/callback`
+  )
+    return false;
+  if (redirect.protocol === 'http:' && !LOOPBACK.has(redirect.hostname))
+    return false;
+  return true;
+};
+
 const panelDiscordAuth = async (bot, req, res, url, rest) => {
-  const { clientId, clientSecret } = discordConfig(bot);
-  const redirectUri = `${discordOrigin(req)}/api/bots/${bot.id}/panel/discord/callback`;
+  const {
+    clientId,
+    clientSecret,
+    oauthUrl,
+    redirectUri: configuredRedirectUri,
+  } = discordConfig(bot);
+  let authorizationUrl;
+  try {
+    authorizationUrl = new URL(
+      oauthUrl || 'https://discord.com/oauth2/authorize',
+    );
+  } catch {
+    throw httpError(503, 'Discord-OAuth-URL ist ungültig');
+  }
+  if (
+    authorizationUrl.protocol !== 'https:' ||
+    authorizationUrl.hostname !== 'discord.com' ||
+    authorizationUrl.pathname !== '/oauth2/authorize'
+  )
+    throw httpError(503, 'Discord-OAuth-URL ist ungültig');
+  const redirectUri =
+    configuredRedirectUri ||
+    authorizationUrl.searchParams.get('redirect_uri') ||
+    `${discordOrigin(req)}/api/bots/${bot.id}/panel/discord/callback`;
+  if (!validRedirectUri(redirectUri, bot.id))
+    throw httpError(503, 'Discord-Redirect-URL ist ungültig');
   if (rest === 'discord/config' && req.method === 'GET')
     return sendJson(res, 200, {
       configured: Boolean(clientId && clientSecret),
       redirectUri,
     });
   if (rest === 'discord/login' && req.method === 'GET') {
-    const panelKey = panelSessionKey(req, bot.id);
-    if (!panelKey) throw httpError(403, 'Panel-Token erforderlich');
+    const ticketKey = url.searchParams.get('ticket') ?? '';
+    const ticket = ticketKey ? discordLoginTickets.get(ticketKey) : null;
+    if (ticketKey) discordLoginTickets.delete(ticketKey);
+    // Das Ticket ist der Nachweis der abrufenden Seite: ein fetch aus der
+    // Sandbox der Bot-Seite darf den Login anstoßen, aber der Browser muss
+    // die Start-Adresse selbst aufrufen (Cookie!), sonst legt der Hub den
+    // State in einer Umgebung an, in der das Cookie nicht ankommt.
+    const panelKey = ticket ? ticket.panelKey : panelSessionKey(req, bot.id);
+    if (
+      !panelKey ||
+      (ticket && (ticket.botId !== bot.id || ticket.expiresAt <= Date.now()))
+    )
+      throw httpError(
+        403,
+        ticketKey
+          ? 'Dieser Login-Aufruf ist abgelaufen. Bitte erneut anmelden.'
+          : 'Panel-Token erforderlich',
+      );
     if (!clientId || !clientSecret)
       throw httpError(
         503,
-        'Discord-Login ist für dieses Panel nicht konfiguriert',
+        clientId
+          ? 'DISCORD_CLIENT_SECRET oder DISCORD_CLIENT_TOKEN fehlt in der Bot-.env'
+          : 'DISCORD_CLIENT_ID oder DISCORD_OAUTH_URL mit client_id fehlt in der Bot-.env',
       );
+    // Abruf per fetch liefert nur ein Ticket für die Start-Adresse. Ohne das
+    // Ticket entsteht hier nichts: der State gehört in den Browser, der sich
+    // anmeldet, sonst könnte ihn jemand im fremden Browser anlegen und einem
+    // Opfer weiterreichen (Login-CSRF).
+    if (url.searchParams.get('format') === 'json') {
+      const now = Date.now();
+      for (const [key, value] of discordLoginTickets)
+        if (value.expiresAt <= now) discordLoginTickets.delete(key);
+      const ticketValue = randomBytes(24).toString('hex');
+      discordLoginTickets.set(ticketValue, {
+        botId: bot.id,
+        panelKey,
+        expiresAt: now + 60_000,
+      });
+      return sendJson(res, 200, {
+        location: `${panelPageOrigin(bot)}/api/bots/${encodeURIComponent(
+          bot.id,
+        )}/panel/discord/login?ticket=${ticketValue}`,
+        redirectUri,
+      });
+    }
     const state = randomBytes(24).toString('hex');
     const codeVerifier = randomBytes(32).toString('base64url');
     const codeChallenge = createHash('sha256')
       .update(codeVerifier)
       .digest('base64url');
+    const preAuth = randomBytes(24).toString('hex');
     discordAuthStates.set(state, {
       botId: bot.id,
       panelKey,
+      panelToken: panelKey.slice(`${bot.id}:`.length),
       codeVerifier,
-      expiresAt: Date.now() + 10 * 60 * 1000,
+      preAuth,
+      expiresAt: Date.now() + PRE_AUTH_TTL_MS,
     });
     const params = new URLSearchParams({
       client_id: clientId,
@@ -338,23 +579,54 @@ const panelDiscordAuth = async (bot, req, res, url, rest) => {
       code_challenge_method: 'S256',
       prompt: 'consent',
     });
+    for (const [key, value] of params)
+      authorizationUrl.searchParams.set(key, value);
     res.writeHead(302, {
-      location: `https://discord.com/oauth2/authorize?${params}`,
+      location: authorizationUrl.href,
+      'set-cookie': preAuthCookie(bot.id, preAuth),
+      'cache-control': 'no-store',
     });
     return res.end();
   }
   if (rest === 'discord/callback' && req.method === 'GET') {
-    const state = discordAuthStates.get(url.searchParams.get('state') ?? '');
-    discordAuthStates.delete(url.searchParams.get('state') ?? '');
+    const stateKey = url.searchParams.get('state') ?? '';
+    const state = discordAuthStates.get(stateKey);
+    discordAuthStates.delete(stateKey);
+    if (url.searchParams.has('error'))
+      throw httpError(400, 'Discord-Anmeldung wurde abgebrochen');
     const code = url.searchParams.get('code');
+    // Drei Bedingungen müssen zusammenpassen: der State gehört zu diesem Bot,
+    // er ist noch nicht abgelaufen, und der Browser, der den Callback öffnet,
+    // ist derselbe, der den Login gestartet hat.
+    const browser = preAuthId(req, bot.id);
     if (
       !state ||
       state.botId !== bot.id ||
-      state.panelKey !== panelSessionKey(req, bot.id) ||
       state.expiresAt <= Date.now() ||
       !code
     )
       throw httpError(400, 'Ungültige Discord-Anmeldung');
+    if (!browser || browser !== state.preAuth) {
+      // Nur die Namen, nie die Werte – im Log stehen keine Geheimnisse.
+      const names = String(req.headers.cookie ?? '')
+        .split(';')
+        .map((part) => part.trim().split('=')[0])
+        .filter(Boolean)
+        .join(', ');
+      console.error(
+        `[hub] Panel-Login "${bot.name}": keine passende Voranmeldung-Kennung. ` +
+          `Callback-Host ${String(req.headers.host ?? '?')}, ` +
+          `Cookies: ${names || 'keine'}.`,
+      );
+      throw httpError(
+        400,
+        browser
+          ? 'Diese Discord-Anmeldung gehört zu einem anderen Login-Versuch. Bitte im selben Fenster erneut anmelden.'
+          : 'Diese Discord-Anmeldung wurde in einem anderen Browser oder unter einer anderen Adresse gestartet. Bitte die Bot-Seite über die Hub-Adresse öffnen und dort erneut anmelden.',
+      );
+    }
+    if (!clientId || !clientSecret)
+      throw httpError(503, 'Bot-Anmeldung ist nicht konfiguriert');
     const tokenResponse = await fetch(`${DISCORD_API}/oauth2/token`, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -369,11 +641,45 @@ const panelDiscordAuth = async (bot, req, res, url, rest) => {
     });
     if (!tokenResponse.ok) throw httpError(502, 'Discord-Login fehlgeschlagen');
     const token = await tokenResponse.json();
+    if (typeof token.access_token !== 'string' || !token.access_token)
+      throw httpError(502, 'Discord-Login lieferte kein gültiges Token');
     const [user, guilds, installedGuildIds] = await Promise.all([
       discordRequest('/users/@me', token.access_token),
       discordRequest('/users/@me/guilds', token.access_token),
       botGuilds(bot),
     ]);
+    // Autorisiert wird nur gegen die Guild, für die der Bot hier konfiguriert
+    // ist. Eine andere Guild, in der derselbe Benutzer zufällig
+    // „Server verwalten" hat, ist kein Ersatz - sonst könnte ein fremder
+    // Server-Admin das Panel eines Bots bedienen, der gar nicht für ihn läuft.
+    //
+    // Ohne Bot-Token lässt sich nicht feststellen, wo der Bot installiert ist;
+    // dann bleibt die Prüfung der Berechtigung in der Ziel-Guild.
+    const targetGuild = String(bot.guildId ?? '').trim();
+    const installed = installedGuildIds.size ? installedGuildIds : null;
+    const allowed = guilds
+      .filter(discordGuildAllowed)
+      .filter((guild) => !installed || installed.has(String(guild.id)))
+      .filter((guild) => !targetGuild || String(guild.id) === targetGuild);
+    if (!allowed.length) {
+      // Das Token wird nicht weitergegeben; die Sitzung entsteht gar nicht.
+      await revokeDiscordToken(clientId, clientSecret, token.access_token);
+      console.warn(
+        `[hub] Discord-Anmeldung für ${bot.name} abgewiesen: ${
+          targetGuild
+            ? `keine Berechtigung in der Ziel-Guild ${targetGuild}`
+            : 'kein Server mit passender Berechtigung'
+        }${installed ? '' : ' (Bot hat kein DISCORD_BOT_TOKEN – Ziel-Guild nicht prüfbar)'}.`,
+      );
+      throw httpError(
+        403,
+        targetGuild
+          ? `In dem Server, für den dieser Bot läuft, fehlt dir die Berechtigung (Administrator oder Server verwalten)${
+              installed ? '' : ' oder der Bot ist dort nicht installiert'
+            }.`
+          : 'Du hast in keinem Server, in dem dieser Bot installiert ist, die Berechtigung (Administrator oder Server verwalten).',
+      );
+    }
     const sessionId = randomUUID();
     discordSessions.set(sessionId, {
       user: {
@@ -381,23 +687,27 @@ const panelDiscordAuth = async (bot, req, res, url, rest) => {
         name: user.global_name ?? user.username,
         avatar: user.avatar,
       },
-      guilds: guilds
-        .filter(discordGuildAllowed)
-        .filter((guild) => installedGuildIds.has(String(guild.id)))
-        .map(({ id, name, icon, owner, permissions }) => ({
-          id,
-          name,
-          icon,
-          owner: Boolean(owner),
-          permissions: String(permissions ?? '0'),
-        })),
+      guilds: allowed.map(({ id, name, icon, owner, permissions }) => ({
+        id,
+        name,
+        icon,
+        owner: Boolean(owner),
+        permissions: String(permissions ?? '0'),
+      })),
       expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
     });
-    const key = panelSessionKey(req, bot.id);
-    if (key) discordPanelSessions.set(key, sessionId);
+    // Der OAuth-Callback kommt aus dem Discord-Popup und enthält den
+    // ursprünglichen Panel-Token nicht zuverlässig. Der signierte State
+    // bindet die neue Discord-Session bereits eindeutig an dieses Panel.
+    if (state.panelKey) discordPanelSessions.set(state.panelKey, sessionId);
     res.writeHead(302, {
       location: `/api/bots/${bot.id}/panel/file/panel/index.html?discord=connected`,
-      'set-cookie': panelCookie(bot.id, sessionId),
+      'set-cookie': [
+        panelCookie(bot.id, sessionId),
+        preAuthCookie(bot.id, '', 0),
+      ],
+      'cache-control': 'no-store',
+      'referrer-policy': 'no-referrer',
     });
     return res.end();
   }
@@ -423,18 +733,17 @@ const panelDiscordAuth = async (bot, req, res, url, rest) => {
   return false;
 };
 
-/**
- * Verknüpft die zentrale Hub-Sitzung mit dem Panel, ohne OAuth-Codes oder
- * Discord-Access-Tokens an die Bot-Seite zu übergeben.
+/*
+ * The dashboard session is intentionally not forwarded to bot panels.
  */
-export const linkHubDiscordSession = async (
+const linkHubDiscordSession = async (
   bot,
   req,
   res,
   authSession,
   panelAccessToken = '',
 ) => {
-  if (!authSession?.user) return;
+  return;
   const cookieSessionId = discordCookie(req, bot.id);
   const existing = discordSession(req, bot.id);
   const panelKey = panelAccessToken
@@ -564,12 +873,12 @@ const normaliseCommand = (raw) => {
   const structured = typeof raw?.executable === 'string';
   const executable = text(raw?.executable, 120);
   const args = Array.isArray(raw?.args)
-    ? raw.args.filter((arg) => typeof arg === 'string').map((arg) => text(arg, 240))
+    ? raw.args
+        .filter((arg) => typeof arg === 'string')
+        .map((arg) => text(arg, 240))
     : [];
   const legacy = text(raw?.run, 400);
-  const commandText = structured
-    ? [executable, ...args].join(' ')
-    : legacy;
+  const commandText = structured ? [executable, ...args].join(' ') : legacy;
   if (/[;&|`$<>]/.test(commandText)) return null;
   const parsed = structured
     ? { executable, args }
@@ -605,6 +914,15 @@ const normalisePage = (raw) => {
  */
 export const normalisePanel = (input) => {
   if (!input || typeof input !== 'object') return null;
+  // Gespeicherte Manifeste liegen bereits normalisiert vor (dann heißen die
+  // Felder `fields` statt `settings`). Ohne diese Zweigstelle verlöre ein Bot
+  // nach jedem Neustart seine Formularfelder – Befehle und Seiten blieben,
+  // weil sie unter demselben Namen gespeichert werden.
+  const rawFields = Array.isArray(input.settings)
+    ? input.settings
+    : Array.isArray(input.fields)
+      ? input.fields
+      : [];
   const panel = {
     title: text(input.title, 60) || 'Bot-Seite',
     icon: text(input.icon, 4) || '🧩',
@@ -614,10 +932,7 @@ export const normalisePanel = (input) => {
       .map(normalisePage)
       .filter(Boolean)
       .slice(0, MAX_PAGES),
-    fields: (Array.isArray(input.settings) ? input.settings : [])
-      .map(normaliseField)
-      .filter(Boolean)
-      .slice(0, MAX_FIELDS),
+    fields: rawFields.map(normaliseField).filter(Boolean).slice(0, MAX_FIELDS),
     commands: (Array.isArray(input.commands) ? input.commands : [])
       .map(normaliseCommand)
       .filter(Boolean)
@@ -637,33 +952,37 @@ export const normalisePanel = (input) => {
 const projectRoot = () =>
   resolve(process.env.BOT_DASHBOARD_ROOT || process.cwd());
 
-const botDir = (bot) => {
+const workspaceDir = (bot) => {
   const root = realpathSync(projectRoot());
-  const dir = realpathSync(resolve(root, bot.cwd || '.'));
-  const rel = relative(root, dir);
+  if (process.env.BOT_HUB_TEST_MODE === '1') return root;
+  const workspaceInput = bot.workspaceRoot || `bots/${bot.id}/workspace`;
+  if (isAbsolute(workspaceInput))
+    throw httpError(400, 'Ungültiger Bot-Workspace');
+  const botsRoot = realpathSync(resolve(root, 'bots'));
+  const workspace = realpathSync(resolve(root, workspaceInput));
+  const rel = relative(botsRoot, workspace);
+  if (!rel || rel.startsWith('..') || isAbsolute(rel))
+    throw httpError(400, 'Bot-Workspace liegt außerhalb des Projekts');
+  return workspace;
+};
+
+const botDir = (bot) => {
+  const workspace = workspaceDir(bot);
+  const dir = realpathSync(resolve(workspace, bot.cwd || '.'));
+  const rel = relative(workspace, dir);
   if (rel.startsWith('..') || isAbsolute(rel))
-    throw httpError(400, 'Arbeitsordner liegt außerhalb des Projekts');
+    throw httpError(400, 'Arbeitsordner liegt außerhalb des Bot-Workspace');
   return dir;
 };
 
-const dotenvKey = (key) => {
-  const normalized = String(key)
-    .toUpperCase()
-    .replace(/[^A-Z0-9_]/g, '_');
-  return /^[A-Z_]/.test(normalized) ? normalized : `_${normalized}`;
-};
-
-const dotenvValue = (value) =>
-  `"${String(value ?? '')
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"')
-    .replace(/\r/g, '\\r')
-    .replace(/\n/g, '\\n')}"`;
-
 /**
- * Spiegelt die im Panel definierten Werte in eine lokale .env-Datei.
- * Die Datei wird absichtlich mit 0600 angelegt, weil sie Secret-Felder
- * enthalten kann.
+ * Spiegelt die im Panel definierten Werte in die Secret-Datei des Hubs und –
+ * im Testbetrieb – zusätzlich in den Workspace des Bots.
+ *
+ * `data/secrets/<id>.env` wird in jedem Betriebsmodus geschrieben: dort
+ * liegen die Werte, aus denen der Hub sie beim Start wieder einliest. Im
+ * Testbetrieb schreibt der Hub zusätzlich nach `<workspace>/.env`, damit der
+ * Bot seine .env im eigenen Ordner findet.
  */
 const writePanelEnv = (bot, settings) => {
   const fields = bot.panel?.manifest?.fields ?? [];
@@ -678,17 +997,31 @@ const writePanelEnv = (bot, settings) => {
   }
   if (!values.size) return;
 
-  const content = [...values.entries()]
-    .map(([key, value]) => `${key}=${dotenvValue(value)}`)
-    .join('\n');
-  const dir = botDir(bot);
-  const envPath = join(dir, '.env');
-  const tempPath = join(dir, `.env.bot-hub.tmp-${process.pid}-${Date.now()}`);
-
   try {
-    writeFileSync(tempPath, `${content}\n`, { encoding: 'utf8', mode: 0o600 });
+    storeSecretValues(projectRoot(), bot.id, Object.fromEntries(values), {
+      merge: false,
+    });
+  } catch (error) {
+    throw httpError(
+      500,
+      `.env konnte nicht gespeichert werden: ${error.message}`,
+    );
+  }
+
+  if (process.env.BOT_HUB_TEST_MODE !== '1') return;
+  const targetDir = botDir(bot);
+  const tempPath = join(
+    targetDir,
+    `.env.bot-hub.tmp-${bot.id}-${process.pid}-${Date.now()}`,
+  );
+  try {
+    mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+    writeFileSync(tempPath, formatDotenv(values), {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
     chmodSync(tempPath, 0o600);
-    renameSync(tempPath, envPath);
+    renameSync(tempPath, join(targetDir, '.env'));
   } catch (error) {
     try {
       if (existsSync(tempPath)) unlinkSync(tempPath);
@@ -779,13 +1112,34 @@ export const hydratePanel = (stored) => {
 
 const applyPanel = (bot, { manifest, path, signature, error }, source) => {
   const previous = bot.panel ?? emptyPanel();
-  if (previous.source === source && previous.signature === signature) return;
+  // Die Datei auf der Platte ist die Wahrheit. Ist der Hub-Stand unvollständig
+  // – etwa weil eine ältere Hub-Version die Felder beim Speichern verloren hat
+  // –, wird das Manifest erneut angewendet, statt die Lücke zu übernehmen.
+  const unvollstaendig =
+    manifest.fields.length > (previous.manifest?.fields?.length ?? 0) ||
+    manifest.commands.length > (previous.manifest?.commands?.length ?? 0);
+  if (
+    previous.source === source &&
+    previous.signature === signature &&
+    !unvollstaendig
+  )
+    return;
+
+  // Geheime Felder älterer Stände stehen ausschließlich in der .env des Bots,
+  // weil bots.json sie nie enthalten hat. Fehlt ein Wert im Hub-Stand, wird er
+  // von dort übernommen – sonst wäre er nach einem Neustart verloren.
+  let fromFile;
+  const fileValue = (key) => {
+    fromFile ??= readSecretValues(projectRoot(), bot.id);
+    const value = fromFile[dotenvKey(key)];
+    return value === undefined || value === '' ? undefined : value;
+  };
 
   const settings = {};
   const secretSettings = {};
   for (const field of manifest.fields) {
     const stored = field.secret
-      ? previous.secretSettings[field.key]
+      ? (previous.secretSettings[field.key] ?? fileValue(field.key))
       : previous.settings[field.key];
     if (stored === undefined) continue;
     if (field.secret) secretSettings[field.key] = String(stored);
@@ -1036,14 +1390,52 @@ const registerCallback = (bot, url, token) => {
   } catch {
     throw httpError(400, 'callback.url ist keine gültige URL');
   }
-  if (!LOOPBACK.has(parsed.hostname))
+  // SSRF-Schutz: Blockiere private/loopback-Adressen vollständig
+  const hostname = parsed.hostname.toLowerCase();
+  const isPrivate =
+    LOOPBACK.has(hostname) ||
+    hostname === '0.0.0.0' ||
+    hostname.startsWith('10.') ||
+    hostname.startsWith('192.168.') ||
+    hostname.startsWith('169.254.') ||
+    /^172\.(1[6-9]|2[0-9]|3[01])\./.test(hostname) ||
+    hostname.startsWith('fc') ||
+    hostname.startsWith('fd') ||
+    hostname.startsWith('fe80:') ||
+    hostname === '::1' ||
+    hostname === '[::1]';
+  if (isPrivate)
     throw httpError(
       400,
-      'callback.url muss auf localhost zeigen (127.0.0.1, ::1 oder localhost)',
+      'callback.url darf nicht auf private oder lokale Adressen zeigen (SSRF-Schutz)',
     );
+  // Nicht auf den Hub selbst: sonst lässt sich der Hub als Vermittler für
+  // eigene Aufrufe benutzen.
+  if ((parsed.port || '80') === String(process.env.PORT || 8787))
+    throw httpError(400, 'callback.url darf nicht auf den Hub selbst zeigen');
   callbacks.set(bot.id, { url: parsed.toString(), token: text(token, 200) });
   broadcastEvent('panel', { id: bot.id, panel: publicPanel(bot) });
   return { ok: true, url: parsed.origin };
+};
+
+/** Liest höchstens `max` Bytes – ein Callback soll keine unbegrenzte Flut
+ *  in den Hub hängen können. */
+const readLimited = async (response, max) => {
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > max) {
+      await reader.cancel().catch(() => {});
+      throw new Error(`Antwort größer als ${max} Byte`);
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks).toString('utf8');
 };
 
 const callCallback = async (bot, hook, command, args) => {
@@ -1062,9 +1454,12 @@ const callCallback = async (bot, hook, command, args) => {
         'x-bot-hub-token': hook.token,
       },
       body: payload,
+      // Keine Redirects: sonst hebt ein Callback auf dem localhost die
+      // Beschränkung auf loopback auf und der Hub ruft beliebige Ziele auf.
+      redirect: 'manual',
       signal: AbortSignal.timeout(CALLBACK_TIMEOUT),
     });
-    const raw = (await response.text()).slice(0, MAX_OUTPUT);
+    const raw = await readLimited(response, MAX_OUTPUT);
     let data = raw;
     try {
       data = JSON.parse(raw);
@@ -1081,44 +1476,125 @@ const callCallback = async (bot, hook, command, args) => {
   }
 };
 
-const runScript = (bot, command, args) =>
-  new Promise((resolveRun) => {
-    const dir = botDir(bot);
-    const settings = effectiveSettings(bot);
-    const executable = command.executable;
-    const commandArgs = command.args ?? [];
-    if (
-      isAbsolute(executable) ||
-      executable.includes('..') ||
-      commandArgs.some(
-        (arg) =>
-          isAbsolute(arg) ||
-          arg.split(/[\\/]/).includes('..') ||
-          /[;&|`$<>]/.test(arg),
-      )
-    ) {
-      resolveRun({
+/**
+ * Werkzeuge, die eine Panel-Aktion neben dem Interpreter der Bot-Sprache
+ * benutzen darf. Alles, was Dateien übertragen, Netze öffnen oder Prozesse
+ * starten kann (curl, wget, nc, ssh …), bleibt außen vor.
+ */
+const PANEL_RUNTIME_TOOLS = [
+  'node',
+  'python3',
+  'python',
+  'sh',
+  'bash',
+  'echo',
+  'printf',
+  'cat',
+  'ls',
+  'test',
+  'touch',
+  'grep',
+  'head',
+  'tail',
+  'wc',
+  'date',
+  'true',
+  'false',
+];
+
+/**
+ * Panel-Aktionen unterliegen denselben Regeln wie Start- und
+ * Installationsbefehle: nur ein freigegebenes Programm, keine
+ * Interpreter-Evaluationsflags und Pfade ausschließlich im Bot-Workspace.
+ * Ohne diese Prüfung wäre die HTML-Seite des Bots ein Weg aus seinem
+ * Container heraus in den Hub-Rechner.
+ */
+const scriptSpec = (bot, command, dir) => {
+  const executable = String(command.executable ?? '');
+  if (!executable || isAbsolute(executable) || /[/\\]/.test(executable))
+    throw httpError(
+      400,
+      'Panel-Befehl braucht ein Programm aus der freigegebenen Runtime',
+    );
+  const language = getLanguage(bot.language);
+  const allowed = new Set(
+    [language.runtime, ...PANEL_RUNTIME_TOOLS].filter(Boolean),
+  );
+  if (!allowed.has(executable))
+    throw httpError(
+      400,
+      'Programm ist für diese Bot-Sprache nicht freigegeben',
+    );
+  const args = [];
+  for (const arg of command.args ?? []) {
+    const value = String(arg);
+    if (isEvalFlag(value))
+      throw httpError(400, 'Interpreter-Evaluationsflags sind nicht erlaubt');
+    if (!value.includes('/') && !value.startsWith('.')) {
+      args.push(value);
+      continue;
+    }
+    const candidate = resolve(dir, value);
+    let trusted = candidate;
+    try {
+      if (existsSync(candidate)) trusted = realpathSync(candidate);
+    } catch {
+      trusted = candidate;
+    }
+    const rel = relative(dir, trusted);
+    if (rel.startsWith('..') || isAbsolute(rel))
+      throw httpError(400, 'Befehl verweist außerhalb des Bot-Workspace');
+    args.push(rel);
+  }
+  return { executable, args };
+};
+
+const runScript = async (bot, command, args) => {
+  const dir = botDir(bot);
+  let spec;
+  try {
+    spec = scriptSpec(bot, command, dir);
+  } catch (error) {
+    return { ok: false, via: 'script', error: error.message };
+  }
+  const settings = effectiveSettings(bot);
+  const scriptEnv = {
+    ...envFor(bot, dir),
+    ...settingEnv(settings),
+    BOT_HUB_ID: bot.id,
+    BOT_HUB_NAME: bot.name,
+    BOT_HUB_COMMAND: command.id,
+    BOT_HUB_COMMAND_LABEL: command.label,
+    BOT_HUB_ARGS: JSON.stringify(args ?? {}),
+    BOT_HUB_SETTINGS: JSON.stringify(settings),
+  };
+  // Wie der Bot selbst läuft eine Panel-Aktion im Container des Bots –
+  // nicht direkt auf dem Hub-Rechner.
+  const inContainer = containerRuntimeEnabled();
+  if (inContainer) {
+    try {
+      await ensureContainer(bot, projectRoot());
+    } catch (error) {
+      return {
         ok: false,
         via: 'script',
-        error: 'Panel-Befehl enthält einen unzulässigen Pfad oder Shell-Operator',
-      });
-      return;
+        error: `Container nicht verfügbar: ${error.message}`,
+      };
     }
-    const child = spawn(executable, commandArgs, {
-      cwd: dir,
-      env: {
-        ...envFor(bot, dir),
-        ...settingEnv(settings),
-        BOT_HUB_ID: bot.id,
-        BOT_HUB_NAME: bot.name,
-        BOT_HUB_COMMAND: command.id,
-        BOT_HUB_COMMAND_LABEL: command.label,
-        BOT_HUB_ARGS: JSON.stringify(args ?? {}),
-        BOT_HUB_SETTINGS: JSON.stringify(settings),
+  }
+  return new Promise((resolveRun) => {
+    const child = spawn(
+      inContainer ? containerRuntimeName() : spec.executable,
+      inContainer
+        ? execArgs(bot, projectRoot(), dir, spec, scriptEnv)
+        : spec.args,
+      {
+        cwd: inContainer ? projectRoot() : dir,
+        env: inContainer ? process.env : scriptEnv,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: true,
       },
-      stdio: ['ignore', 'pipe', 'pipe'],
-      detached: true,
-    });
+    );
 
     let out = '';
     let err = '';
@@ -1140,10 +1616,14 @@ const runScript = (bot, command, args) =>
 
     child.on('error', (error) => {
       clearTimeout(killer);
+      if (inContainer && !bot.child) stopContainer(bot).catch(() => {});
       resolveRun({ ok: false, via: 'script', error: error.message });
     });
+
     child.on('exit', (code) => {
       clearTimeout(killer);
+      // Nur den Container mitnehmen, den diese Aktion gestartet hat.
+      if (inContainer && !bot.child) stopContainer(bot).catch(() => {});
       const output = out.trim().slice(0, MAX_OUTPUT);
       const errors = err.trim().slice(0, MAX_OUTPUT);
       let data = output;
@@ -1162,6 +1642,7 @@ const runScript = (bot, command, args) =>
       });
     });
   });
+};
 
 /** Bitte den Bot, seine Live-Werte sofort neu zu melden – nicht erst beim
  * nächsten Herzschlag. Geht ins Leere, wenn kein Prozess läuft. */
@@ -1264,7 +1745,21 @@ export const publicPanel = (bot) => {
 /* ------------------------------------------------------------------ *
  * Statische Dateien der Bot-Seite
  * ------------------------------------------------------------------ */
-const sendFile = (res, path) => {
+const panelAssetOrigin = (req) => {
+  const protocol = String(req.headers['x-forwarded-proto'] ?? 'http')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  const host = String(req.headers.host ?? '').trim();
+  if (
+    !['http', 'https'].includes(protocol) ||
+    !/^(?:[a-z0-9.-]+|\[[0-9a-f:]+\])(?::\d{1,5})?$/i.test(host)
+  )
+    return '';
+  return `${protocol}://${host}`;
+};
+
+const sendFile = (res, path, assetOrigin = '') => {
   let stat;
   try {
     stat = statSync(path);
@@ -1280,13 +1775,22 @@ const sendFile = (res, path) => {
     'x-content-type-options': 'nosniff',
     // Panel-Dateien bleiben auch dann in einer opaken Origin, wenn jemand sie
     // direkt statt im Dashboard-iframe öffnet.
-    'content-security-policy':
-      "sandbox allow-scripts allow-forms allow-modals allow-popups allow-downloads allow-pointer-lock; default-src 'none'; script-src 'self' 'unsafe-inline' https:; style-src 'self' 'unsafe-inline' https:; connect-src 'self' http: https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; base-uri 'none'; frame-ancestors 'self'",
+    'content-security-policy': [
+      'sandbox allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads allow-pointer-lock',
+      "default-src 'none'",
+      "script-src 'self'",
+      "style-src 'self' 'unsafe-inline'",
+      `connect-src 'self'${assetOrigin ? ` ${assetOrigin}` : ''}`,
+      "img-src 'self' data: blob:",
+      "font-src 'self' data:",
+      "base-uri 'none'",
+      "frame-ancestors 'self'",
+    ].join('; '),
   });
   res.end(readFileSync(path));
 };
 
-const servePanelFile = (bot, res, rest, publicStatic = false) => {
+const servePanelFile = (bot, req, res, rest, publicStatic = false) => {
   const rel = safeRelPath(decodeURIComponent(rest));
   if (!rel) throw httpError(400, 'Ungültiger Pfad');
   if (publicStatic) {
@@ -1334,7 +1838,7 @@ const servePanelFile = (bot, res, rest, publicStatic = false) => {
     /\.(?:pem|key|p12|pfx|jks|keystore)$/i.test(target)
   )
     throw httpError(400, 'Ungültiger Pfad');
-  sendFile(res, target);
+  sendFile(res, target, panelAssetOrigin(req));
 };
 
 const BRIDGE_SOURCE = `/* Von \${location.origin}/api/bots/<id>/panel/bridge.js ausgeliefert.
@@ -1347,7 +1851,9 @@ const BRIDGE_SOURCE = `/* Von \${location.origin}/api/bots/<id>/panel/bridge.js 
 const parts = location.pathname.split('/').filter(Boolean);
 const botId = parts[0] === 'api' && parts[1] === 'bots' ? (parts[2] ?? '') : '';
 const embedded = window.parent !== window;
-let token = new URLSearchParams(location.hash.slice(1)).get('hub') ?? '';
+const panelSessionToken = "";
+let token = panelSessionToken;
+const bootstrapToken = new URLSearchParams(location.search).get('bootstrap') ?? '';
 
 const pending = new Map();
 let counter = 0;
@@ -1369,7 +1875,7 @@ if (embedded) {
     if (event.source !== parent) return;
     const data = event.data ?? {};
     if (data.source !== 'bot-hub') return;
-    if (data.type === 'hello') token = data.token ?? token;
+    if (data.type === 'hello') token = '';
     if (data.seq && pending.has(data.seq)) {
       const { resolve: done, reject } = pending.get(data.seq);
       pending.delete(data.seq);
@@ -1384,7 +1890,13 @@ if (embedded) {
 const request = async (url, method, body) => {
   const response = await fetch(url, {
     method,
-    headers: { 'content-type': 'application/json', 'x-bot-hub-token': token },
+    headers: {
+      'content-type': 'application/json',
+      ...(token ? { 'x-bot-hub-token': token } : {}),
+      ...(!token && bootstrapToken
+        ? { 'x-bot-hub-bootstrap': bootstrapToken }
+        : {}),
+    },
     credentials: 'include',
     body: body === undefined ? undefined : JSON.stringify(body),
   });
@@ -1451,7 +1963,9 @@ const direct = {
     return { ok: true, payload: view(last ? { ...last, state } : null) };
   },
   async notify({ message, kind }) {
-    await request('/api/hub/notify', 'POST', { message, kind });
+    // Ueber die Panel-API und nicht ueber /api/hub/notify: dort akzeptiert
+    // der Hub nur den Runtime-Token des laufenden Prozesses.
+    await request(base + '/notify', 'POST', { message, kind });
     return { ok: true };
   },
   async 'discord:config'() {
@@ -1459,6 +1973,12 @@ const direct = {
   },
   async 'discord:session'() {
     return request(base + '/discord/session', 'GET');
+  },
+  async 'discord:login'() {
+    // Liefert die Adresse, die der Browser als Navigation aufrufen muss - nicht
+    // die Discord-URL. Nur so legt der Hub den State in dem Browser an, der
+    // sich anmeldet, und das Bindungs-Cookie bleibt ein eigenes Cookie.
+    return request(base + '/discord/login?format=json', 'GET');
   },
   async 'discord:logout'() {
     return request(base + '/discord/logout', 'POST', {});
@@ -1487,9 +2007,8 @@ if (!embedded) {
 }
 
 export const hub = {
-  get token() {
-    return token;
-  },
+  // Bewusst ohne Getter fuer das Token: die Seite bekommt Befehle, keine
+  // Sitzung. Wer den Token auslesen kann, kann alles, was die Seite kann.
   settings: () => call('settings:get'),
   save: (values) => call('settings:set', { values }),
   command: (id, args = {}) => call('command', { id, args }),
@@ -1497,6 +2016,7 @@ export const hub = {
   notify: (message, kind = 'info') => call('notify', { message, kind }),
   discordConfig: () => call('discord:config'),
   discordSession: () => call('discord:session'),
+  discordLogin: () => call('discord:login'),
   discordLogout: () => call('discord:logout'),
 };
 
@@ -1511,7 +2031,6 @@ export const handlePanelRoutes = async (
   req,
   res,
   url,
-  authSession = null,
   panelTokenAuth = false,
   publicStatic = false,
 ) => {
@@ -1519,6 +2038,31 @@ export const handlePanelRoutes = async (
   if (parts[0] === 'panel') parts.shift();
   const rest = parts.join('/');
   ensurePanel(bot);
+
+  if (req.method === 'GET' && rest === 'bridge.js') {
+    res.setHeader('content-type', 'text/javascript; charset=utf-8');
+    res.setHeader('cache-control', 'no-store');
+    res.setHeader('x-content-type-options', 'nosniff');
+    const bootstrap = url.searchParams.get('bootstrap');
+    const sessionToken =
+      bootstrap && consumePanelBootstrapToken(bot.id, bootstrap);
+    if (sessionToken) {
+      res.setHeader(
+        'set-cookie',
+        `bot_hub_panel_access_${bot.id}=${panelToken(
+          bot.id,
+        )}; Max-Age=3600; Path=/api/bots/${encodeURIComponent(
+          bot.id,
+        )}/panel; HttpOnly; SameSite=Lax${secureCookies() ? '; Secure' : ''}`,
+      );
+      return res.end(
+        BRIDGE_SOURCE.replace(
+          'const panelSessionToken = "";',
+          `const panelSessionToken = ${JSON.stringify(sessionToken)};`,
+        ),
+      );
+    }
+  }
 
   const authResult = await panelDiscordAuth(bot, req, res, url, rest);
   if (authResult !== false) return authResult;
@@ -1535,20 +2079,20 @@ export const handlePanelRoutes = async (
           rest.startsWith('file/'))) ||
       (req.method === 'PUT' && (rest === 'settings' || rest === 'state')) ||
       (req.method === 'POST' &&
-        (rest === 'discord/logout' || rest.startsWith('commands/')))
+        (rest === 'notify' ||
+          rest === 'discord/logout' ||
+          rest.startsWith('commands/')))
     )
   )
     throw httpError(403, 'Diese Panel-Aktion ist nur im Dashboard erlaubt');
 
   if (req.method === 'GET' && !rest) {
-    await linkHubDiscordSession(bot, req, res, authSession);
     return sendJson(res, 200, {
       panel: publicPanel(bot),
       // Für die Bot-Seite im neuen Tab: sie hat kein Elternfenster und braucht
       // den Namen für ihren Kopf, sonst bleibt er leer.
       bot: { id: bot.id, name: bot.name, emoji: bot.emoji },
       bridge: {
-        token: panelToken(bot.id),
         file: `/api/bots/${bot.id}/panel/bridge.js`,
         base: `/api/bots/${bot.id}/panel`,
       },
@@ -1576,6 +2120,7 @@ export const handlePanelRoutes = async (
   }
 
   if (req.method === 'PUT' && rest === 'settings') {
+    requirePanelDiscordLogin(bot, req);
     const body = await readBody(req);
     const result = saveSettings(bot, body.values ?? {});
     return sendJson(res, 200, { panel: publicPanel(bot), ...result });
@@ -1585,11 +2130,22 @@ export const handlePanelRoutes = async (
     return sendJson(res, 200, { settings: publicSettings(bot) });
 
   if (req.method === 'PUT' && rest === 'state') {
+    requirePanelDiscordLogin(bot, req);
     const body = await readBody(req);
     return sendJson(res, 200, { state: pushState(bot, body.state ?? {}) });
   }
 
+  // Meldung aus der Bot-Seite. Sie laeuft ueber die Panel-API und nicht ueber
+  // /api/hub/notify: dort ist der laufende Prozess (Runtime-Token) der
+  // einzige Schreiber, die Seite darf aber weiterhin Toasts ausloesen.
+  if (req.method === 'POST' && rest === 'notify') {
+    requirePanelDiscordLogin(bot, req);
+    const body = await readBody(req);
+    return sendJson(res, 200, notifyUser(bot, body.message, body.kind));
+  }
+
   if (req.method === 'POST' && rest.startsWith('commands/')) {
+    requirePanelDiscordLogin(bot, req);
     const commandId = decodeURIComponent(rest.slice('commands/'.length));
     const body = await readBody(req);
     const result = await runAction(bot, commandId, body.args ?? {});
@@ -1597,16 +2153,18 @@ export const handlePanelRoutes = async (
   }
 
   if (req.method === 'GET' && rest === 'bridge.js') {
-    res.writeHead(200, {
-      'content-type': 'text/javascript; charset=utf-8',
-      'cache-control': 'no-store',
-      'x-content-type-options': 'nosniff',
-    });
+    res.writeHead(200);
     return res.end(BRIDGE_SOURCE);
   }
 
   if (req.method === 'GET' && rest.startsWith('file/'))
-    return servePanelFile(bot, res, rest.slice('file/'.length), publicStatic);
+    return servePanelFile(
+      bot,
+      req,
+      res,
+      rest.slice('file/'.length),
+      publicStatic,
+    );
 
   throw httpError(405, 'Methode nicht erlaubt');
 };
@@ -1630,7 +2188,8 @@ const sessionOf = (bot, runtime) => ({
   manifestPath: bot.panel?.path ?? '',
   source: bot.panel?.source ?? null,
   settings: runtime ? effectiveSettings(bot) : publicSettings(bot),
-  panelToken: panelToken(bot.id),
+  // Panel-Token nur für Panel-Scope, nie für Runtime-Bots
+  panelToken: runtime ? undefined : panelToken(bot.id),
   commands: (bot.panel?.manifest?.commands ?? []).map(
     ({ id, label, description, danger }) => ({
       id,
@@ -1709,14 +2268,116 @@ export const handleHubRoutes = async (req, res, url, getBot) => {
   }
 
   if (req.method === 'POST' && rest === '/state') {
+    // Nur der laufende Prozess darf Live-Werte schreiben. Das Panel-Token
+    // gehoert der Bot-Seite; es darf lesen, aber keine Bot-Zustaende veraendern.
+    if (!runtime)
+      throw httpError(
+        403,
+        'Nur der laufende Prozess darf den Zustand des Bots aendern.',
+      );
     const body = await readBody(req);
     return sendJson(res, 200, { state: pushState(bot, body.state ?? body) });
   }
 
   if (req.method === 'POST' && rest === '/notify') {
+    // Wie /state: der Hub-Endpunkt gehoert dem Prozess. Die Bot-Seite nutzt
+    // /api/bots/<id>/panel/notify.
+    if (!runtime)
+      throw httpError(
+        403,
+        'Nur der laufende Prozess darf Benachrichtigungen ausloesen.',
+      );
     const body = await readBody(req);
     return sendJson(res, 200, notifyUser(bot, body.message, body.kind));
   }
 
+  if (rest === '/db' || rest.startsWith('/db/'))
+    return handleStoreRoutes(req, res, url, bot, identity);
+
   throw httpError(404, 'Unbekannter Hub-Endpunkt');
+};
+
+/* ------------------------------------------------------------------ *
+ * Bot-Speicher: /api/hub/db/...
+ * ------------------------------------------------------------------ */
+
+/**
+ * Jeder Bot bekommt seinen eigenen Bereich in derselben Tabelle. Welcher Bot
+ * das ist, entscheidet allein das Token - ein Bot-Id aus der Anfrage gibt es
+ * hier nicht, damit niemand durch Raten oder Mitsenden fremde Werte erreicht.
+ */
+const segment = (value, name) => {
+  let text;
+  try {
+    text = decodeURIComponent(String(value ?? ''));
+  } catch {
+    throw httpError(400, `${name} ist ungültig kodiert.`);
+  }
+  return text;
+};
+
+const handleStoreRoutes = async (req, res, url, bot, identity) => {
+  // Wie /state und /notify: die Bot-Seite arbeitet mit dem Panel-Token und
+  // bekommt den Speicher nicht zu sehen. Nur der laufende Prozess darf.
+  if (identity.scope !== 'runtime')
+    throw httpError(
+      403,
+      'Den Bot-Speicher darf nur der laufende Prozess nutzen (BOT_HUB_TOKEN).',
+    );
+
+  const parts = url.pathname
+    .slice('/api/hub/db'.length)
+    .split('/')
+    .filter(Boolean);
+  const store = database();
+  const botId = bot.id;
+
+  if (req.method === 'GET' && parts.length === 0)
+    return sendJson(res, 200, { database: store.status() });
+
+  if (parts.length === 1) {
+    const collection = segment(parts[0], 'Der Sammlungsname');
+    if (req.method === 'GET')
+      return sendJson(
+        res,
+        200,
+        await store.list(botId, {
+          collection,
+          prefix: url.searchParams.get('prefix'),
+          limit: url.searchParams.get('limit'),
+          offset: url.searchParams.get('offset'),
+        }),
+      );
+    throw httpError(405, 'Methode nicht erlaubt');
+  }
+
+  if (parts.length === 2) {
+    const collection = segment(parts[0], 'Der Sammlungsname');
+    const key = segment(parts[1], 'Der Schlüssel');
+    if (req.method === 'GET') {
+      const entry = await store.get(botId, collection, key);
+      if (!entry)
+        throw httpError(
+          404,
+          'Eintrag nicht gefunden – der Hub hat dazu nichts.',
+        );
+      return sendJson(res, 200, { entry });
+    }
+    if (req.method === 'PUT') {
+      const body = await readBody(req);
+      if (!Object.prototype.hasOwnProperty.call(body, 'value'))
+        throw httpError(400, 'PUT erwartet ein Feld "value".');
+      const result = await store.set(botId, collection, key, body.value);
+      return sendJson(res, 200, {
+        entry: { collection, key, ...result },
+      });
+    }
+    if (req.method === 'DELETE')
+      return sendJson(res, 200, {
+        removed: await store.remove(botId, collection, key),
+      });
+    throw httpError(405, 'Methode nicht erlaubt');
+  }
+
+  throw httpError(404, 'Unbekannter Bot-Speicher-Endpunkt');
 };

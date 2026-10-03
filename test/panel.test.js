@@ -3,11 +3,27 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { after, before, describe, it } from 'node:test';
+import { after, before, beforeEach, describe, it } from 'node:test';
 
 let root;
 let baseUrl;
 let server;
+let discordMock;
+
+/** Guild, in der der Bot installiert ist. */
+const TARGET_GUILD = 'guild-ziel';
+const ANDERE_GUILD = 'guild-fremd';
+const ADMIN = String(0x8n);
+const MANAGE_GUILD = String(0x20n);
+const KEINE = '0';
+
+const guild = (id, permissions) => ({
+  id,
+  name: id,
+  icon: null,
+  owner: false,
+  permissions,
+});
 
 const call = async (path, options = {}) => {
   const response = await fetch(`${baseUrl}/api${path}`, {
@@ -101,12 +117,28 @@ const MANIFEST = {
       commands: [
         { id: 'ping', label: 'Ping', run: 'echo pong' },
         { id: 'leer', label: 'Ohne Skript' },
+        {
+          id: 'skript',
+          label: 'Skript',
+          run: 'sh report.sh',
+        },
+        { id: 'interpreter', label: 'Interpreter', run: 'sh -c id' },
+        { id: 'python_eval', label: 'Python-Eval', run: 'python3 -c"id"' },
+        { id: 'werkzeug', label: 'Werkzeug', run: 'curl https://evil.test' },
+        {
+          id: 'nach_oben',
+          label: 'Nach oben',
+          run: 'sh ../../job.sh',
+        },
+        { id: 'leer', label: 'Ohne Skript' },
       ],
     },
   },
 };
 
 before(async () => {
+  // Der Testmodus ist nur mit NODE_ENV=test erlaubt (server/index.js).
+  process.env.NODE_ENV = 'test';
   process.env.BOT_HUB_TEST_MODE = '1';
   root = mkdtempSync(join(tmpdir(), 'bot-hub-panel-'));
   mkdirSync(join(root, 'worker'));
@@ -137,12 +169,54 @@ before(async () => {
     join(root, 'worker', 'extra.html'),
     '<!doctype html><h1>Extra</h1>',
   );
+  writeFileSync(join(root, 'worker', 'report.sh'), 'echo "bericht $1"\n');
   writeFileSync(
     join(root, 'nackt', 'bot.sh'),
     'echo "token=$BOT_HUB_TOKEN"\nsleep 30\n',
   );
 
   process.env.BOT_DASHBOARD_ROOT = root;
+  // Der OAuth-Flow spricht mit Discord. Für die Tests läuft ein Mock, der
+  // Nutzer, Guild-Liste und Token-Austausch nachstellt – die Basis-URL ist
+  // nur mit NODE_ENV=test überschreibbar.
+  discordMock = createServer((req, res) => {
+    const authorization = String(req.headers.authorization ?? '');
+    const send = (status, payload) => {
+      const body = JSON.stringify(payload);
+      res.writeHead(status, {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+      });
+      res.end(body);
+    };
+    if (req.url.endsWith('/oauth2/token')) {
+      discordMock.tokens += 1;
+      return send(200, { access_token: 'mock-access-token' });
+    }
+    if (req.url.endsWith('/oauth2/token/revoke')) {
+      discordMock.revoked += 1;
+      return send(200, {});
+    }
+    if (req.url.endsWith('/users/@me'))
+      return send(200, {
+        id: discordMock.user.id,
+        username: discordMock.user.name,
+        global_name: discordMock.user.name,
+        avatar: null,
+      });
+    if (req.url.endsWith('/users/@me/guilds'))
+      return send(
+        200,
+        authorization.startsWith('Bot ')
+          ? discordMock.botGuilds
+          : discordMock.userGuilds,
+      );
+    return send(404, {});
+  });
+  await new Promise((resolve) => discordMock.listen(0, '127.0.0.1', resolve));
+  process.env.BOT_HUB_DISCORD_API = `http://127.0.0.1:${
+    discordMock.address().port
+  }/api/v10`;
   const { createServer: createApp } = await import('../server/manager.js');
   server = createServer(createApp());
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -154,6 +228,7 @@ before(async () => {
 after(() => {
   server?.closeAllConnections?.();
   server?.close();
+  discordMock?.close();
 });
 
 describe('Bot-Seite aus einem Manifest', () => {
@@ -183,7 +258,7 @@ describe('Bot-Seite aus einem Manifest', () => {
       mode: 'safe',
     });
     assert.equal(data.panel.online, false);
-    assert.ok(data.bridge.token.length > 20);
+    assert.equal(data.bridge.token, undefined);
   });
 
   it('liefert die Dateien der Bot-Seite aus – aber nur im Arbeitsordner', async () => {
@@ -235,16 +310,22 @@ describe('Bot-Seite aus einem Manifest', () => {
     );
     assert.equal(response.status, 302);
     const location = response.headers.get('location');
+    // Absolut und auf der Adresse, die auch den Discord-Callback bekommt:
+    // das Bindungs-Cookie des Logins gilt nur für diesen Host. Im
+    // Entwicklungsbetrieb lädt das Dashboard die Seite sonst über den
+    // Vite-Port, und der Callback käme bei einem anderen Host an.
+    assert.ok(location.startsWith(baseUrl), location);
     assert.match(
       location,
       new RegExp(`/api/bots/${bot.id}/panel/file/page\\.html`),
     );
-    assert.match(location, /#hub=[a-f0-9]{48}$/);
+    assert.ok(!location.includes('#hub='));
+    assert.match(location, /[?&]bootstrap=[a-f0-9]{48}$/);
     const cookie = response.headers.get('set-cookie');
     assert.match(cookie, new RegExp(`bot_hub_panel_access_${bot.id}=`));
     assert.match(cookie, /HttpOnly/);
     assert.match(cookie, /SameSite=Lax/);
-    const pageResponse = await fetch(`${baseUrl}${location.split('#')[0]}`, {
+    const pageResponse = await fetch(location.split('#')[0], {
       headers: { cookie },
     });
     assert.equal(pageResponse.status, 200);
@@ -257,6 +338,35 @@ describe('Bot-Seite aus einem Manifest', () => {
       nestedStylesheet.headers.get('content-type'),
       'text/css; charset=utf-8',
     );
+
+    const bootstrapUrl = new URL(location);
+    const bootstrap = bootstrapUrl.searchParams.get('bootstrap');
+    const bridgeResponse = await fetch(
+      `${baseUrl}/api/bots/${bot.id}/panel/bridge.js?bootstrap=${bootstrap}`,
+      { headers: { origin: 'null' } },
+    );
+    assert.equal(bridgeResponse.status, 200);
+    assert.match(
+      bridgeResponse.headers.get('content-type'),
+      /text\/javascript/,
+    );
+    const bridgeSource = await bridgeResponse.text();
+    assert.match(bridgeSource, /const panelSessionToken = "[a-f0-9]{48}";/);
+    const bootstrapCookie = bridgeResponse.headers.get('set-cookie');
+    assert.match(
+      bootstrapCookie,
+      new RegExp(`bot_hub_panel_access_${bot.id}=`),
+    );
+    const panelResponse = await fetch(`${baseUrl}/api/bots/${bot.id}/panel`, {
+      headers: { origin: 'null', cookie: bootstrapCookie },
+    });
+    assert.equal(panelResponse.status, 200);
+    const replay = await fetch(
+      `${baseUrl}/api/bots/${bot.id}/panel/bridge.js?bootstrap=${bootstrap}`,
+      { headers: { origin: 'null' } },
+    );
+    assert.equal(replay.status, 200);
+    assert.equal(replay.headers.get('set-cookie'), null);
   });
 
   it('speichert Einstellungen, maskiert Geheimnisse und wirft sie um', async () => {
@@ -312,6 +422,14 @@ describe('Bot-Seite aus einem Manifest', () => {
     assert.equal(ping.result.ok, true);
     assert.equal(ping.result.data, 'pong');
 
+    // Ein Skript im eigenen Workspace läuft weiterhin normal.
+    const { data: script } = await call(
+      `/bots/${bot.id}/panel/commands/skript`,
+      { method: 'POST', body: {} },
+    );
+    assert.equal(script.result.ok, true);
+    assert.equal(script.result.data, 'bericht');
+
     const missing = await call(`/bots/${bot.id}/panel/commands/leer`, {
       method: 'POST',
       body: {},
@@ -324,6 +442,41 @@ describe('Bot-Seite aus einem Manifest', () => {
       body: {},
     });
     assert.equal(unknown.status, 404);
+  });
+
+  it('führt Panel-Aktionen nur als freigegebenes Programm im Workspace aus', async () => {
+    // Das Manifest stammt aus dem Bot-Workspace und wird von einer Seite
+    // ausgelöst, die selbst in einer Sandbox läuft. Ein Manifest darf
+    // deshalb keine beliebigen Befehle auf dem Hub-Rechner starten.
+    for (const [id, expected] of [
+      ['interpreter', /Interpreter-Evaluationsflags sind nicht erlaubt/],
+      ['python_eval', /Interpreter-Evaluationsflags sind nicht erlaubt/],
+      ['werkzeug', /nicht freigegeben/],
+      ['nach_oben', /außerhalb des Bot-Workspace/],
+    ]) {
+      const { data } = await call(`/bots/${bot.id}/panel/commands/${id}`, {
+        method: 'POST',
+        body: {},
+      });
+      assert.equal(data.result.ok, false, `${id} wurde ausgeführt`);
+      assert.match(data.result.error, expected);
+    }
+  });
+
+  it('zeigt dem Panel-Token nur die freigegebenen Aktionen', async () => {
+    // Der Bot-Prozess selbst kann über /api/hub/session an den Panel-Token
+    // kommen. Auch damit darf kein beliebiger Befehl laufen.
+    const { panelToken } = await import('../server/panel.js');
+    const asPage = callWithToken(panelToken(bot.id));
+    const { data } = await asPage(
+      `/bots/${bot.id}/panel/commands/interpreter`,
+      {
+        method: 'POST',
+        body: {},
+      },
+    );
+    assert.equal(data.result.ok, false);
+    assert.match(data.result.error, /Interpreter-Evaluationsflags/);
   });
 
   it('reicht die Werte beim Start als Umgebung weiter', async () => {
@@ -438,12 +591,13 @@ describe('Bot-Seite aus dem laufenden Prozess', () => {
       401,
     );
 
-    const { data: panel } = await call(`/bots/${bot.id}/panel`);
-    const page = callWithToken(panel.bridge.token);
+    const { panelToken } = await import('../server/panel.js');
+    const panelAccessToken = panelToken(bot.id);
+    const page = callWithToken(panelAccessToken);
     const standalone = await fetch(`${baseUrl}/api/bots/${bot.id}/panel`, {
       headers: {
         origin: 'null',
-        'x-bot-hub-token': panel.bridge.token,
+        'x-bot-hub-token': panelAccessToken,
       },
     });
     assert.equal(standalone.status, 200);
@@ -452,7 +606,7 @@ describe('Bot-Seite aus dem laufenden Prozess', () => {
       (
         await fetch(
           `${baseUrl}/api/hub/session?token=${encodeURIComponent(
-            panel.bridge.token,
+            panelAccessToken,
           )}`,
         )
       ).status,
@@ -464,7 +618,7 @@ describe('Bot-Seite aus dem laufenden Prozess', () => {
           method: 'POST',
           headers: {
             origin: 'null',
-            'x-bot-hub-token': panel.bridge.token,
+            'x-bot-hub-token': panelAccessToken,
           },
         })
       ).status,
@@ -484,6 +638,62 @@ describe('Bot-Seite aus dem laufenden Prozess', () => {
     // Lesen darf die Seite aber
     const { data: read } = await page('/hub/settings');
     assert.deepEqual(read.settings, { modus: 'ruhig' });
+  });
+
+  it('trennt Panel- und Runtime-Token fuer Zustand und Meldungen', async () => {
+    const { panelToken } = await import('../server/panel.js');
+    const page = callWithToken(panelToken(bot.id));
+
+    // Das Panel-Token gehoert der Bot-Seite: lesen ja, Bot-Zustaende schreiben nein.
+    for (const rest of ['/state', '/notify']) {
+      const denied = await page(`/hub${rest}`, {
+        method: 'POST',
+        body: { state: { status: 'falsch' }, message: 'falsch' },
+      });
+      assert.equal(denied.status, 403, `Panel-Token durfte ${rest} schreiben`);
+    }
+
+    // Der laufende Prozess darf beides weiterhin.
+    const asBot = callWithToken(token);
+    assert.equal(
+      (
+        await asBot('/hub/state', {
+          method: 'POST',
+          body: { state: { status: 'online' } },
+        })
+      ).status,
+      200,
+    );
+    assert.equal(
+      (await asBot('/hub/notify', { method: 'POST', body: { message: 'hi' } }))
+        .status,
+      200,
+    );
+
+    // Fuer die Bot-Seite gibt es den Panel-Weg weiterhin.
+    const viaPanel = await page(`/bots/${bot.id}/panel/notify`, {
+      method: 'POST',
+      body: { message: 'von der Seite' },
+    });
+    assert.equal(viaPanel.status, 200);
+    assert.equal(viaPanel.data.ok, true);
+  });
+
+  it('gibt den Panel-Token nicht ueber die JS-Bridge aus', async () => {
+    const { panelToken } = await import('../server/panel.js');
+    const bridge = await fetch(
+      `${baseUrl}/api/bots/${bot.id}/panel/bridge.js`,
+      {
+        headers: {
+          origin: 'null',
+          'x-bot-hub-token': panelToken(bot.id),
+        },
+      },
+    );
+    const source = await bridge.text();
+    assert.match(source, /export const hub/);
+    assert.ok(!source.includes('get token'), 'Bridge gibt das Token aus');
+    assert.match(source, /base \+ '\/notify'/);
   });
 
   it('vergibt das Manifest Vorrang vor der Laufzeit-Anmeldung', async () => {
@@ -537,5 +747,262 @@ describe('Herkunft und Mandant', () => {
       headers: { origin: 'null' },
     });
     assert.equal(sandbox.status, 403);
+  });
+});
+
+/*
+ * Anmeldung im Bot-Panel: Browser-Bindung und Autorisierung gegen genau die
+ * Guild, für die der Bot konfiguriert ist.
+ */
+describe('Bot-Anmeldung am Panel', () => {
+  let bot;
+  let page;
+  /*
+   * Der echte Ablauf in zwei Schritten, genau wie im Browser:
+   * 1. Die Bot-Seite fragt per fetch an und bekommt nur eine Start-Adresse.
+   * 2. Der Browser ruft diese Adresse als Navigation auf - erst dort entstehen
+   *    State und Bindungs-Cookie, weil ein Cookie aus einem sandboxed fetch
+   *    der Browser beim Rücksprung von Discord nicht mitschickt.
+   */
+  const loginStart = async () => {
+    const response = await fetch(
+      `${baseUrl}/api/bots/${bot.id}/panel/discord/login?format=json`,
+      { headers: { 'x-bot-hub-token': page } },
+    );
+    const raw = await response.text();
+    assert.equal(response.status, 200, raw);
+    const { location: start } = JSON.parse(raw);
+    const target = new URL(start);
+    assert.equal(target.pathname, `/api/bots/${bot.id}/panel/discord/login`);
+    assert.match(target.searchParams.get('ticket') ?? '', /^[a-f0-9]{48}$/);
+    // Ohne Navigation gibt es weder State noch Cookie.
+    assert.equal(response.headers.get('set-cookie'), null);
+    return start;
+  };
+  const stateOf = async () => {
+    const response = await fetch(await loginStart(), { redirect: 'manual' });
+    assert.equal(response.status, 302);
+    const location = new URL(response.headers.get('location'));
+    assert.equal(location.hostname, 'discord.com');
+    assert.equal(location.pathname, '/oauth2/authorize');
+    assert.equal(location.searchParams.get('code_challenge_method'), 'S256');
+    assert.ok(location.searchParams.get('code_challenge'));
+    const cookie = response.headers.get('set-cookie');
+    assert.match(cookie, new RegExp(`bot_hub_preauth_${bot.id}=[a-f0-9]{48}`));
+    assert.match(cookie, /HttpOnly/);
+    assert.match(cookie, /SameSite=Lax/);
+    return {
+      state: location.searchParams.get('state'),
+      // Nur der Name vor dem ersten "=" – der Weg ist fuer den Test egal.
+      cookie: cookie.split(';')[0],
+    };
+  };
+  const callback = (state, cookie) =>
+    fetch(
+      `${baseUrl}/api/bots/${bot.id}/panel/discord/callback?state=${state}&code=mock-code`,
+      { redirect: 'manual', headers: cookie ? { cookie } : {} },
+    );
+
+  beforeEach(async () => {
+    discordMock.user = { id: 'user-1', name: 'Tester' };
+    discordMock.botGuilds = [
+      guild(TARGET_GUILD, ADMIN),
+      guild(ANDERE_GUILD, '0'),
+    ];
+    discordMock.userGuilds = [guild(TARGET_GUILD, ADMIN)];
+    discordMock.tokens = 0;
+    discordMock.revoked = 0;
+    bot = await createBot({
+      name: 'Anmeldung',
+      language: 'custom',
+      cwd: 'worker',
+      entrypoint: 'bot.sh',
+      command: 'sh {entrypoint}',
+      guildId: TARGET_GUILD,
+      secretEnv: { DISCORD_BOT_TOKEN: 'mock-bot-token' },
+    });
+    // Die OAuth-App des Panels liegt in der geschuetzten Secret-Datei.
+    mkdirSync(join(root, 'data', 'secrets'), { recursive: true });
+    writeFileSync(
+      join(root, 'data', 'secrets', `${bot.id}.env`),
+      'DISCORD_CLIENT_ID=mock-client\nDISCORD_CLIENT_SECRET=mock-secret\n',
+    );
+    const { panelToken } = await import('../server/panel.js');
+    page = panelToken(bot.id);
+  });
+
+  it('gibt das Start-Ticket nur einmal frei', async () => {
+    const start = await loginStart();
+    const first = await fetch(start, { redirect: 'manual' });
+    assert.equal(first.status, 302);
+    assert.equal(
+      new URL(first.headers.get('location')).hostname,
+      'discord.com',
+    );
+    // Ein zweiter Aufruf derselben Adresse bekommt nichts mehr: das Ticket
+    // ist der Nachweis der abrufenden Seite und wird verbraucht.
+    const second = await fetch(start, { redirect: 'manual' });
+    assert.equal(second.status, 403);
+    assert.match(
+      JSON.parse(await second.text()).error,
+      /Login-Aufruf ist abgelaufen/,
+    );
+    // Ein erfundenes Ticket ersetzt den Panel-Token nicht.
+    const erfunden = await fetch(
+      `${baseUrl}/api/bots/${bot.id}/panel/discord/login?ticket=${'a'.repeat(48)}`,
+      { redirect: 'manual' },
+    );
+    assert.equal(erfunden.status, 403);
+    // Der Start ohne Ticket bleibt möglich, wenn die Seite den Panel-Cookie
+    // mitbringt - so startet auch ein direkt geöffneter Tab den Login.
+    const mitCookie = await fetch(
+      `${baseUrl}/api/bots/${bot.id}/panel/open?page=page.html`,
+      { redirect: 'manual' },
+    );
+    const direct = await fetch(
+      `${baseUrl}/api/bots/${bot.id}/panel/discord/login`,
+      {
+        redirect: 'manual',
+        headers: { cookie: mitCookie.headers.get('set-cookie') },
+      },
+    );
+    assert.equal(direct.status, 302);
+    assert.equal(
+      new URL(direct.headers.get('location')).hostname,
+      'discord.com',
+    );
+  });
+
+  it('bindet den Callback an den Browser, der den Login gestartet hat', async () => {
+    // Jeder Versuch verbraucht den State - genau so soll es sein.
+    const first = await stateOf();
+    assert.equal((await callback(first.state)).status, 400);
+
+    // Browser B nimmt den Callback von Browser A: keine Sitzung.
+    const second = await stateOf();
+    const fremder = await callback(
+      second.state,
+      'bot_hub_preauth_x=' + 'f'.repeat(48),
+    );
+    assert.equal(fremder.status, 400);
+    assert.match(
+      JSON.parse(await fremder.text()).error,
+      /anderen Browser oder unter einer anderen Adresse gestartet/,
+    );
+    // Ohne gültigen Browser wird kein Token bei Discord geholt.
+    assert.equal(discordMock.tokens, 0);
+
+    // Browser A gewinnt.
+    const third = await stateOf();
+    const gut = await callback(third.state, third.cookie);
+    assert.equal(gut.status, 302);
+    assert.match(gut.headers.get('set-cookie') ?? '', /bot_hub_panel_/);
+    assert.equal(discordMock.tokens, 1);
+
+    // State ist einmalig verwendbar.
+    assert.equal((await callback(third.state, third.cookie)).status, 400);
+  });
+
+  it('verwirft einen State, der zu einem anderen Bot gehoert', async () => {
+    const { state, cookie } = await stateOf();
+    const other = await createBot({
+      name: 'Anderer Bot',
+      language: 'custom',
+      cwd: 'worker',
+      entrypoint: 'bot.sh',
+      command: 'sh {entrypoint}',
+      guildId: TARGET_GUILD,
+    });
+    const response = await fetch(
+      `${baseUrl}/api/bots/${other.id}/panel/discord/callback?state=${state}&code=mock-code`,
+      { headers: { cookie } },
+    );
+    assert.equal(response.status, 400);
+  });
+
+  it('lehnt ab, wenn die Berechtigung nur in einer anderen Guild liegt', async () => {
+    discordMock.userGuilds = [guild(ANDERE_GUILD, MANAGE_GUILD)];
+    const { state, cookie } = await stateOf();
+    const response = await callback(state, cookie);
+    assert.equal(response.status, 403);
+    assert.match(
+      JSON.parse(await response.text()).error,
+      /für den dieser Bot läuft|Server verwalten/,
+    );
+    // Das Token des abgelehnten Nutzers wird wieder verworfen.
+    assert.equal(discordMock.revoked, 1);
+    const session = await call(`/bots/${bot.id}/panel/discord/session`);
+    assert.equal(session.data.authenticated, false);
+  });
+
+  it('lehnt ab, wenn der Nutzer die Berechtigung in keiner Guild hat', async () => {
+    discordMock.userGuilds = [guild(TARGET_GUILD, KEINE)];
+    const { state, cookie } = await stateOf();
+    assert.equal((await callback(state, cookie)).status, 403);
+  });
+
+  it('lehnt ab, wenn der Bot in der Ziel-Guild gar nicht installiert ist', async () => {
+    discordMock.botGuilds = [guild(ANDERE_GUILD, '0')];
+    const { state, cookie } = await stateOf();
+    assert.equal((await callback(state, cookie)).status, 403);
+  });
+
+  it('prüft ohne Bot-Token nur die Berechtigung der Ziel-Guild', async () => {
+    // Der Hub kennt ohne Token nicht, wo der Bot installiert ist. Die Sperre
+    // darf daran nicht scheitern – sonst wäre das Panel nie benutzbar.
+    discordMock.botGuilds = [];
+    const { state, cookie } = await stateOf();
+    assert.equal((await callback(state, cookie)).status, 302);
+
+    // Die Berechtigung in der Ziel-Guild bleibt trotzdem Pflicht.
+    discordMock.userGuilds = [guild(ANDERE_GUILD, MANAGE_GUILD)];
+    const ohneRecht = await stateOf();
+    assert.equal(
+      (await callback(ohneRecht.state, ohneRecht.cookie)).status,
+      403,
+    );
+  });
+
+  it('meldet die Sitzung nur fuer die Ziel-Guild an', async () => {
+    discordMock.userGuilds = [
+      guild(TARGET_GUILD, ADMIN),
+      guild(ANDERE_GUILD, MANAGE_GUILD),
+    ];
+    const { state, cookie } = await stateOf();
+    const response = await callback(state, cookie);
+    assert.equal(response.status, 302);
+
+    const sessionCookie = (response.headers.get('set-cookie') ?? '')
+      .split(',')
+      .map((part) => part.trim().split(';')[0])
+      .find((part) => part.startsWith(`bot_hub_panel_${bot.id}=`));
+    const { data } = await call(`/bots/${bot.id}/panel/discord/session`, {
+      headers: { cookie: sessionCookie },
+    });
+    assert.equal(data.authenticated, true);
+    assert.equal(data.user.id, 'user-1');
+    assert.deepEqual(
+      data.guilds.map((item) => item.id),
+      [TARGET_GUILD],
+    );
+  });
+
+  it('verlangt fuer Panel-Aktionen eine gueltige Discord-Sitzung', async () => {
+    const { state, cookie } = await stateOf();
+    discordMock.userGuilds = [guild(ANDERE_GUILD, MANAGE_GUILD)];
+    // Abgelehnte Anmeldung -> die Seite bleibt gesperrt.
+    await callback(state, cookie);
+    const { status } = await fetch(
+      `${baseUrl}/api/bots/${bot.id}/panel/settings`,
+      {
+        method: 'PUT',
+        headers: {
+          'content-type': 'application/json',
+          'x-bot-hub-token': page,
+        },
+        body: JSON.stringify({ values: { log_channel: 'trojan' } }),
+      },
+    );
+    assert.equal(status, 401);
   });
 });

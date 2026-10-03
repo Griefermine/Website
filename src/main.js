@@ -213,13 +213,17 @@ const bootstrap = async () => {
       account.replaceChildren(
         Object.assign(document.createElement('a'), {
           className: 'btn btn--primary',
-          href: '/api/auth/discord/login',
+          href: '#',
           textContent: 'Mit Discord einloggen',
           title: auth.configured
             ? 'Mit deinem Discord-Konto anmelden'
             : 'DISCORD_CLIENT_ID und DISCORD_CLIENT_SECRET müssen serverseitig gesetzt werden',
         }),
       );
+      account.querySelector('a').addEventListener('click', (event) => {
+        event.preventDefault();
+        api.authDiscordLogin();
+      });
       toast(
         auth.configured
           ? 'Bitte zuerst mit Discord einloggen.'

@@ -28,7 +28,7 @@ export const LANGUAGES = [
     entrypoint: 'bot.py',
     command: 'python3 {entrypoint}',
     venv: '.venv',
-    prepare: 'python3 -m venv {venv}',
+    prepare: 'python3 -m venv --clear {venv}',
     check: 'python3 -c "import {module}"',
     install: 'python3 -m pip install --disable-pip-version-check {package}',
     frameworks: [
@@ -78,8 +78,12 @@ export const LANGUAGES = [
     command: 'java -jar {entrypoint}',
     check:
       'ls build/libs/*.jar target/*.jar out/production/libs/*.jar > /dev/null 2>&1',
-    install:
-      '[ -x ./gradlew ] && ./gradlew build || mvn -q -DskipTests package',
+    install: {
+      fallback: [
+        { executable: './gradlew', args: ['build'] },
+        { executable: 'mvn', args: ['-q', '-DskipTests', 'package'] },
+      ],
+    },
     frameworks: [
       framework('JDA', 'net.dv8tion.jda', 'net.dv8tion:JDA:5.0.0-beta.13'),
       framework('Discord4J', 'discord4j', 'discord4j:core'),
@@ -95,8 +99,12 @@ export const LANGUAGES = [
     command: 'java -jar {entrypoint}',
     check:
       'ls build/libs/*.jar target/*.jar out/production/libs/*.jar > /dev/null 2>&1',
-    install:
-      '[ -x ./gradlew ] && ./gradlew build || mvn -q -DskipTests package',
+    install: {
+      fallback: [
+        { executable: './gradlew', args: ['build'] },
+        { executable: 'mvn', args: ['-q', '-DskipTests', 'package'] },
+      ],
+    },
     frameworks: [
       framework('Kord', 'dev.kord', 'dev.kord:kord-core'),
       framework(
@@ -114,8 +122,12 @@ export const LANGUAGES = [
     entrypoint: 'main.go',
     command: 'go run {entrypoint}',
     check: 'go list -m all 2> /dev/null | grep -q {module}',
-    install:
-      'if [ -f go.mod ]; then go get {module}; else go mod init bot && go get {module}; fi',
+    install: {
+      fallback: [
+        { executable: 'go', args: ['get', '{module}'] },
+        { executable: 'go', args: ['mod', 'init', 'bot'] },
+      ],
+    },
     frameworks: [
       framework(
         'discordgo',
@@ -151,8 +163,12 @@ export const LANGUAGES = [
     entrypoint: 'target/release/bot',
     command: './target/release/bot',
     check: 'grep -qi {package} Cargo.toml 2> /dev/null',
-    install:
-      'if [ -f Cargo.toml ]; then cargo add {package}; else cargo init --name bot && cargo add {package}; fi',
+    install: {
+      fallback: [
+        { executable: 'cargo', args: ['add', '{package}'] },
+        { executable: 'cargo', args: ['init', '--name', 'bot'] },
+      ],
+    },
     frameworks: [
       framework('Serenity', 'serenity', 'serenity'),
       framework('Poise', 'poise', 'poise'),

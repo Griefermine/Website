@@ -13,7 +13,8 @@
     "start": "node server/index.js",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "node --test test/api.test.js && node --test test/panel.test.js"
+    "test": "node --test test/api.test.js && node --test test/panel.test.js && node --test test/secrets.test.js && node --test test/startup.test.js && node --test test/containers.test.js && node --test test/database.test.js",
+    "test:mysql": "BOT_HUB_TEST_MYSQL=1 node --test test/database-mysql.test.js"
   },
   "devDependencies": {
     "concurrently": "^9.1.2",
@@ -22,5 +23,8 @@
   },
   "dependencies": {
     "discord.js": "^14.27.0"
+  },
+  "optionalDependencies": {
+    "mysql2": "^3.24.5"
   }
 }

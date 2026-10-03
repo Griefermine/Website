@@ -15,6 +15,15 @@ sind alle Funktionen still und werfen nichts.
     publish({"status": "online", "guilds": 3})
     for wert in on_settings():
         ...
+
+Dazu kommt der Bot-Speicher: ein eigener Bereich pro Bot in der Datenbank des
+Hubs, erreichbar nur von diesem Prozess. SQLite oder MySQL entscheidet der
+Hub, der Bot merkt davon nichts.
+
+    from hub_link import db_get, db_set, db_list, db_remove
+
+    db_set("notizen", f"user:{message.author.id}", {"text": "hallo"})
+    wert = db_get("notizen", f"user:{message.author.id}")
 """
 
 from __future__ import annotations
@@ -24,34 +33,77 @@ import os
 import threading
 import urllib.error
 import urllib.request
+from urllib.parse import quote, urlencode, urlparse
 from typing import Any, Callable, Iterator
 
-URL = os.environ.get("BOT_HUB_URL", "").rstrip("/")
-TOKEN = os.environ.get("BOT_HUB_TOKEN", "")
+_raw_url = os.environ.get("BOT_HUB_URL", "").strip().rstrip("/")
+_parsed_url = urlparse(_raw_url) if _raw_url else None
+if _parsed_url and (
+    _parsed_url.scheme not in {"http", "https"}
+    or _parsed_url.username
+    or _parsed_url.password
+    or _parsed_url.query
+    or _parsed_url.fragment
+    or (
+        os.environ.get("NODE_ENV") == "production"
+        and _parsed_url.scheme != "https"
+        and _parsed_url.hostname not in {"127.0.0.1", "::1", "localhost"}
+    )
+):
+    raise RuntimeError("BOT_HUB_URL ist ungültig oder unsicher")
+
+URL = _raw_url
+TOKEN = os.environ.get("BOT_HUB_TOKEN", "").strip()
+if TOKEN and (
+    not (32 <= len(TOKEN) <= 256)
+    or not all(char.isalnum() or char in "_-" for char in TOKEN)
+):
+    raise RuntimeError("BOT_HUB_TOKEN hat ein ungültiges Format")
 CONNECTED = bool(URL and TOKEN)
 
 
-def call(path: str, payload: dict | None = None, timeout: float = 8.0) -> Any:
-    """Ruft einen Hub-Endpunkt auf. Ohne Hub (manueller Start) kommt None."""
+def call(
+    path: str,
+    payload: dict | None = None,
+    timeout: float = 8.0,
+    method: str | None = None,
+    query: dict | None = None,
+    quiet: bool = False,
+) -> Any:
+    """Ruft einen Hub-Endpunkt auf. Ohne Hub (manueller Start) kommt None.
+
+    `method` ist nur für PUT und DELETE nötig; ohne `payload` wird nichts
+    gesendet. `quiet` unterdrückt die Fehlermeldung – für Abfragen, bei denen
+    "nicht gefunden" eine normale Antwort ist.
+    """
     if not CONNECTED:
         return None
     body = None if payload is None else json.dumps(payload).encode("utf-8")
+    verb = method or ("GET" if body is None else "POST")
+    if body is None and verb not in {"GET", "DELETE", "HEAD"}:
+        body = b"{}"
+    parameter = urlencode(
+        {k: v for k, v in (query or {}).items() if v not in (None, "")}
+    )
+    target = f"{URL}/api/hub/{path.lstrip('/')}"
+    if parameter:
+        target += f"?{parameter}"
     request = urllib.request.Request(
-        f"{URL}/api/hub/{path.lstrip('/')}",
+        target,
         data=body,
         headers={
             "authorization": f"Bearer {TOKEN}",
             "content-type": "application/json",
         },
-        method="GET" if body is None else "POST",
+        method=verb,
     )
-    request.add_header("authorization", f"Bearer {TOKEN}")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8")
         return json.loads(raw) if raw else {}
     except (urllib.error.URLError, OSError, ValueError) as error:
-        print(f"hub_link: {path} fehlgeschlagen ({error})", flush=True)
+        if not quiet:
+            print(f"hub_link: {path} fehlgeschlagen ({error})", flush=True)
         return None
 
 
@@ -78,6 +130,56 @@ def register(panel: dict[str, Any]) -> Any:
 def callback(url: str, token: str = "") -> Any:
     """Lokale URL, an die der Hub Aktionsklicks schickt (nur localhost)."""
     return call("callback", {"url": url, "token": token})
+
+
+def _segment(value: str, label: str) -> str:
+    """Ein Pfadsegment für den Bot-Speicher, kodiert.
+
+    Der Hub prüft Namen gegen ein Muster und setzt sie als Parameter in die
+    SQL-Abfrage; hier werden sie nur kodiert, damit ein Doppelpunkt im
+    Schlüssel den Weg nicht verändert.
+    """
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{label} darf nicht leer sein")
+    return quote(text, safe="")
+
+
+def _path(collection: str, key: str) -> str:
+    return f"db/{_segment(collection, 'Sammlungsname')}/{_segment(key, 'Schlüssel')}"
+
+
+def db_get(collection: str, key: str, timeout: float = 8.0) -> Any:
+    """Liest einen Wert aus dem Bot-Speicher, sonst None."""
+    data = call(_path(collection, key), timeout=timeout, quiet=True)
+    if not data:
+        return None
+    return data.get("entry", {}).get("value")
+
+
+def db_set(collection: str, key: str, value: Any, timeout: float = 8.0) -> Any:
+    """Legt einen Wert an oder überschreibt ihn."""
+    return call(_path(collection, key), {"value": value}, timeout=timeout, method="PUT")
+
+
+def db_list(
+    collection: str,
+    prefix: str = "",
+    limit: int | None = None,
+    offset: int | None = None,
+    timeout: float = 8.0,
+) -> Any:
+    """Listet Einträge einer Sammlung: {entries, total, limit, offset}."""
+    return call(
+        f"db/{_segment(collection, 'Sammlungsname')}",
+        timeout=timeout,
+        query={"prefix": prefix, "limit": limit, "offset": offset},
+    )
+
+
+def db_remove(collection: str, key: str, timeout: float = 8.0) -> Any:
+    """Löscht einen Eintrag. Meldet {removed: True/False}."""
+    return call(_path(collection, key), timeout=timeout, method="DELETE")
 
 
 def on_settings(
@@ -117,8 +219,11 @@ def on_settings(
         while CONNECTED:
             try:
                 request = urllib.request.Request(
-                    f"{URL}/api/hub/events?token={TOKEN}",
-                    headers={"accept": "text/event-stream"},
+                    f"{URL}/api/hub/events",
+                    headers={
+                        "accept": "text/event-stream",
+                        "authorization": f"Bearer {TOKEN}",
+                    },
                 )
                 with urllib.request.urlopen(request, timeout=None) as stream:
                     wait = 2.0

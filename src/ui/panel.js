@@ -44,6 +44,11 @@ const ENDPOINTS = [
   ['POST', '/api/hub/callback', 'Lokale URL für Aktionsklicks hinterlegen'],
   ['POST', '/api/hub/state', 'Live-Werte an die Seite schicken'],
   ['POST', '/api/hub/notify', 'Kurze Meldung als Toast im Dashboard'],
+  [
+    'POST',
+    '/api/bots/<id>/panel/notify',
+    'Wie oben, aber aus der HTML-Seite (bridge.js: hub.notify)',
+  ],
 ];
 
 let current = null;
