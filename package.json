@@ -13,8 +13,9 @@
     "start": "node server/index.js",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "node --test test/api.test.js && node --test test/panel.test.js && node --test test/secrets.test.js && node --test test/startup.test.js && node --test test/containers.test.js && node --test test/database.test.js",
-    "test:mysql": "BOT_HUB_TEST_MYSQL=1 node --test test/database-mysql.test.js"
+    "test": "node --test test/api.test.js && node --test test/panel.test.js && node --test test/secrets.test.js && node --test test/startup.test.js && node --test test/containers.test.js && node --test test/commands.test.js && node --test test/quota.test.js && node --test test/database.test.js",
+    "test:mysql": "BOT_HUB_TEST_MYSQL=1 node --test test/database-mysql.test.js",
+    "release:scan": "node scripts/release-scan.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.1.2",

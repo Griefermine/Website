@@ -1,7 +1,10 @@
 import { createServer as createServerFactory } from 'node:http';
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { containerRuntimeEnabled } from './containers.js';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import {
+  containerRuntimeEnabled,
+  containerSecurityFacts,
+} from './containers.js';
 import { createServer, stopAllBots } from './manager.js';
 import {
   closeDatabase,
@@ -131,70 +134,119 @@ if (
       '         Adresse eintragen, die auch aus dem Container erreichbar ist.',
   );
 
-// Startup Security Self-Check: kritische Bedingungen prüfen, bevor der Server startet
-const securitySelfCheck = () => {
+/**
+ * Startup-Selbstprüfung.
+ *
+ * Zwei Ebenen: `errors` verhindern den Start, `warnings` nicht. Getrennt
+ * gehalten wird nur, was sich nicht anders entscheiden lässt – Bedingungen wie
+ * "Testmodus in Produktion" oder "Container abgeschaltet" brechen weiter oben
+ * schon den Start ab, und sie hier noch einmal zu prüfen hieße, zwei Stellen
+ * zu haben, an denen dieselbe Regel steht.
+ *
+ * Wichtig für die Pfadprüfungen: gemessen wird am Projekt-Root, nicht am
+ * aktuellen Arbeitsverzeichnis. Der Hub läuft nicht immer von dort, und eine
+ * Prüfung, die das falsche Verzeichnis ansieht, hält eine Fehlkonfiguration für
+ * eine richtige.
+ */
+const collectSecurityFindings = ({
+  env = process.env,
+  projectRoot = resolve(env.BOT_DASHBOARD_ROOT || process.cwd()),
+} = {}) => {
   const errors = [];
   const warnings = [];
+  const production = env.NODE_ENV === 'production';
 
-  // Testmodus darf nicht in Production aktiviert sein
-  if (process.env.BOT_HUB_TEST_MODE === '1' && process.env.NODE_ENV === 'production') {
-    errors.push('BOT_HUB_TEST_MODE=1 ist in Production nicht erlaubt');
+  // 1) Der Hub darf in Produktion nicht als root laufen. Sonst bekommen auch
+  //    die Container root, und die Trennung zwischen fremdem Bot-Code und dem
+  //    Host trägt nicht mehr.
+  const facts = containerSecurityFacts();
+  if (production && facts.hubRunsAsRoot) {
+    errors.push(
+      'Der Hub läuft als root. Container würden dann ebenfalls als root laufen; bitte einen eigenen Benutzer anlegen und den Hub unter diesem starten.',
+    );
   }
 
-  // Container müssen in Production aktiviert sein
-  if (process.env.NODE_ENV === 'production' && !containerRuntimeEnabled()) {
-    errors.push('Container sind in Production deaktiviert');
+  // 2) Images ohne Digest sind nur über ein Tag festgelegt, das jedezeit
+  //    jemand anderes umschreiben kann.
+  if (facts.unpinnedImages.length > 0) {
+    const liste = facts.unpinnedImages
+      .map((item) => `${item.language}=${item.reference}`)
+      .join(', ');
+    const text =
+      `Container-Images sind nicht per Digest festgelegt: ${liste}. ` +
+      'Ein Tag kann auf ein anderes Image zeigen, ohne dass es hier etwas ändert.';
+    if (facts.digestRequired) {
+      errors.push(
+        `${text} BOT_HUB_REQUIRE_IMAGE_DIGEST verlangt Digests – bitte ` +
+          'BOT_HUB_CONTAINER_IMAGES mit Digest-Referenzen setzen.',
+      );
+    } else if (production) {
+      warnings.push(text);
+    }
   }
 
-  // BOT_HUB_URL sollte HTTPS sein in Production
-  const hubUrl = String(process.env.BOT_HUB_URL ?? '').trim();
-  if (process.env.NODE_ENV === 'production' && hubUrl && !hubUrl.startsWith('https://')) {
-    errors.push('BOT_HUB_URL muss in Production HTTPS verwenden');
+  // 3) Der Docker-Socket ist der Weg aus dem Host heraus. Er muss da sein,
+  //    damit Container laufen – gemountet wird er dennoch nicht.
+  if (existsSync('/var/run/docker.sock')) {
+    warnings.push(
+      'Docker Socket vorhanden: er darf nicht in einen Bot-Container gemountet werden, sonst steuert der Bot den Host.',
+    );
   }
 
-  // .env-Datei sollte nicht existieren oder keine echten Secrets enthalten
-  const envPath = join(process.cwd(), '.env');
+  // 4) `.env` im Projekt-Root: hier stehen im Betrieb keine Geheimnisse, die
+  //    liegen in `data/secrets/`. Eine belegte Datei ist ein Fund, kein Vorwurf.
+  const envPath = join(projectRoot, '.env');
   if (existsSync(envPath)) {
     try {
-      const envContent = readFileSync(envPath, 'utf8');
-      const hasRealSecrets = /DISCORD_CLIENT_SECRET\s*=\s*\S+/.test(envContent) ||
-                            /BOT_HUB_TOKEN\s*=\s*\S+/.test(envContent);
-      if (hasRealSecrets) {
-        warnings.push('.env enthält möglicherweise echte Secrets – bitte data/secrets/ verwenden');
-      }
+      const content = readFileSync(envPath, 'utf8');
+      const filled = [
+        /^\s*DISCORD_CLIENT_SECRET\s*=\s*\S+/m,
+        /^\s*DISCORD_BOT_TOKEN\s*=\s*\S+/m,
+        /^\s*BOT_HUB_TOKEN\s*=\s*\S+/m,
+        /^\s*BOT_HUB_SESSION_SECRET\s*=\s*\S+/m,
+      ].some((muster) => muster.test(content));
+      if (filled)
+        warnings.push(
+          '.env enthält belegte Geheimnisse. Bitte nach data/secrets/ umziehen und die Werte hier leeren – eine Datei im Projekt-Root landet leicht im Git.',
+        );
     } catch {
-      // Datei nicht lesbar – ignorieren
+      warnings.push(
+        '.env ist vorhanden, aber nicht lesbar – bitte Rechte prüfen.',
+      );
     }
   }
 
-  // data/secrets-Verzeichnis sollte existieren und sichere Rechte haben
-  const secretsDir = join(process.cwd(), 'data', 'secrets');
-  if (!existsSync(secretsDir)) {
-    warnings.push('data/secrets/ existiert nicht – wird bei Bedarf erstellt');
+  // 5) Das Secret-Verzeichnis muss für andere Benutzer gesperrt sein.
+  const secretsDir = join(projectRoot, 'data', 'secrets');
+  if (existsSync(secretsDir)) {
+    try {
+      const { mode } = statSync(secretsDir);
+      // Prüfung des Others-Bits: bei 0077 oder strenger ist nichts fremdlesbar.
+      if (process.platform !== 'win32' && (mode & 0o077) !== 0)
+        warnings.push(
+          `data/secrets/ ist für andere Benutzer lesbar (Modus ${(mode & 0o777).toString(8)}). Bitte auf 700 setzen.`,
+        );
+    } catch {
+      warnings.push(
+        'data/secrets/ ist nicht prüfbar – bitte Rechte kontrollieren.',
+      );
+    }
+  } else if (production) {
+    warnings.push('data/secrets/ fehlt und wird erst bei Bedarf angelegt.');
   }
 
-  // DB-Datei sollte nicht in bots/ liegen
-  const dbFile = String(process.env.BOT_HUB_DB_FILE ?? '').trim();
-  if (dbFile && dbFile.startsWith('bots/')) {
-    errors.push('BOT_HUB_DB_FILE darf nicht innerhalb von bots/ liegen');
-  }
+  return { errors, warnings };
+};
 
-  // Docker Socket sollte nicht gemountet sein
-  if (existsSync('/var/run/docker.sock')) {
-    warnings.push('Docker Socket ist vorhanden – sicherstellen, dass er nicht in Containers gemountet wird');
-  }
-
-  // Ausgabe
-  for (const warning of warnings) {
+const securitySelfCheck = () => {
+  const { errors, warnings } = collectSecurityFindings();
+  for (const warning of warnings)
     console.warn(`[hub] SICHERHEITS-WARNUNG: ${warning}`);
-  }
-  if (errors.length > 0) {
-    for (const error of errors) {
-      console.error(`[hub] SICHERHEITS-FEHLER: ${error}`);
-    }
-    console.error('[hub] Server startet nicht aufgrund kritischer Sicherheitsprobleme.');
-    process.exit(1);
-  }
+  if (errors.length === 0) return;
+  for (const error of errors)
+    console.error(`[hub] SICHERHEITS-FEHLER: ${error}`);
+  console.error('[hub] Der Server startet nicht.');
+  process.exit(1);
 };
 
 securitySelfCheck();

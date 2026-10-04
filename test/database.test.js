@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { createServer } from 'node:http';
@@ -284,6 +285,111 @@ describe('Konfiguration', () => {
   });
 });
 
+/**
+ * Die Sperre auf `bots/` ist eine Zeichenkettenschranke. Sie hält `./bots/x` und
+ * absolute Pfade fern, aber keinen SymLink – und über einen SymLink lädt der Hub
+ * genau die Datei, die ein Bot ohne Umweg über die API lesen dürfte.
+ */
+describe('Die DB-Datei kann nicht in bots/ liegen', () => {
+  it('lehnt einen relativen Pfad in bots/ ab', async () => {
+    const { resolveDatabaseConfig } = await import('../server/database.js');
+    for (const pfad of [
+      'bots/b/x.sqlite',
+      './bots/b/x.sqlite',
+      'data/../bots/b/x.sqlite',
+    ]) {
+      assert.throws(
+        () =>
+          resolveDatabaseConfig({
+            env: { BOT_DASHBOARD_ROOT: root, BOT_HUB_DB_FILE: pfad },
+          }),
+        /nicht innerhalb von bots\//,
+        `unverlangt zugelassen: ${pfad}`,
+      );
+    }
+  });
+
+  it('lehnt einen absoluten Pfad in bots/ ab', async () => {
+    const { resolveDatabaseConfig } = await import('../server/database.js');
+    const ordner = mkdtempSync(join(root, 'abs-'));
+    const botsRoot = join(ordner, 'bots');
+    mkdirSync(botsRoot, { recursive: true });
+    assert.throws(
+      () =>
+        resolveDatabaseConfig({
+          env: {
+            BOT_DASHBOARD_ROOT: ordner,
+            BOT_HUB_DB_FILE: join(botsRoot, 'x.sqlite'),
+          },
+        }),
+      /nicht innerhalb von bots\//,
+    );
+  });
+
+  it('lehnt einen SymLink nach bots/ ab', async () => {
+    const { resolveDatabaseConfig } = await import('../server/database.js');
+    const ordner = join(root, 'symlink-ziel');
+    mkdirSync(join(ordner, 'bots', 'b'), { recursive: true });
+    mkdirSync(join(ordner, 'data', 'db'), { recursive: true });
+    symlinkSync(
+      join(ordner, 'bots', 'b', 'x.sqlite'),
+      join(ordner, 'data', 'db', 'x.sqlite'),
+    );
+    // Der Pfad zeigt nach data/db – und landet bei bots/b/x.sqlite.
+    assert.throws(
+      () =>
+        resolveDatabaseConfig({
+          env: {
+            BOT_DASHBOARD_ROOT: ordner,
+            BOT_HUB_DB_FILE: 'data/db/x.sqlite',
+          },
+        }),
+      /nicht innerhalb von bots\//,
+      'SymLink nach bots/ wurde zugelassen',
+    );
+  });
+
+  it('folgt einem SymLink auch ohne vorhandenes Ziel', async () => {
+    // Die DB-Datei existiert beim Start noch gar nicht. Ein Link, der auf sie
+    // zeigt, muss trotzdem erkannt werden – sonst wartet die Prüfung auf eine
+    // Datei, die sie selbst erst anlegen würde.
+    const { resolveDatabaseConfig } = await import('../server/database.js');
+    const ordner = mkdtempSync(join(root, 'tot-'));
+    mkdirSync(join(ordner, 'bots', 'b'), { recursive: true });
+    mkdirSync(join(ordner, 'data', 'db'), { recursive: true });
+    symlinkSync(
+      join(ordner, 'bots', 'b', 'x.sqlite'),
+      join(ordner, 'data', 'db', 'x.sqlite'),
+    );
+    assert.equal(
+      existsSync(join(ordner, 'data', 'db', 'x.sqlite')),
+      false,
+      'Ziel existiert bereits – der Fall wird nicht geprüft',
+    );
+    assert.throws(
+      () =>
+        resolveDatabaseConfig({
+          env: {
+            BOT_DASHBOARD_ROOT: ordner,
+            BOT_HUB_DB_FILE: 'data/db/x.sqlite',
+          },
+        }),
+      /nicht innerhalb von bots\//,
+    );
+  });
+
+  it('lässt eine Datei daneben zu', async () => {
+    const { resolveDatabaseConfig } = await import('../server/database.js');
+    const config = resolveDatabaseConfig({
+      env: {
+        BOT_DASHBOARD_ROOT: root,
+        BOT_HUB_DB_FILE: 'data/db/echt.sqlite',
+      },
+    });
+    assert.equal(config.file, join(root, 'data', 'db', 'echt.sqlite'));
+  });
+});
+
 describe('Eingaben', () => {
   const cases = [
     ['normaliseCollection', 'settings', 'settings'],
@@ -516,6 +622,11 @@ describe('Bot-Speicher über die API', () => {
       driver: 'sqlite',
       ready: true,
       maxValueBytes: 65536,
+      quotas: {
+        entries: 10000,
+        collections: 100,
+        bytes: 104857600,
+      },
     });
     const rohtext = JSON.stringify(antwort.data);
     assert.ok(!rohtext.includes(root));

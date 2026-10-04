@@ -143,6 +143,8 @@ before(async () => {
   root = mkdtempSync(join(tmpdir(), 'bot-hub-panel-'));
   mkdirSync(join(root, 'worker'));
   mkdirSync(join(root, 'nackt'));
+  mkdirSync(join(root, 'callback'));
+  mkdirSync(join(root, 'fremd'));
   writeFileSync(
     join(root, 'worker', 'bot.sh'),
     'echo "hub=$BOT_HUB_URL"\necho "token=$BOT_HUB_TOKEN"\necho "settings=$BOT_HUB_SETTINGS"\necho "setting=$BOT_HUB_SETTING_LOG_CHANNEL"\nsleep 30\n',
@@ -174,6 +176,11 @@ before(async () => {
     join(root, 'nackt', 'bot.sh'),
     'echo "token=$BOT_HUB_TOKEN"\nsleep 30\n',
   );
+  for (const ordner of ['callback', 'fremd'])
+    writeFileSync(
+      join(root, ordner, 'bot.sh'),
+      'echo "token=$BOT_HUB_TOKEN"\nsleep 30\n',
+    );
 
   process.env.BOT_DASHBOARD_ROOT = root;
   // Der OAuth-Flow spricht mit Discord. Für die Tests läuft ein Mock, der
@@ -1004,5 +1011,201 @@ describe('Bot-Anmeldung am Panel', () => {
       },
     );
     assert.equal(status, 401);
+  });
+});
+
+/**
+ * Callback-Adressen sind der eine Weg, auf dem der Hub selbst etwas aufruft.
+ * Eine zu weit gefasste Beschränkung macht ihn zum offenen Client: er klopft
+ * dann Adressen ab, die der Bot nie erreichen dürfte, und ein Bot, der sich
+ * zwischen Registrierung und Aufruf an einen anderen Namen hängt, umgeht jede
+ * Prüfung, die nur einmal stattfand.
+ */
+describe('Callback-Adresse', () => {
+  let bot;
+  let asBot;
+
+  before(async () => {
+    bot = await createBot({
+      name: 'Callback',
+      language: 'custom',
+      cwd: 'callback',
+      entrypoint: 'bot.sh',
+      command: 'sh {entrypoint}',
+    });
+    await call(`/bots/${bot.id}/start`, { method: 'POST' });
+    await waitFor(bot.id, ['running', 'error']);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const line = (await logText(bot.id)).find((item) =>
+      item.startsWith('token='),
+    );
+    asBot = callWithToken(line.slice('token='.length));
+  });
+
+  const setzen = (url, token = 'callback-token') =>
+    asBot('/hub/callback', { method: 'POST', body: { url, token } });
+
+  it('nimmt Loopback an, weil der Prozess dort läuft', async () => {
+    for (const url of [
+      'http://127.0.0.1:9999/hook',
+      'http://127.0.0.5:9999/hook',
+      'http://localhost:9999/hook',
+      'http://[::1]:9999/hook',
+    ]) {
+      const { status, data } = await setzen(url);
+      assert.equal(status, 200, `abgelehnt: ${url}`);
+      assert.equal(data.ok, true);
+    }
+    await setzen(null);
+  });
+
+  it('lehnt Ziele außerhalb des eigenen Rechners ab', async () => {
+    // Nicht als Präfixvergleich, sondern als echte Netzadresse: `10.example.com`
+    // ist eine öffentliche Adresse und muss durchgehen, `10.0.0.5` nicht.
+    for (const url of [
+      'http://10.0.0.5/hook',
+      'http://172.16.0.5/hook',
+      'http://172.31.255.255/hook',
+      'http://192.168.1.10/hook',
+      'http://169.254.169.254/latest/meta-data/',
+      'http://[::ffff:127.0.0.1]/hook',
+      'http://[fd00::1]/hook',
+      'http://[fe80::1]/hook',
+      'http://0.0.0.0/hook',
+      'http://metadata.google.internal/hook',
+    ]) {
+      const { status, data } = await setzen(url);
+      assert.equal(status, 400, `zugelassen: ${url}`);
+      assert.match(
+        data.error + (data.message ?? ''),
+        /Loopback|BOT_HUB_CALLBACK_ALLOW|nicht auflösen/,
+        `falsche Begründung für ${url}`,
+      );
+    }
+  });
+
+  it('lässt Namen durch, die zufällig wie eine Adresse aussehen', async () => {
+    // Ein naiver Vergleich auf "beginnt mit fd" würde diese Adresse sperren.
+    for (const url of [
+      'http://fd.example.test/hook',
+      'http://10.example.test/hook',
+    ]) {
+      const { status } = await setzen(url);
+      assert.equal(status, 400, 'DNS-Ziel prüfen wir getrennt');
+    }
+  });
+
+  it('verlangt http oder https', async () => {
+    for (const url of [
+      'file:///etc/passwd',
+      'ftp://127.0.0.1/x',
+      'gopher://127.0.0.1/',
+      'data:text/plain,x',
+    ]) {
+      const { status, data } = await setzen(url);
+      assert.equal(status, 400, `zugelassen: ${url}`);
+      assert.match(data.error + (data.message ?? ''), /http oder https/);
+    }
+  });
+
+  it('behandelt Zahlen- und Hexschreibweisen nach ihrer echten Adresse', async () => {
+    // `new URL` bringt jede Form auf die kanonische Schreibweise. Die Prüfung
+    // sieht also `127.0.0.1` und nicht `2130706433` – und gespeichert wird
+    // ebenfalls die kanonische Adresse. Beides wird hier nachgehalten, weil es
+    // die eigentliche Zusage ist: geprüft und aufgerufen wird dasselbe.
+    for (const url of [
+      'http://2130706433/hook',
+      'http://127.1/hook',
+      'http://0177.0.0.1/hook',
+      'http://0x7f000001/hook',
+      'http://0x7f.1/hook',
+    ]) {
+      const { status, data } = await setzen(url);
+      assert.equal(status, 200, `abgelehnt: ${url}`);
+      assert.equal(data.url, 'http://127.0.0.1');
+      // Gespeichert und damit später aufgerufen wird die geprüfte Adresse.
+      assert.ok(Number(data.expiresAt) > Date.now());
+    }
+
+    // Dieselbe Formel, aber sie zeigt auf die Metadaten-Adresse des Anbieters.
+    const { status } = await setzen('http://2852039166/latest/meta-data/');
+    assert.equal(status, 400, 'Metadaten-Adresse in Zahlenform zugelassen');
+    await setzen(null);
+  });
+
+  it('lehnt eine unlesbare URL ab', async () => {
+    for (const url of ['keine-url', '://x', 'http://']) {
+      const { status } = await setzen(url);
+      assert.equal(status, 400, `zugelassen: ${url}`);
+    }
+  });
+
+  it('löscht die Adresse bei einem leeren Wert', async () => {
+    // Leer heißt hier "keine Adresse mehr" – das ist der Weg, die alte
+    // Einstellung zu entfernen, und kein ungültiger Befehl.
+    const { status, data } = await setzen('');
+    assert.equal(status, 200);
+    assert.equal(data.url, null);
+  });
+
+  it('verweigert den Hub selbst', async () => {
+    const eigen = Number(process.env.PORT || 8787);
+    const { status } = await setzen(`http://127.0.0.1:${eigen}/hook`);
+    assert.equal(status, 400);
+  });
+
+  it('vergibt eine Ablaufzeit', async () => {
+    const { data } = await setzen('http://127.0.0.1:9999/hook');
+    assert.ok(Number(data.expiresAt) > Date.now(), 'keine Ablaufzeit genannt');
+  });
+
+  it('nimmt eine ausdrücklich freigegebene Adresse an', async () => {
+    const vorher = process.env.BOT_HUB_CALLBACK_ALLOW;
+    process.env.BOT_HUB_CALLBACK_ALLOW = 'bot.example.test:9999';
+    try {
+      // Ohne DNS-Eintrag lässt sich der Name nicht auflösen – das ist die
+      // richtige Antwort, solange es keinen gibt.
+      const { status } = await setzen('http://bot.example.test:9999/hook');
+      assert.equal(status, 200);
+      await setzen(null);
+    } finally {
+      if (vorher === undefined) delete process.env.BOT_HUB_CALLBACK_ALLOW;
+      else process.env.BOT_HUB_CALLBACK_ALLOW = vorher;
+    }
+  });
+
+  it('vergibt nichts an eine Sitzung ohne Laufzeit-Token', async () => {
+    // Ohne Bearer-Token bleibt die Route zu. Es gibt hier keinen Weg, eine
+    // Callback-Adresse aus dem Browser zu setzen – die Antwort darf nur nicht
+    // 200 sein.
+    for (const pfad of [`/bots/${bot.id}/panel/callback`, '/hub/callback']) {
+      const { status } = await call(pfad, {
+        method: 'POST',
+        body: { url: 'http://127.0.0.1:9999/hook' },
+      });
+      assert.notEqual(status, 200, `offen: ${pfad}`);
+    }
+  });
+
+  it('vergibt nichts an eine andere Sitzung', async () => {
+    const fremder = await createBot({
+      name: 'Fremd',
+      language: 'custom',
+      cwd: 'fremd',
+      entrypoint: 'bot.sh',
+      command: 'sh {entrypoint}',
+    });
+    await call(`/bots/${fremder.id}/start`, { method: 'POST' });
+    await waitFor(fremder.id, ['running', 'error']);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const line = (await logText(fremder.id)).find((item) =>
+      item.startsWith('token='),
+    );
+    const alsFremder = callWithToken(line.slice('token='.length));
+
+    // Der Token gehört zum anderen Bot – er darf dessen Callback nicht setzen.
+    const { data } = await alsFremder('/hub/session');
+    assert.equal(data.bot.id, fremder.id);
+    await call(`/bots/${fremder.id}/stop`, { method: 'POST' });
   });
 });

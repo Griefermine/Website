@@ -287,11 +287,52 @@ public final class HubLink {
         return request(method, path, body, false);
     }
 
+    /**
+     * Wandelt eine Zeichenkette in den Inhalt eines JSON-Strings – ohne die
+     * Anführungszeichen, die die Aufruferin schon gesetzt hat.
+     *
+     * Vollständig escapen ist hier wichtiger, als es aussieht: JSON verlangt
+     * jedes Steuerzeichen unter U+0020 zu maskieren, auch Tab und Backspace. Ein
+     * unvollständiges Escaping wirft keine Ausnahme, es schickt ein Paket, das
+     * die Gegenseite nicht lesen kann – der Hub meldet dann "ungültiges JSON"
+     * und der Bot meldet sich gar nicht mehr.
+     */
     private static String json(String value) {
-        return String.valueOf(value)
-                .replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r");
+        String text = String.valueOf(value);
+        StringBuilder out = new StringBuilder(text.length() + 8);
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            switch (c) {
+                case '"':
+                    out.append("\\\"");
+                    break;
+                case '\\':
+                    out.append("\\\\");
+                    break;
+                case '\n':
+                    out.append("\\n");
+                    break;
+                case '\r':
+                    out.append("\\r");
+                    break;
+                case '\t':
+                    out.append("\\t");
+                    break;
+                case '\b':
+                    out.append("\\b");
+                    break;
+                case '\f':
+                    out.append("\\f");
+                    break;
+                default:
+                    if (c < 0x20) {
+                        out.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        out.append(c);
+                    }
+                    break;
+            }
+        }
+        return out.toString();
     }
 }

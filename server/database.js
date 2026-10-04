@@ -23,8 +23,22 @@
  * SQLite-Betrieb bleibt ohne diese Abhängigkeit.
  */
 
-import { chmodSync, mkdirSync } from 'node:fs';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import {
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  readlinkSync,
+  realpathSync,
+} from 'node:fs';
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from 'node:path';
 import { readSecretValues } from './secrets.js';
 import { httpError } from './util.js';
 
@@ -37,25 +51,76 @@ const MAX_CONNECTIONS = 8;
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost', '[::1]']);
 const DRIVERS = new Set(['sqlite', 'mysql']);
 
-/** Quotas pro Bot gegen Ressourcenmissbrauch / DoS. */
+/**
+ * Quotas pro Bot gegen Ressourcenmissbrauch / DoS.
+ *
+ * Alle Grenzen gelten GLOBAL je Bot, also über alle Collections hinweg – nicht
+ * je Collection. Eine Prüfung pro Collection ließe sich sonst umgehen, indem ein
+ * Bot sich viele Collections anlegt (100 Collections × 9000 Einträge).
+ */
 export const MAX_ENTRIES_PER_BOT = 10_000;
+export const MAX_COLLECTIONS_PER_BOT = 100;
 export const MAX_DATABASE_BYTES_PER_BOT = 100 * 1024 * 1024; // 100 MiB
 export const MAX_WRITES_PER_MINUTE = 120;
 export const MAX_DELETES_PER_MINUTE = 60;
+export const MAX_DB_READS_PER_MINUTE = 240;
+export const MAX_QUERIES_PER_MINUTE = 120;
+/** Obergrenze einer Listenantwort in Bytes, damit `list` nicht als DoS dient. */
+export const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 
-/** Rate-Limit-Zähler pro Bot (in-memory). */
-const writeRateBuckets = new Map();
-const deleteRateBuckets = new Map();
+const BASE_RATE_LIMITS = {
+  write: MAX_WRITES_PER_MINUTE,
+  delete: MAX_DELETES_PER_MINUTE,
+  read: MAX_DB_READS_PER_MINUTE,
+  query: MAX_QUERIES_PER_MINUTE,
+};
+
+const rateBuckets = new Map();
+
+/** Zähler je Bot und Art. Als Objekt statt als Liste, damit ein Test die Grenze
+ *  anheben kann: der Zählerpfad soll prüfbar sein, ohne dass das Rate-Limit
+ *  nebenbei 280 von 300 Schreibvorgängen verschluckt. */
+export const rateLimits = {
+  write: MAX_WRITES_PER_MINUTE,
+  delete: MAX_DELETES_PER_MINUTE,
+  read: MAX_DB_READS_PER_MINUTE,
+  query: MAX_QUERIES_PER_MINUTE,
+};
+
+/** Nur für Tests: `resetRateLimits`, Grenzen anheben oder zurücksetzen. */
+export const setRateLimits = (overrides = {}) =>
+  Object.assign(rateLimits, BASE_RATE_LIMITS, overrides);
+
+/** Ein Bucket je Bot und Art. `Retry-After` gehört in die Antwort, damit ein
+ *  Bot sein Limit selbst zurücknehmen kann, statt es zu testen. */
+const takeRate = (kind, botId) => {
+  const limit = rateLimits[kind];
+  if (!limit) return;
+  const key = `${botId}:${kind}`;
+  const now = Date.now();
+  const bucket = rateBuckets.get(key);
+  if (!bucket || bucket.resetAt <= now) {
+    rateBuckets.set(key, { count: 1, resetAt: now + 60_000 });
+    return;
+  }
+  bucket.count += 1;
+  if (bucket.count > limit) {
+    const error = httpError(429, `Rate-Limit überschritten (${kind}).`);
+    error.retryAfter = Math.max(1, Math.ceil((bucket.resetAt - now) / 1000));
+    throw error;
+  }
+};
+
 const rateLimitCleanup = setInterval(() => {
   const now = Date.now();
-  for (const [key, bucket] of writeRateBuckets) {
-    if (bucket.resetAt <= now) writeRateBuckets.delete(key);
-  }
-  for (const [key, bucket] of deleteRateBuckets) {
-    if (bucket.resetAt <= now) deleteRateBuckets.delete(key);
+  for (const [key, bucket] of rateBuckets) {
+    if (bucket.resetAt <= now) rateBuckets.delete(key);
   }
 }, 60_000);
 rateLimitCleanup.unref();
+
+/** Nur für Tests: leert die Rate-Zähler. */
+export const resetRateLimits = () => rateBuckets.clear();
 
 /**
  * Namen und Werte werden vom Hub vergeben, nicht vom Bot. Die Muster halten
@@ -128,6 +193,71 @@ const INSERT_ONE = `
 const DELETE_ONE = `
   DELETE FROM bot_store
    WHERE bot_id = ? AND collection = ? AND key_name = ?`;
+
+/* ------------------------------------------------------------------ *
+ * Verbrauchszähler je Bot
+ *
+ * Die Zähler liegen in einer eigenen Tabelle, damit die Quota-Prüfung eine
+ * Zeile sperren kann, statt über ein COUNT über die ganze Tabelle zu gehen.
+ * Sie werden ausschließlich innerhalb derselben Transaktion verändert wie der
+ * Eintrag selbst – sonst könnten parallele Schreibvorgänge aneinander vorbei
+ * zählen. `rebuildUsage` rechnet sie aus den echten Zeilen neu, damit eine
+ * veraltete oder teilweise Tabelle sich selbst heilt.
+ * ------------------------------------------------------------------ */
+
+const CREATE_USAGE_TABLE = `
+  CREATE TABLE IF NOT EXISTS bot_store_usage (
+    bot_id          VARCHAR(64) NOT NULL,
+    entry_count     BIGINT      NOT NULL DEFAULT 0,
+    collection_count BIGINT     NOT NULL DEFAULT 0,
+    byte_count      BIGINT      NOT NULL DEFAULT 0,
+    updated_at      BIGINT      NOT NULL,
+    PRIMARY KEY (bot_id)
+  )`;
+
+const SELECT_USAGE = `
+  SELECT entry_count, collection_count, byte_count, updated_at
+    FROM bot_store_usage
+   WHERE bot_id = ?`;
+
+// Absichtlich über alle Collections: das ist der Unterschied zwischen einer
+// echten Bot-Quota und einer Quota pro Collection. Die Bytezahl braucht
+// treiberspezifische Syntax, deshalb ist es eine Funktion statt eine Konstante.
+const usageTotalsSql = (driver) => `
+  SELECT COUNT(*) AS entry_count,
+         COUNT(DISTINCT collection) AS collection_count,
+         COALESCE(SUM(${driver === 'sqlite' ? VALUE_BYTES_SQLITE : VALUE_BYTES_MYSQL}), 0) AS byte_count
+    FROM bot_store
+   WHERE bot_id = ?`;
+
+const USAGE_COLLECTION_EXISTS = `
+  SELECT 1 AS present FROM bot_store
+   WHERE bot_id = ? AND collection = ?
+   LIMIT 1`;
+
+const INSERT_USAGE = `
+  INSERT INTO bot_store_usage
+    (bot_id, entry_count, collection_count, byte_count, updated_at)
+  VALUES (?, ?, ?, ?, ?)`;
+
+const UPDATE_USAGE = `
+  UPDATE bot_store_usage
+     SET entry_count = ?, collection_count = ?, byte_count = ?, updated_at = ?
+   WHERE bot_id = ?`;
+
+const UPSERT_USAGE_IGNORE_SQLITE = `
+  INSERT OR IGNORE INTO bot_store_usage
+    (bot_id, entry_count, collection_count, byte_count, updated_at)
+  VALUES (?, 0, 0, 0, ?)`;
+
+const UPSERT_USAGE_IGNORE_MYSQL = `
+  INSERT IGNORE INTO bot_store_usage
+    (bot_id, entry_count, collection_count, byte_count, updated_at)
+  VALUES (?, 0, 0, 0, ?)`;
+
+/** Länge eines Werts in Bytes – SQLite kennt LENGTH, MySQL Octet_length. */
+const VALUE_BYTES_SQLITE = 'LENGTH(CAST(value AS BLOB))';
+const VALUE_BYTES_MYSQL = 'OCTET_LENGTH(value)';
 
 /* ------------------------------------------------------------------ *
  * Eingaben
@@ -236,6 +366,57 @@ export const projectRootOf = (env = process.env) =>
  * Gebrauch. Deshalb beendet ein gestarteter Hub nicht, weil MySQL gerade
  * nicht läuft - erst ein Bot, der Daten braucht, läuft dann auf einen Fehler.
  */
+/**
+ * Löst einen Pfad auf seinen echten Namen – auch über SymLinks hinweg.
+ *
+ * Ein reiner Vergleich aufgelöster Zeichenketten genügt nicht: ein SymLink
+ * `data/db/x.sqlite -> bots/b/x.sqlite` liegt scheinbar außerhalb von `bots/`
+ * und lädt trotzdem die DB eines Bots.
+ *
+ * `realpathSync` allein reicht dafür nicht, weil er auch dann scheitert, wenn
+ * nur die letzte Komponente fehlt – und genau das ist hier der Normalfall: die
+ * DB-Datei wird erst nach dieser Prüfung angelegt, ein vorhandener Link auf sie
+ * aber schon. Deshalb wird ein Link von Hand aufgelöst, auch wenn sein Ziel
+ * noch gar nicht existiert.
+ */
+const realPathDeepest = (target) => {
+  let current = resolve(target);
+  // Teile, die es noch nicht gab – in Pfadrichtung, damit `join` sie richtig
+  // anhängt.
+  let pending = [];
+  for (let step = 0; step < 64; step += 1) {
+    let link = null;
+    try {
+      if (lstatSync(current).isSymbolicLink()) link = readlinkSync(current);
+    } catch {
+      link = null;
+    }
+    if (link !== null) {
+      // Auf das Ziel zeigen. Ist es selbst ein Link, greift derselbe Durchgang.
+      current = isAbsolute(link)
+        ? resolve(link)
+        : resolve(dirname(current), link);
+      continue;
+    }
+    try {
+      const real = realpathSync(current);
+      return pending.length ? join(real, ...pending) : real;
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) break;
+      pending = [basename(current), ...pending];
+      current = parent;
+    }
+  }
+  return pending.length ? join(current, ...pending) : current;
+};
+
+/** Liegt `target` wirklich – auch über SymLinks – in `root`? */
+const staysInside = (root, target) => {
+  const rel = relative(root, target);
+  return Boolean(rel) && !rel.startsWith('..') && !isAbsolute(rel);
+};
+
 export const resolveDatabaseConfig = ({
   env = process.env,
   projectRoot,
@@ -270,13 +451,15 @@ export const resolveDatabaseConfig = ({
       : join(projectRootOf(env), 'data', 'db', 'bot-hub.sqlite');
     const resolved = resolve(file);
     const botsRoot = resolve(projectRootOf(env), 'bots');
-    const relativeToBots = relative(botsRoot, resolved);
-    // Sicherheitsregel: DB-Dateien dürfen niemals im Bot-Workspace liegen.
-    if (
-      relativeToBots &&
-      !relativeToBots.startsWith('..') &&
-      !isAbsolute(relativeToBots)
-    ) {
+    // Zwei Vergleiche, weil jeder für sich etwas anderes sieht: der erste
+    // fängt `./bots/x` und absolute Pfade, der zweite SymLinks, die aus
+    // bots/ hinauszeigen.
+    const lexical = staysInside(botsRoot, resolved);
+    const throughLinks = staysInside(
+      realPathDeepest(botsRoot),
+      realPathDeepest(resolved),
+    );
+    if (lexical || throughLinks) {
       throw new Error(
         'BOT_HUB_DB_FILE darf nicht innerhalb von bots/ liegen – ein Bot könnte die DB direkt lesen.',
       );
@@ -419,6 +602,7 @@ const sqliteDriver = async (config) => {
   db.exec('PRAGMA busy_timeout = 5000');
   db.exec('PRAGMA foreign_keys = ON');
   db.exec(CREATE_TABLE);
+  db.exec(CREATE_USAGE_TABLE);
 
   const cache = new Map();
   const prepare = (sql) => {
@@ -429,12 +613,53 @@ const sqliteDriver = async (config) => {
     }
     return statement;
   };
-  return {
+
+  /**
+   * Transaktionen für SQLite.
+   *
+   * `BEGIN IMMEDIATE` nimmt die Schreibsperre sofort, nicht erst beim ersten
+   * Schreibzugriff. Zusammen mit der Mutex im Store (siehe `withWrite`)
+   * serialisiert das alle Schreibvorgänge des Prozesses: Zählerstand prüfen,
+   * Eintrag schreiben und Zähler fortschreiben können nicht auseinanderlaufen.
+   */
+  let depth = 0;
+  const runTx = async (work) => {
+    if (depth > 0) return work(api);
+    db.exec('BEGIN IMMEDIATE');
+    depth = 1;
+    try {
+      const result = await work(api);
+      db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        /* Bereits zurückgerollt – der ursprüngliche Fehler zählt. */
+      }
+      throw error;
+    } finally {
+      depth = 0;
+    }
+  };
+
+  const api = {
     run: (sql, params) => prepare(sql).run(...params),
     get: (sql, params) => prepare(sql).get(...params) ?? null,
     all: (sql, params) => prepare(sql).all(...params),
+    ensureUsageRow: async (botId, now) => {
+      prepare(UPSERT_USAGE_IGNORE_SQLITE).run(botId, now);
+    },
+    lockUsage: async (botId) => {
+      // SQLite kennt kein FOR UPDATE. Die Sperre hält BEGIN IMMEDIATE.
+      return prepare(SELECT_USAGE).get(botId) ?? null;
+    },
+    usageTotals: async (botId) =>
+      prepare(usageTotalsSql('sqlite')).get(botId) ?? null,
+    transaction: runTx,
     close: () => db.close(),
   };
+  return api;
 };
 
 const mysqlDriver = async (config) => {
@@ -466,12 +691,60 @@ const mysqlDriver = async (config) => {
     bigNumberStrings: false,
   });
   await pool.query(CREATE_TABLE);
+  await pool.query(CREATE_USAGE_TABLE);
+
+  const isDuplicate = (error) => error?.code === 'ER_DUP_ENTRY';
+
+  /**
+   * Eine Transaktion braucht in MySQL eine eigene Verbindung aus dem Pool – und
+   * dort eine Zeilensperre auf dem Zähler. Erst dadurch können zwei parallele
+   * Schreibvorgänge nicht beide denselben Zählerstand lesen und sich zusammen
+   * über die Quota hinaus schreiben.
+   */
+  const transaction = async (work) => {
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const scoped = {
+        run: async (sql, params) => {
+          const [result] = await connection.execute(sql, params);
+          return result;
+        },
+        get: async (sql, params) => {
+          const [rows] = await connection.execute(sql, params);
+          return rows[0] ?? null;
+        },
+        all: async (sql, params) => {
+          const [rows] = await connection.execute(sql, params);
+          return rows;
+        },
+        ensureUsageRow: async (botId, now) => {
+          await connection.execute(UPSERT_USAGE_IGNORE_MYSQL, [botId, now]);
+        },
+        lockUsage: async (botId) => {
+          const [rows] = await connection.execute(
+            `${SELECT_USAGE} FOR UPDATE`,
+            [botId],
+          );
+          return rows[0] ?? null;
+        },
+      };
+      const result = await work(scoped);
+      await connection.commit();
+      return result;
+    } catch (error) {
+      await connection.rollback().catch(() => {});
+      throw error;
+    } finally {
+      connection.release();
+    }
+  };
 
   const run = async (sql, params) => {
     const [result] = await pool.execute(sql, params);
     return result;
   };
-  const isDuplicate = (error) => error?.code === 'ER_DUP_ENTRY';
+
   return {
     run: async (sql, params) => {
       try {
@@ -489,6 +762,18 @@ const mysqlDriver = async (config) => {
       const [rows] = await pool.execute(sql, params);
       return rows;
     },
+    ensureUsageRow: async (botId, now) => {
+      await pool.execute(UPSERT_USAGE_IGNORE_MYSQL, [botId, now]);
+    },
+    lockUsage: async (botId) => {
+      const [rows] = await pool.execute(`${SELECT_USAGE} FOR UPDATE`, [botId]);
+      return rows[0] ?? null;
+    },
+    usageTotals: async (botId) => {
+      const [rows] = await pool.execute(usageTotalsSql('mysql'), [botId]);
+      return rows[0] ?? null;
+    },
+    transaction,
     close: () => pool.end(),
   };
 };
@@ -510,10 +795,77 @@ const duplicateEntry = () =>
     'Dieser Eintrag wurde gerade angelegt – bitte erneut schreiben.',
   );
 
+/** SQLite und MySQL melden eine doppelte Zeile unterschiedlich. */
+const isDuplicateError = (error) =>
+  error?.duplicate === true ||
+  error?.code === 'ER_DUP_ENTRY' ||
+  /UNIQUE constraint failed/i.test(String(error?.message ?? ''));
+
+const quotaExceeded = (what, limit, unit = 'Einträge') =>
+  httpError(
+    413,
+    `Bot-Speicher voll: ${what}-Quota überschritten (max. ${limit} ${unit} je Bot).`,
+  );
+
+const usageOf = (row) => ({
+  entries: Number(row?.entry_count ?? 0),
+  collections: Number(row?.collection_count ?? 0),
+  bytes: Number(row?.byte_count ?? 0),
+});
+
+/**
+ * Zähler zurückschreiben. `UPDATE` zuerst, `INSERT` als Auffangnet – so bleibt
+ * der Ablauf auch dann korrekt, wenn zwei Prozesse gleichzeitig dieselbe Zeile
+ * erstmals anlegen wollen.
+ */
+const writeUsage = async (tx, botId, usage, now) => {
+  const result = await tx.run(UPDATE_USAGE, [
+    usage.entries,
+    usage.collections,
+    usage.bytes,
+    now,
+    botId,
+  ]);
+  const changes = Number(result?.changes ?? result?.affectedRows ?? 0);
+  if (changes > 0) return;
+  try {
+    await tx.run(INSERT_USAGE, [
+      botId,
+      usage.entries,
+      usage.collections,
+      usage.bytes,
+      now,
+    ]);
+  } catch (error) {
+    // Ein anderer Prozess hat die Zeile zwischen UPDATE und INSERT angelegt.
+    if (!isDuplicateError(error)) throw error;
+    await tx.run(UPDATE_USAGE, [
+      usage.entries,
+      usage.collections,
+      usage.bytes,
+      now,
+      botId,
+    ]);
+  }
+};
+
 const createStore = (config) => {
   let driver = null;
   let starting = null;
   let lastError = null;
+  // Alle Schreibvorgänge eines Prozesses laufen hintereinander. Für SQLite ist
+  // das die Bedingung dafür, dass Zählerstand und Eintrag nie auseinanderlaufen;
+  // für MySQL kommt die Zeilensperre in der Transaktion dazu.
+  let writeChain = Promise.resolve();
+
+  const withWrite = (work) => {
+    const result = writeChain.then(work, work);
+    writeChain = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  };
 
   /**
    * Verbindung erst beim ersten Bedarf. Der Start prüft die Konfiguration, aber
@@ -543,17 +895,41 @@ const createStore = (config) => {
   return {
     driver: config.driver,
 
+    /** Nur für Tests: der Treiber selbst, um Zählerzeilen zu untersuchen. */
+    raw: async () => connect(),
+
     status: () => ({
       driver: config.driver,
       // Kein Pfad, kein Host, kein Benutzer: die Antwort geht an einen Bot.
       ready: Boolean(driver),
       maxValueBytes: config.maxValueBytes,
+      // Die Quota-Grenzen sind keine Geheimnisse: ein Bot soll wissen, wann er
+      // an eine Grenze stößt, statt es durch Raten herauszufinden.
+      quotas: {
+        entries: MAX_ENTRIES_PER_BOT,
+        collections: MAX_COLLECTIONS_PER_BOT,
+        bytes: MAX_DATABASE_BYTES_PER_BOT,
+      },
     }),
 
+    /**
+     * Zählerstand eines Bots. Fehlt die Zeile, wird er aus den echten Zeilen
+     * abgeleitet – dadurch heilt eine unvollständige Tabelle sich selbst.
+     */
+    usage: async (botId) => {
+      const open = await connect();
+      const id = normaliseBotId(botId);
+      const row = await open.get(SELECT_USAGE, [id]);
+      if (row) return usageOf(row);
+      return usageOf(await open.usageTotals(id));
+    },
+
     get: async (botId, collection, key) => {
+      const id = normaliseBotId(botId);
+      takeRate('read', id);
       const open = await connect();
       const row = await open.get(SELECT_ONE, [
-        normaliseBotId(botId),
+        id,
         normaliseCollection(collection),
         normaliseKey(key),
       ]);
@@ -561,78 +937,123 @@ const createStore = (config) => {
     },
 
     set: async (botId, collection, key, value) => {
-      const open = await connect();
       const id = normaliseBotId(botId);
       const name = normaliseCollection(collection);
       const entryKey = normaliseKey(key);
       const json = checkValue(value);
-      const now = Date.now();
+      const valueBytes = Buffer.byteLength(json, 'utf8');
+      takeRate('write', id);
 
-      // Rate-Limit für Writes pro Bot
-      const rateKey = `${id}:write`;
-      const writeBucket = writeRateBuckets.get(rateKey);
-      if (!writeBucket || writeBucket.resetAt <= now) {
-        writeRateBuckets.set(rateKey, { count: 1, resetAt: now + 60_000 });
-      } else {
-        writeBucket.count += 1;
-        if (writeBucket.count > MAX_WRITES_PER_MINUTE) {
-          throw httpError(429, 'Write-Rate-Limit überschritten');
-        }
-      }
+      const open = await connect();
+      return withWrite(() =>
+        open.transaction(async (tx) => {
+          const now = Date.now();
+          const existing = await tx.get(SELECT_ONE, [id, name, entryKey]);
+          // Zähler innerhalb derselben Transaktion lesen: so kann kein zweiter
+          // Schreibvorgang zwischen Lesen und Schreiben dazwischenfunken.
+          const usage = usageOf(
+            (await tx.lockUsage(id)) ?? (await tx.usageTotals(id)),
+          );
 
-      const existing = await open.get(SELECT_ONE, [id, name, entryKey]);
-      if (existing) {
-        await open.run(UPDATE_ONE, [json, now, id, name, entryKey]);
-        return { created: false, updatedAt: now };
-      }
+          if (existing) {
+            const previousBytes = Buffer.byteLength(
+              String(existing.value),
+              'utf8',
+            );
+            const nextBytes = usage.bytes - previousBytes + valueBytes;
+            if (nextBytes > MAX_DATABASE_BYTES_PER_BOT)
+              throw quotaExceeded(
+                'Bytes',
+                MAX_DATABASE_BYTES_PER_BOT / (1024 * 1024),
+                'MiB',
+              );
+            await tx.run(UPDATE_ONE, [json, now, id, name, entryKey]);
+            await writeUsage(tx, id, { ...usage, bytes: nextBytes }, now);
+            return { created: false, updatedAt: now };
+          }
 
-      // Quota-Prüfung nur bei neuen Einträgen
-      const countRow = await open.get(COUNT_ALL, [id, name]);
-      const currentCount = Number(countRow?.total ?? 0);
-      if (currentCount >= MAX_ENTRIES_PER_BOT) {
-        throw httpError(413, `Maximale Eintragsanzahl pro Bot überschritten (${MAX_ENTRIES_PER_BOT})`);
-      }
+          // Globale Quotas – über alle Collections hinweg, nicht je Collection.
+          if (usage.entries + 1 > MAX_ENTRIES_PER_BOT)
+            throw quotaExceeded('Einträge', MAX_ENTRIES_PER_BOT);
+          if (usage.bytes + valueBytes > MAX_DATABASE_BYTES_PER_BOT)
+            throw quotaExceeded(
+              'Bytes',
+              MAX_DATABASE_BYTES_PER_BOT / (1024 * 1024),
+              'MiB',
+            );
 
-      try {
-        await open.run(INSERT_ONE, [id, name, entryKey, json, now, now]);
-        return { created: true, updatedAt: now };
-      } catch (error) {
-        // Ein zweiter Hub auf derselben Datei war schneller. Der Eintrag
-        // existiert dann schon - das ist kein Fehler, sondern ein Update.
-        if (error?.duplicate) throw duplicateEntry();
-        throw error;
-      }
+          let collections = usage.collections;
+          const known = await tx.get(USAGE_COLLECTION_EXISTS, [id, name]);
+          if (!known) {
+            if (collections + 1 > MAX_COLLECTIONS_PER_BOT)
+              throw quotaExceeded('Collections', MAX_COLLECTIONS_PER_BOT);
+            collections += 1;
+          }
+
+          try {
+            await tx.run(INSERT_ONE, [id, name, entryKey, json, now, now]);
+          } catch (error) {
+            // Ein zweiter Hub auf derselben Datei war schneller. Der Eintrag
+            // existiert dann schon – das ist kein Fehler, sondern ein Update.
+            if (isDuplicateError(error)) throw duplicateEntry();
+            throw error;
+          }
+          await writeUsage(
+            tx,
+            id,
+            {
+              entries: usage.entries + 1,
+              collections,
+              bytes: usage.bytes + valueBytes,
+            },
+            now,
+          );
+          return { created: true, updatedAt: now };
+        }),
+      );
     },
 
     remove: async (botId, collection, key) => {
-      const open = await connect();
       const id = normaliseBotId(botId);
+      const name = normaliseCollection(collection);
+      const entryKey = normaliseKey(key);
+      takeRate('delete', id);
 
-      // Rate-Limit für Deletes pro Bot
-      const rateKey = `${id}:delete`;
-      const deleteBucket = deleteRateBuckets.get(rateKey);
-      const now = Date.now();
-      if (!deleteBucket || deleteBucket.resetAt <= now) {
-        deleteRateBuckets.set(rateKey, { count: 1, resetAt: now + 60_000 });
-      } else {
-        deleteBucket.count += 1;
-        if (deleteBucket.count > MAX_DELETES_PER_MINUTE) {
-          throw httpError(429, 'Delete-Rate-Limit überschritten');
-        }
-      }
-
-      const result = await open.run(DELETE_ONE, [
-        id,
-        normaliseCollection(collection),
-        normaliseKey(key),
-      ]);
-      const changes = Number(result?.changes ?? result?.affectedRows ?? 0);
-      return changes > 0;
+      const open = await connect();
+      return withWrite(() =>
+        open.transaction(async (tx) => {
+          const now = Date.now();
+          const existing = await tx.get(SELECT_ONE, [id, name, entryKey]);
+          if (!existing) return false;
+          await tx.run(DELETE_ONE, [id, name, entryKey]);
+          const usage = usageOf(
+            (await tx.lockUsage(id)) ?? (await tx.usageTotals(id)),
+          );
+          const freed = Buffer.byteLength(String(existing.value), 'utf8');
+          // Eine Collection zählt nur, solange sie noch einen Eintrag hat.
+          const stillUsed = await tx.get(USAGE_COLLECTION_EXISTS, [id, name]);
+          await writeUsage(
+            tx,
+            id,
+            {
+              entries: Math.max(0, usage.entries - 1),
+              collections:
+                stillUsed || usage.collections === 0
+                  ? usage.collections
+                  : usage.collections - 1,
+              bytes: Math.max(0, usage.bytes - freed),
+            },
+            now,
+          );
+          return true;
+        }),
+      );
     },
 
     list: async (botId, options = {}) => {
-      const open = await connect();
       const id = normaliseBotId(botId);
+      takeRate('query', id);
+      const open = await connect();
       const name = normaliseCollection(options.collection);
       const prefix = normalisePrefix(options.prefix);
       const { limit, offset } = normalisePage(options);
@@ -645,13 +1066,30 @@ const createStore = (config) => {
         ? await open.get(COUNT_PAGE, [id, name, pattern])
         : await open.get(COUNT_ALL, [id, name]);
 
+      // Eine volle Seite aus 200 Werten zu je 64 KiB wäre über 12 MiB. Statt
+      // die Antwort abzuschneiden und damit ein stiller Datenverlust zu sein,
+      // wird sie hier am Byte-Budget entlang gefüllt und die Kürzung gemeldet.
+      const entries = [];
+      let bytes = 0;
+      let truncated = false;
+      for (const row of rows) {
+        const size = Buffer.byteLength(String(row.value), 'utf8');
+        if (bytes + size > MAX_RESPONSE_BYTES) {
+          truncated = true;
+          break;
+        }
+        bytes += size;
+        entries.push(entryOf(row));
+      }
+
       return {
         collection: name,
         prefix,
         limit,
         offset,
         total: Number(counter?.total ?? 0),
-        entries: rows.map(entryOf),
+        truncated,
+        entries,
       };
     },
 

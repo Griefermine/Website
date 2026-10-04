@@ -656,9 +656,8 @@ const depsFor = (bot) => {
   const check = fillDeps(bot.depsCheck || language.check, deps);
   const installRaw = bot.depsInstall || language.install;
   // Unterstütze sowohl String- als auch strukturierte Befehle
-  const install = typeof installRaw === 'string'
-    ? fillDeps(installRaw, deps)
-    : installRaw;
+  const install =
+    typeof installRaw === 'string' ? fillDeps(installRaw, deps) : installRaw;
   const prepare = fillDeps(language.prepare, deps);
   return { language, framework, deps, check, install, prepare, venv };
 };
@@ -738,18 +737,50 @@ const parseCommand = (command) => {
   return tokens.length ? tokens : null;
 };
 
+/**
+ * Ein Programm im eigenen Ordner des Bots, z.B. der Gradle-Wrapper
+ * `./gradlew`.
+ *
+ * Dafür gilt mehr als "beginnt mit ./": das Ziel muss eine reguläre Datei im
+ * Workspace sein, ausführbar, und nach `realpath` immer noch darin liegen. Ein
+ * SymLink nach `/usr/bin` wäre sonst ein Weg aus der Prüfung heraus.
+ */
+const WORKSPACE_PROGRAMS = new Set(['./gradlew', './mvnw', './gradlew.bat']);
+
+const workspaceProgram = (executable, dir) => {
+  if (!WORKSPACE_PROGRAMS.has(executable)) return null;
+  const candidate = resolve(dir, executable);
+  let info;
+  let real;
+  try {
+    info = statSync(candidate);
+    real = realpathSync(candidate);
+  } catch {
+    return null;
+  }
+  if (!info.isFile()) return null;
+  if (process.platform !== 'win32' && (info.mode & 0o111) === 0) return null;
+  const rel = relative(dir, real);
+  if (rel.startsWith('..') || isAbsolute(rel)) return null;
+  return real;
+};
+
 const commandSpec = (bot, command, dir, purpose = 'start') => {
   const tokens = parseCommand(command);
   if (!tokens) throw httpError(400, 'Ungültiger Befehl');
   const [executable, ...args] = tokens;
+  // `./gradlew` ist der einzige erlaubte Pfad: eine Datei im eigenen Ordner des
+  // Bots, nicht irgendwo im Dateisystem.
+  const local = workspaceProgram(executable, dir);
   if (
-    isAbsolute(executable) ||
-    executable.includes('/') ||
-    executable.includes('\\')
+    !local &&
+    (isAbsolute(executable) ||
+      executable.includes('/') ||
+      executable.includes('\\'))
   )
     throw httpError(
       400,
-      'Das Programm muss aus dem freigegebenen Runtime stammen',
+      'Das Programm muss aus der freigegebenen Runtime stammen',
     );
   const language = getLanguage(bot.language);
   const allowed = new Set(
@@ -776,7 +807,7 @@ const commandSpec = (bot, command, dir, purpose = 'start') => {
         : []),
     ].filter(Boolean),
   );
-  if (!allowed.has(executable))
+  if (!local && !allowed.has(executable))
     throw httpError(
       400,
       'Programm ist für diese Bot-Sprache nicht freigegeben',
@@ -787,9 +818,13 @@ const commandSpec = (bot, command, dir, purpose = 'start') => {
     module: framework.module,
     venv: language.venv || '',
   };
-  const expectedCheck = fillDeps(language.check, deps);
-  const expectedPrepare = fillDeps(language.prepare, deps);
-  const expectedInstall = fillDeps(language.install, deps);
+  // Sprachen ohne Prüfbefehl (z.B. "Sonstiges") haben hier nichts zu füllen.
+  const expectedCheck = fillDeps(language.check || '', deps);
+  const expectedPrepare = fillDeps(language.prepare || '', deps);
+  const expectedInstall = fillDeps(
+    typeof language.install === 'string' ? language.install : '',
+    deps,
+  );
   const isExpectedDependencyCheck =
     purpose === 'dependency' && command === expectedCheck;
   const isExpectedDependencyCommand =
@@ -820,7 +855,7 @@ const commandSpec = (bot, command, dir, purpose = 'start') => {
       throw httpError(400, 'Befehl verweist außerhalb des Bot-Workspace');
     return relative(dir, trusted);
   });
-  return { executable, args: safeArgs };
+  return { executable: local ?? executable, args: safeArgs };
 };
 
 const runCommand = (
@@ -922,7 +957,9 @@ const checkDependencies = async (bot, dir) => {
 const installDependencies = async (bot, dir, { state, force = false } = {}) => {
   const info = state ?? (await checkDependencies(bot, dir));
   if (info.ok && !force) return { ...info, installed: false, ok: true };
-  if (!info.install) {
+
+  const plan = resolveInstallPlan(info.install, dir, info.deps);
+  if (!plan.length) {
     pushLine(
       bot.id,
       'system',
@@ -934,7 +971,7 @@ const installDependencies = async (bot, dir, { state, force = false } = {}) => {
 
   setStatus(bot, 'installing', {
     depsStatus: 'installing',
-    depsCommand: typeof info.install === 'string' ? info.install : 'structured',
+    depsCommand: installLabel(plan),
   });
   pushLine(
     bot.id,
@@ -942,48 +979,79 @@ const installDependencies = async (bot, dir, { state, force = false } = {}) => {
     `Installiere ${info.framework.name} – je nach Sprache kann das ein paar Minuten dauern …`,
   );
 
-  // Unterstütze strukturierte Befehle (fallback-Array)
-  if (typeof info.install === 'object' && info.install.fallback) {
-    for (const cmd of info.install.fallback) {
-      const cmdStr = [cmd.executable, ...cmd.args].join(' ');
-      const { code } = await runCommand(bot, cmdStr, {
-        dir,
-        timeout: INSTALL_TIMEOUT,
-      });
-      if (code === 0) {
-        pushLine(bot.id, 'system', `✓ ${info.framework.name} installiert`);
-        setStatus(bot, 'stopped', { depsStatus: 'ready' });
-        return { ...info, installed: true, ok: true };
-      }
+  for (const step of plan) {
+    const { code } = await runCommand(bot, step.join(' '), {
+      dir,
+      timeout: INSTALL_TIMEOUT,
+    });
+    if (code !== 0) {
+      pushLine(
+        bot.id,
+        'system',
+        `✗ Installation fehlgeschlagen (Exit-Code ${code})`,
+      );
+      setStatus(bot, 'stopped', { depsStatus: 'failed' });
+      return { ...info, installed: true, ok: false };
     }
-    pushLine(
-      bot.id,
-      'system',
-      `✗ Installation fehlgeschlagen – alle Befehle fehlgeschlagen`,
-    );
-    setStatus(bot, 'stopped', { depsStatus: 'failed' });
-    return { ...info, installed: true, ok: false };
-  }
-
-  const { code } = await runCommand(bot, info.install, {
-    dir,
-    timeout: INSTALL_TIMEOUT,
-  });
-
-  if (code !== 0) {
-    pushLine(
-      bot.id,
-      'system',
-      `✗ Installation fehlgeschlagen (Exit-Code ${code})`,
-    );
-    setStatus(bot, 'stopped', { depsStatus: 'failed' });
-    return { ...info, installed: true, ok: false };
   }
 
   pushLine(bot.id, 'system', `✓ ${info.framework.name} installiert`);
   setStatus(bot, 'stopped', { depsStatus: 'ready' });
   return { ...info, installed: true, ok: true };
 };
+
+/**
+ * Aus einem Installationsbefehl wird eine Folge von Schritten.
+ *
+ * Ein String bleibt ein Schritt und geht über den bestehenden geprüften Weg.
+ * Ein Objekt beschreibt eine Bedingung im Arbeitsordner – etwa "nutze den
+ * Wrapper im Projekt, wenn es ihn gibt, sonst Maven". Die Bedingung wird hier
+ * im Hub ausgewertet; ein `if [ -f ... ]` im Befehl selbst wäre wieder
+ * Shell-Syntax und fiele durch die Befehlsprüfung.
+ *
+ * Wichtig ist die Unterscheidung zwischen *Alternative* und *Folge*: ein
+ * else-Zweig, der aus zwei Befehlen besteht, führt beide aus. Ersetzt man den
+ * zweiten durch den ersten, bleibt das Projekt uninitialisiert.
+ */
+const resolveInstallPlan = (install, dir, deps) => {
+  if (!install) return [];
+  // Auch ein String wird zu einer Argumentliste. Bliebe er hier als Text
+  // stehen, würde `step.join(' ')` später jedes Zeichen einzeln trennen.
+  if (typeof install === 'string') return [[fillDeps(install, deps)]];
+  const fill = (parts) => parts.map((part) => fillDeps(String(part), deps));
+  const branch = (node) => {
+    if (!node) return [];
+    if (Array.isArray(node)) return node.map(fill);
+    if (Array.isArray(node.run)) return [fill(node.run)];
+    if (Array.isArray(node.sequence)) return node.sequence.map(fill);
+    return [];
+  };
+  if (!install.if) return branch(install);
+  const file = String(install.if.file ?? '');
+  if (!file || /[/\\]/.test(file)) return branch(install.else);
+  const target = join(dir, file);
+  const matches = () => {
+    try {
+      const info = statSync(target);
+      if (!info.isFile()) return false;
+      if (
+        install.if.executable &&
+        process.platform !== 'win32' &&
+        (info.mode & 0o111) === 0
+      )
+        return false;
+      const rel = relative(dir, realpathSync(target));
+      return !rel.startsWith('..') && !isAbsolute(rel);
+    } catch {
+      return false;
+    }
+  };
+  return branch(matches() ? (install.then ?? install.else) : install.else);
+};
+
+/** Nur für Tests und Anzeige: der Installationsbefehl als Text. */
+const installLabel = (plan) =>
+  plan.map((step) => step.join(' ')).join(' && ') || '—';
 
 const spawnBot = (bot, dir, language) => {
   const command = fillPlaceholders(bot.command, bot, dir) || language.command;
@@ -1774,3 +1842,8 @@ configurePanel({
 configureAccess(ACCESS_FILE);
 
 export { stopAllBots };
+
+/* Nur für Tests: die beiden Stellen, an denen ein Befehl oder eine
+ * Installationsfolge entsteht. Beides entscheidet, was ein Bot ausführen darf,
+ * und gehört damit in den Test statt nur in den Betrieb. */
+export const __testing = { commandSpec, resolveInstallPlan, installLabel };

@@ -21,6 +21,8 @@ import {
   randomUUID,
   timingSafeEqual,
 } from 'node:crypto';
+import { lookup } from 'node:dns/promises';
+import { isIP } from 'node:net';
 import {
   chmodSync,
   existsSync,
@@ -1383,40 +1385,126 @@ const openBotStream = (bot, req, res) => {
 /* ------------------------------------------------------------------ *
  * Aktionen (Callback-URL oder Skript)
  * ------------------------------------------------------------------ */
-const registerCallback = (bot, url, token) => {
+/**
+ * Callback-Ziele prüfen.
+ *
+ * Standardmäßig ist ausschließlich Loopback erlaubt: der Hub ruft damit nur den
+ * Prozess an, der sich selbst gemeldet hat. Das ist bewusst die enge Variante –
+ * der Hub wäre sonst für jeden Bot ein offener Client, der beliebige Adressen
+ * im Netz abklopft (SSRF) und über Umgehungstechniken wie DNS-Rebinding auch
+ * interne Dienste erreicht.
+ *
+ * Für Container, deren Loopback der Hub nicht teilt, kann ein Betreiber Ziele
+ * ausdrücklich freigeben: `BOT_HUB_CALLBACK_ALLOW=host:port,host`.
+ */
+const callbackAllowlist = () =>
+  new Set(
+    String(process.env.BOT_HUB_CALLBACK_ALLOW ?? '')
+      .split(',')
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean),
+  );
+
+/** Loopback über den echten Adresstyp, nicht über einen Zeichenketten-Vergleich. */
+const isLoopbackAddress = (address) => {
+  const text = String(address ?? '').toLowerCase();
+  // IPv4-Schreibweisen, die ein Parser als Adresse erkennt.
+  if (isIP(text) === 4) return /^127\./.test(text);
+  if (isIP(text) === 6) {
+    if (text === '::1' || text === '0:0:0:0:0:0:0:1') return true;
+    // IPv4-mapped: ::ffff:127.0.0.1 ist ebenfalls Loopback.
+    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(text);
+    if (mapped) return /^127\./.test(mapped[1]);
+  }
+  return false;
+};
+
+/** Alle Adressen eines Namens – eine einzige reicht nicht, sonst gewinnt der letzte Eintrag. */
+const resolveAll = async (hostname) => {
+  try {
+    const found = await lookup(hostname, { all: true, verbatim: true });
+    return found.map((item) => item.address);
+  } catch {
+    return [];
+  }
+};
+
+/**
+ * `new URL` bringt jede Schreibweise einer IPv4-Adresse auf die kanonische Form,
+ * bevor hier etwas geprüft wird: `2130706433`, `127.1`, `0177.0.0.1` und
+ * `0x7f.1` stehen danach alle als `127.0.0.1` da, `2852039166` als
+ * `169.254.169.254`. Deshalb genügt der Vergleich mit der normalisierten
+ * Adresse – und deshalb wird unten auch genau die Adresse gespeichert und
+ * aufgerufen, die geprüft wurde.
+ */
+const assertCallbackTarget = async (parsed) => {
+  const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  const port = parsed.port || (parsed.protocol === 'https:' ? '443' : '80');
+  const allow = callbackAllowlist();
+  if (allow.has(hostname) || allow.has(`${hostname}:${port}`)) return;
+
+  if (isIP(hostname)) {
+    if (!isLoopbackAddress(hostname))
+      throw httpError(
+        400,
+        'callback.url darf nur auf den eigenen Rechner zeigen (Loopback). Für andere Ziele braucht es BOT_HUB_CALLBACK_ALLOW.',
+      );
+    return;
+  }
+
+  const addresses = await resolveAll(hostname);
+  if (addresses.length === 0)
+    throw httpError(400, 'callback.url: Hostname lässt sich nicht auflösen');
+  // Jede aufgelöste Adresse muss Loopback sein. Sonst genügt ein DNS-Eintrag
+  // mit einer privaten Adresse, um die Beschränkung zu umgehen.
+  if (addresses.some((address) => !isLoopbackAddress(address)))
+    throw httpError(
+      400,
+      'callback.url löst auf eine Adresse außerhalb des Loopback auf (SSRF-Schutz). Für andere Ziele braucht es BOT_HUB_CALLBACK_ALLOW.',
+    );
+};
+
+/** Wie lange eine registrierte Callback-Adresse gilt. */
+const CALLBACK_TTL = 60 * 60 * 1000;
+
+const registerCallback = async (bot, url, token) => {
   let parsed;
   try {
     parsed = new URL(String(url));
   } catch {
     throw httpError(400, 'callback.url ist keine gültige URL');
   }
-  // SSRF-Schutz: Blockiere private/loopback-Adressen vollständig
-  const hostname = parsed.hostname.toLowerCase();
-  const isPrivate =
-    LOOPBACK.has(hostname) ||
-    hostname === '0.0.0.0' ||
-    hostname.startsWith('10.') ||
-    hostname.startsWith('192.168.') ||
-    hostname.startsWith('169.254.') ||
-    /^172\.(1[6-9]|2[0-9]|3[01])\./.test(hostname) ||
-    hostname.startsWith('fc') ||
-    hostname.startsWith('fd') ||
-    hostname.startsWith('fe80:') ||
-    hostname === '::1' ||
-    hostname === '[::1]';
-  if (isPrivate)
-    throw httpError(
-      400,
-      'callback.url darf nicht auf private oder lokale Adressen zeigen (SSRF-Schutz)',
-    );
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
+    throw httpError(400, 'callback.url muss http oder https verwenden');
+  await assertCallbackTarget(parsed);
   // Nicht auf den Hub selbst: sonst lässt sich der Hub als Vermittler für
   // eigene Aufrufe benutzen.
-  if ((parsed.port || '80') === String(process.env.PORT || 8787))
+  if (
+    (parsed.port || (parsed.protocol === 'https:' ? '443' : '80')) ===
+    String(process.env.PORT || 8787)
+  )
     throw httpError(400, 'callback.url darf nicht auf den Hub selbst zeigen');
-  callbacks.set(bot.id, { url: parsed.toString(), token: text(token, 200) });
+  callbacks.set(bot.id, {
+    // Die Bot-Id steht mit im Eintrag und wird vor jedem Aufruf geprüft: ein
+    // Eintrag kann so nicht für einen anderen Bot verwendet werden.
+    botId: bot.id,
+    url: parsed.toString(),
+    token: text(token, 200),
+    registeredAt: Date.now(),
+    expiresAt: Date.now() + CALLBACK_TTL,
+  });
   broadcastEvent('panel', { id: bot.id, panel: publicPanel(bot) });
-  return { ok: true, url: parsed.origin };
+  return { ok: true, url: parsed.origin, expiresAt: Date.now() + CALLBACK_TTL };
 };
+
+/** Veraltete Einträge und Speicher von Bots, die es nicht mehr gibt, räumen auf. */
+const sweepCallbacks = () => {
+  const now = Date.now();
+  for (const [id, hook] of callbacks)
+    if (hook.expiresAt <= now) callbacks.delete(id);
+};
+const callbackSweep = setInterval(sweepCallbacks, 60_000);
+callbackSweep.unref?.();
 
 /** Liest höchstens `max` Bytes – ein Callback soll keine unbegrenzte Flut
  *  in den Hub hängen können. */
@@ -1438,7 +1526,45 @@ const readLimited = async (response, max) => {
   return Buffer.concat(chunks).toString('utf8');
 };
 
+/**
+ * Wie viele Callback-Aufrufe ein Bot pro Minute auslösen darf. Ohne diese
+ * Schranke kann eine Aktion im Panel den Prozess in eine Aufrufschleife treiben.
+ */
+const CALLBACK_CALLS_PER_MINUTE = 30;
+const callbackCalls = new Map();
+
+const takeCallbackCall = (botId) => {
+  const key = `${botId}:callback`;
+  const now = Date.now();
+  const bucket = callbackCalls.get(key);
+  if (!bucket || bucket.resetAt <= now) {
+    callbackCalls.set(key, { count: 1, resetAt: now + 60_000 });
+    return;
+  }
+  bucket.count += 1;
+  if (bucket.count > CALLBACK_CALLS_PER_MINUTE)
+    throw httpError(429, 'Zu viele Callback-Aufrufe – bitte kurz warten.');
+};
+
 const callCallback = async (bot, hook, command, args) => {
+  // TTL und Bot-Bindung vor jedem Aufruf prüfen: ein alter Eintrag und ein
+  // Eintrag, der für einen anderen Bot abgelegt wurde, werden nicht benutzt.
+  if (hook.expiresAt <= Date.now()) {
+    callbacks.delete(bot.id);
+    return {
+      ok: false,
+      via: 'callback',
+      error: 'Callback abgelaufen – bitte neu registrieren.',
+    };
+  }
+  if (hook.botId !== bot.id)
+    return {
+      ok: false,
+      via: 'callback',
+      error: 'Callback gehört zu einem anderen Bot.',
+    };
+  takeCallbackCall(bot.id);
+
   const payload = JSON.stringify({
     id: command.id,
     label: command.label,
@@ -1447,7 +1573,11 @@ const callCallback = async (bot, hook, command, args) => {
     bot: { id: bot.id, name: bot.name, guildId: bot.guildId },
   });
   try {
-    const response = await fetch(hook.url, {
+    // Das Ziel wird erneut geprüft, nicht nur bei der Registrierung: zwischen
+    // beiden Zeitpunkten kann sich ein DNS-Eintrag geändert haben.
+    const parsed = new URL(hook.url);
+    await assertCallbackTarget(parsed);
+    const response = await fetch(parsed.toString(), {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -1659,7 +1789,14 @@ export const runAction = async (bot, commandId, args) => {
   if (!command) throw httpError(404, `Unbekannte Aktion "${commandId}"`);
   const hook = callbacks.get(bot.id);
   if (hook && bot.child) {
-    const result = await callCallback(bot, hook, command, args);
+    let result;
+    try {
+      result = await callCallback(bot, hook, command, args);
+    } catch (error) {
+      // Rate-Limit und Zielprüfung werfen; im Panel ist das eine Meldung an den
+      // Bediener, kein Absturz der Aktion.
+      result = { ok: false, via: 'callback', error: error.message };
+    }
     askBotForValues(bot, `command:${commandId}`);
     return result;
   }
@@ -2262,7 +2399,12 @@ export const handleHubRoutes = async (req, res, url, getBot) => {
       );
     const body = await readBody(req);
     if (body.url === null || body.url === '') callbacks.delete(bot.id);
-    else return sendJson(res, 200, registerCallback(bot, body.url, body.token));
+    else
+      return sendJson(
+        res,
+        200,
+        await registerCallback(bot, body.url, body.token),
+      );
     broadcastEvent('panel', { id: bot.id, panel: publicPanel(bot) });
     return sendJson(res, 200, { ok: true, url: null });
   }

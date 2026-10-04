@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { chmodSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, it } from 'node:test';
+import { after, before, describe, it } from 'node:test';
 
 const ROOT = join(import.meta.dirname, '..');
 
@@ -106,5 +107,94 @@ describe('Startschutz für unsichere Konfiguration', () => {
       !mitUrl.includes('BOT_HUB_CONTAINER_URL ist nicht gesetzt'),
       'Hinweis erscheint trotz gesetzter Container-URL',
     );
+  });
+});
+
+/**
+ * Die Selbstprüfung liest Pfade am Projekt-Root. Ein Start mit
+ * `BOT_DASHBOARD_ROOT` zeigt deshalb genau das Verzeichnis, das geprüft wird –
+ * und lässt sich von einem CWD aus nicht beeinflussen.
+ */
+describe('Selbstprüfung misst am Projekt-Root', () => {
+  const root = join(ROOT, 'test', '.selbstpruefung');
+  const mitRoot = (env) => ({
+    NODE_ENV: 'test',
+    BOT_HUB_TEST_MODE: '1',
+    BOT_DASHBOARD_ROOT: root,
+    ...env,
+  });
+
+  before(() => {
+    rmSync(root, { recursive: true, force: true });
+    mkdirSync(join(root, 'data', 'secrets'), { recursive: true });
+  });
+
+  after(() => rmSync(root, { recursive: true, force: true }));
+
+  it('warnt bei belegter .env im Projekt-Root', async () => {
+    const pfad = join(root, '.env');
+    writeFileSync(pfad, 'DISCORD_CLIENT_SECRET=echt-geheimnis\n');
+    try {
+      const out = await startAndRead(mitRoot());
+      assert.match(out, /\.env enthält belegte Geheimnisse/);
+      assert.match(out, /data\/secrets/);
+      // Der Wert selbst darf nirgends auftauchen.
+      assert.ok(!out.includes('echt-geheimnis'), 'Secret stand in der Ausgabe');
+    } finally {
+      rmSync(pfad, { force: true });
+    }
+  });
+
+  it('warnt, wenn data/secrets/ für andere lesbar ist', async () => {
+    chmodSync(join(root, 'data', 'secrets'), 0o755);
+    try {
+      const out = await startAndRead(mitRoot());
+      if (process.platform !== 'win32')
+        assert.match(out, /data\/secrets\/ ist für andere Benutzer lesbar/);
+    } finally {
+      chmodSync(join(root, 'data', 'secrets'), 0o700);
+    }
+  });
+
+  it('meldet nicht verwendete Bilder nur in Produktion', async () => {
+    const still = await startAndRead(mitRoot());
+    assert.ok(
+      !still.includes('nicht per Digest festgelegt'),
+      'Warnung erscheint ohne NODE_ENV=production',
+    );
+  });
+});
+
+describe('Bilder ohne Digest', () => {
+  it('verweigert den Start, wenn Digests verlangt sind', async () => {
+    const { code, out } = await startHub({
+      NODE_ENV: 'test',
+      BOT_HUB_TEST_MODE: '1',
+      BOT_HUB_REQUIRE_IMAGE_DIGEST: '1',
+    });
+    assert.equal(code, 1);
+    assert.match(out, /SICHERHEITS-FEHLER/);
+    assert.match(out, /BOT_HUB_REQUIRE_IMAGE_DIGEST/);
+  });
+
+  it('akzeptiert eine Konfiguration mit Digest', async () => {
+    const images = JSON.stringify({
+      python: 'python@sha256:' + 'a'.repeat(64),
+      javascript: 'node@sha256:' + 'b'.repeat(64),
+      typescript: 'node@sha256:' + 'b'.repeat(64),
+      java: 'temurin@sha256:' + 'c'.repeat(64),
+      kotlin: 'temurin@sha256:' + 'c'.repeat(64),
+      go: 'golang@sha256:' + 'd'.repeat(64),
+      csharp: 'dotnet@sha256:' + 'e'.repeat(64),
+      rust: 'rust@sha256:' + 'f'.repeat(64),
+      custom: 'ubuntu@sha256:' + '0'.repeat(64),
+    });
+    const out = await startAndRead({
+      NODE_ENV: 'test',
+      BOT_HUB_TEST_MODE: '1',
+      BOT_HUB_REQUIRE_IMAGE_DIGEST: '1',
+      BOT_HUB_CONTAINER_IMAGES: images,
+    });
+    assert.match(out, /Bot-Hub/);
   });
 });

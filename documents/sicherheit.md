@@ -22,6 +22,16 @@ Die Werte selbst liegen je Bot in `data/secrets/<bot-id>.env`, geschrieben mit
 `0600` in einem Verzeichnis `0700`. Datei und Verzeichnis gehören nicht ins
 Git-Repository; `data/` ist bereits ausgeschlossen.
 
+Vor einer Veröffentlichung prüft `npm run release:scan` beides: einmal, was Git
+kennt – ein Token, ein Schlüssel, eine belegte Zuweisung in einer Konfigurations-
+oder Quelldatei – und einmal, welche Pfade falsch wären (`data/`, `.env`,
+Zertifikate, `.sqlite`). Geprüft wird nur, was Git kennt: eine `.env` im
+Arbeitsverzeichnis ist über `.gitignore` ausgeschlossen und würde nie
+committet, sie zu melden hieße, immer dasselbe zu melden. Findet der Scan
+etwas, bricht er mit Exit-Code 1 ab und nennt Datei und Zeile – nie den Wert
+selbst. Ein Geheimnis, das einmal committet wurde, bleibt in der Historie und
+ist durch Löschen der Datei nicht weg; es gehört rotiert.
+
 ```dotenv
 DISCORD_BOT_TOKEN="…"
 API_KEY="…"
@@ -70,6 +80,21 @@ Drei Dinge sind bewusst eng geführt:
   als Parameter ein. Namen, Schlüssel, Seitengrößen und die Größe eines Wertes
   werden gegen feste Muster und Grenzen geprüft (64 KiB je Wert, 200 Einträge
   je Liste).
+- **Grenzen gelten je Bot, nicht je Collection.** Ein Bot darf insgesamt
+  10.000 Einträge, 100 Collections und 100 MiB belegen – über alle Collections
+  hinweg. Eine Grenze je Collection wäre umgehbar, indem ein Bot sich viele
+  anlegt (100 × 9000). Die Zählung steht in einer eigenen Zeile und wird in
+  derselben Transaktion nachgeführt wie der Schreibvorgang; konkurrierende
+  Schreibvorgänge können sie deshalb nicht überzählig machen.
+- **Eine Listenantwort bleibt unter 4 MiB.** Reißt die Seite diesen Rahmen,
+  wird sie gekürzt und `truncated: true` gemeldet. Der Zähler `total` bleibt
+  dabei die Wahrheit über alle Zeilen – eine Kürzung soll sichtbar sein, nicht
+  still Daten verschlucken.
+
+Daneben Ratenbegrenzungen je Bot: 120 Schreibvorgänge, 60 Löschungen,
+240 Lesevorgänge und 120 Abfragen pro Minute. Bei `429` nennt die Antwort
+`retryAfter`.
+
 - **MySQL nur auf diesem Rechner.** Ein `BOT_HUB_DB_HOST`, der nicht auf
   Loopback zeigt und kein Unix-Socket ist, bricht den Start ab. `root` als
   Benutzer ebenso, ebenso MySQL im Testmodus ohne ausdrückliche Freigabe.
@@ -102,6 +127,53 @@ schaltet nichts frei – die Schranken bleiben dann stehen. Wer nur
 `BOT_HUB_TEST_MODE=1` setzt, bekommt den Abbruch: lieber ein deutlicher Fehler
 als ein offener Hub.
 
+Zwei weitere Prüfungen können den Start verhindern:
+
+- **Root.** In Produktion startet der Hub nicht als `root`. Sonst bekämen auch
+  die Container `root`, und die Trennung zwischen fremdem Bot-Code und dem Host
+  träfe nicht mehr.
+- **Images ohne Digest.** Ein Tag wie `python:3.12-bookworm` ist eine Liste von
+  Namen, die jemand anderes jederzeit umschreiben kann. Mit
+  `BOT_HUB_REQUIRE_IMAGE_DIGEST=1` startet der Hub nicht, solange nicht alle
+  Images über `BOT_HUB_CONTAINER_IMAGES` auf einen Digest festgelegt sind. Ohne
+  diesen Schalter gibt es in Produktion eine deutliche Warnung – die
+  Grundeinstellung bleibt veränderlich, damit ein Betrieb nicht an einem fehlenden
+  Digest-Pin stehen bleibt. Ein ausgedachter Digest wäre schlimmer als keiner:
+  er lässt jeden Pull scheitern, ohne erkennbar zu sein, warum.
+
+Vor dem Start kommen noch Warnungen, die den Betrieb nicht aufhalten: belegte
+Geheimnisse in `.env`, ein für andere Benutzer lesbares `data/secrets/`, ein
+vorhandener Docker-Socket. Sie messen am Projekt-Root (`BOT_DASHBOARD_ROOT`),
+nicht am Arbeitsverzeichnis – eine Prüfung am falschen Verzeichnis hält eine
+Fehlkonfiguration für eine richtige.
+
+## Callback-Adressen
+
+Der Hub ruft für eine Aktion im Panel die Adresse auf, die sich der Bot-Prozess
+mit `BOT_HUB_TOKEN` gemeldet hat. Diese Adresse ist der einzige Weg, auf dem der
+Hub selbst etwas im Netz aufruft, und damit auch der einzige Weg, auf dem das
+passieren könnte, was der Bot nicht darf.
+
+Ohne weiteren Schalter ist **nur Loopback erlaubt**. Das genügt, weil der
+Prozess neben dem Hub läuft, und es schließt den Hub als Vermittler für
+beliebige Adressen aus:
+
+- geprüft wird die echte Adresse, nicht die Schreibweise. `2130706433`,
+  `127.1` und `0x7f.1` stehen nach der Normalisierung durch `new URL` als
+  `127.0.0.1` da – geprüft und gespeichert wird dieselbe Adresse;
+- bei einem Namen zählt **jede** aufgelöste Adresse. Ein einzelner günstiger
+  Eintrag in der Antwort würde sonst genügen, um die Schranke zu umgehen;
+- geprüft wird wieder bei jedem Aufruf, nicht nur bei der Anmeldung. Zwischen
+  beiden Zeitpunkten kann sich ein DNS-Eintrag geändert haben;
+- Redirects werden nicht verfolgt. Sonst hebt ein Callback auf dem localhost die
+  Schranke auf und der Hub ruft das eigentliche Ziel doch auf.
+
+Für Container, deren Loopback der Hub nicht teilt, gibt es
+`BOT_HUB_CALLBACK_ALLOW=host:port,host`. Der Eintrag ist eine bewusste
+Ausnahme: Der Hub ruft dann auch Ziele außerhalb des eigenen Rechners auf, und
+der Betreiber trägt diese Verantwortung. Eine angemeldete Adresse gilt eine
+Stunde und ist an die Bot-ID gebunden; 30 Aufrufe je Bot und Minute.
+
 ## Was nicht abgesichert ist
 
 - **Container ohne Netzwerk-Firewall.** Die Grenzen sind Benutzer, Rechte,
@@ -131,6 +203,11 @@ als ein offener Hub.
   Absenders. Für den Rückweg gilt weiter: ein Callback in einem fremden Browser
   wird abgewiesen, und die Autorisierung gilt nur für `guildId` plus
   Administrator/**Server verwalten**. Details in `discord-login.md`.
+- **`BOT_HUB_CALLBACK_ALLOW`.** Jeder Eintrag nimmt die Loopback-Schranke für
+  dieses Ziel aus. Damit ruft der Hub auch Adressen außerhalb des eigenen
+  Rechners auf, und ein Bot, der den Hub-Rechner kontrolliert, kann darüber
+  interne Dienste erreichen, die er sonst nicht sieht. Nur setzen, wenn das der
+  eigene Aufbau ist – ein Loopback, das beide Seiten teilen, braucht es nicht.
 - **`BOT_HUB_CONTAINER_URL`.** Der Eintrag `host.docker.internal` ist eine
   bewusste Öffnung und gehört nur gesetzt, wenn ein Bot den Hub braucht.
   Ohne diese Variable erreicht ein Bot-Prozess den Hub nicht: `127.0.0.1` ist im
@@ -150,3 +227,7 @@ im Entwicklungsbetrieb ohne `--watch`. Nach dem Neustart gelten zusätzlich:
   Callback an den Browser, der ihn gestartet hat.
 - Reste abgebrochener Schreibvorgänge (`data/secrets/.env.bot-hub.tmp-*`) werden
   beim Start entfernt.
+- Bereits angemeldete Callback-Adressen gelten ab jetzt nur noch eine Stunde.
+  Nach diesem Neustart meldet sich ein Bot, dessen Aktionen auf einem Callback
+  laufen, bei Bedarf einmal neu an – ein Aufruf meldet „Callback abgelaufen“
+  statt ins Leere zu gehen.

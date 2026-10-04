@@ -79,10 +79,11 @@ export const LANGUAGES = [
     check:
       'ls build/libs/*.jar target/*.jar out/production/libs/*.jar > /dev/null 2>&1',
     install: {
-      fallback: [
-        { executable: './gradlew', args: ['build'] },
-        { executable: 'mvn', args: ['-q', '-DskipTests', 'package'] },
-      ],
+      // Entspricht `[ -x ./gradlew ] && ./gradlew build || mvn ... package`:
+      // der Wrapper im Projekt hat Vorrang, sonst Maven.
+      if: { file: 'gradlew', executable: true },
+      then: { run: ['./gradlew', 'build'] },
+      else: { run: ['mvn', '-q', '-DskipTests', 'package'] },
     },
     frameworks: [
       framework('JDA', 'net.dv8tion.jda', 'net.dv8tion:JDA:5.0.0-beta.13'),
@@ -100,10 +101,11 @@ export const LANGUAGES = [
     check:
       'ls build/libs/*.jar target/*.jar out/production/libs/*.jar > /dev/null 2>&1',
     install: {
-      fallback: [
-        { executable: './gradlew', args: ['build'] },
-        { executable: 'mvn', args: ['-q', '-DskipTests', 'package'] },
-      ],
+      // Entspricht `[ -x ./gradlew ] && ./gradlew build || mvn ... package`:
+      // der Wrapper im Projekt hat Vorrang, sonst Maven.
+      if: { file: 'gradlew', executable: true },
+      then: { run: ['./gradlew', 'build'] },
+      else: { run: ['mvn', '-q', '-DskipTests', 'package'] },
     },
     frameworks: [
       framework('Kord', 'dev.kord', 'dev.kord:kord-core'),
@@ -123,10 +125,17 @@ export const LANGUAGES = [
     command: 'go run {entrypoint}',
     check: 'go list -m all 2> /dev/null | grep -q {module}',
     install: {
-      fallback: [
-        { executable: 'go', args: ['get', '{module}'] },
-        { executable: 'go', args: ['mod', 'init', 'bot'] },
-      ],
+      // Entspricht `if [ -f go.mod ]; then go get {module}; else
+      // go mod init bot && go get {module}; fi`. Der else-Zweig ist eine
+      // Folge, kein Ersatz: erst initialisieren, dann das Modul holen.
+      if: { file: 'go.mod' },
+      then: { run: ['go', 'get', '{module}'] },
+      else: {
+        sequence: [
+          ['go', 'mod', 'init', 'bot'],
+          ['go', 'get', '{module}'],
+        ],
+      },
     },
     frameworks: [
       framework(
@@ -164,10 +173,16 @@ export const LANGUAGES = [
     command: './target/release/bot',
     check: 'grep -qi {package} Cargo.toml 2> /dev/null',
     install: {
-      fallback: [
-        { executable: 'cargo', args: ['add', '{package}'] },
-        { executable: 'cargo', args: ['init', '--name', 'bot'] },
-      ],
+      // Entspricht `if [ -f Cargo.toml ]; then cargo add {package}; else
+      // cargo init --name bot && cargo add {package}; fi`.
+      if: { file: 'Cargo.toml' },
+      then: { run: ['cargo', 'add', '{package}'] },
+      else: {
+        sequence: [
+          ['cargo', 'init', '--name', 'bot'],
+          ['cargo', 'add', '{package}'],
+        ],
+      },
     },
     frameworks: [
       framework('Serenity', 'serenity', 'serenity'),

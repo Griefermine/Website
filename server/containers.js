@@ -22,11 +22,14 @@ const BASE_IMAGES = {
  * Production-Defaults: Images auf Digest pinnen für Reproduzierbarkeit.
  * Können über BOT_HUB_CONTAINER_IMAGES überschrieben werden.
  * Format: {"python":"python:3.12-bookworm@sha256:…"}
+ *
+ * Bewusst leer. Eine ausgedachte Digest-Liste wäre schlimmer als keine: ein
+ * falscher Digest lässt jeden Pull scheitern, und niemand könnte unterscheiden,
+ * ob das Image veraltet oder der Digest falsch ist. Stattdessen meldet der
+ * Start über `unpinnedImages`, welche Bilder nur über ein Tag festgelegt sind, und
+ * verweigert den Betrieb, wenn das verlangt wird.
  */
-const PINNED_IMAGES = {
-  // Beispiel: 'python': 'python:3.12-bookworm@sha256:abc123...',
-  // Diese sollten regelmäßig bewusst aktualisiert werden.
-};
+const PINNED_IMAGES = {};
 
 /**
  * Operatoren können die Bilder auf eine Digest-Version festnageln, ohne dass
@@ -62,6 +65,28 @@ const imageOverrides = () => {
 
 const IMAGES = { ...BASE_IMAGES, ...PINNED_IMAGES, ...imageOverrides() };
 
+/**
+ * Bilder, die nur über ein Tag statt über einen Digest festgelegt sind.
+ *
+ * Ein Tag ist eine Liste von Namen, die jemand anderes umschreiben kann. Wer
+ * `python:3.12-bookworm` zieht, bekommt möglicherweise ein anderes Image als
+ * gestern – und der Code darin läuft mit den Rechten des Containers. Für einen
+ * Betrieb mit festem Anspruch ist das der Unterschied zwischen "ungeprüft" und
+ * "unveränderlich".
+ */
+const unpinnedImages = () =>
+  Object.entries(IMAGES)
+    .filter(([, reference]) => !reference.includes('@sha256:'))
+    .map(([language, reference]) => ({ language, reference }));
+
+/** Soll ein Image ohne Digest abgelehnt werden? */
+const digestRequired = () =>
+  ['1', 'true', 'ja', 'yes'].includes(
+    String(process.env.BOT_HUB_REQUIRE_IMAGE_DIGEST ?? '')
+      .trim()
+      .toLowerCase(),
+  );
+
 const nameOf = (bot) => {
   const id = String(bot.id)
     .replace(/[^a-zA-Z0-9_.-]/g, '')
@@ -77,6 +102,16 @@ const hostUid = () =>
 const hostGid = () =>
   Number.isInteger(process.getgid?.()) ? process.getgid() : 1000;
 const containerUser = () => `${hostUid()}:${hostGid()}`;
+
+/**
+ * Läuft der Hub als root?
+ *
+ * Dann bekommen auch die Container root. Ein Bot darf keinen Weg aus seinem
+ * Workspace in den Host haben – mit uid 0 im Container ist die zweite Hälfte
+ * davon hinfällig. Statt still `1000` anzunehmen und damit eine falsche
+ * Sicherheit vorzutäuschen, sagt die Funktion es dem Start.
+ */
+const hubRunsAsRoot = () => process.platform !== 'win32' && hostUid() === 0;
 
 /**
  * `bots/shared` enthält die gemeinsame Hub-Bibliothek der Beispiel-Bots. Ein
@@ -298,3 +333,11 @@ export const containerRuntimeName = () => RUNTIME;
 export const containerRuntimeEnabled = () =>
   process.env.BOT_HUB_TEST_MODE !== '1' &&
   process.env.BOT_HUB_CONTAINER_MODE !== 'disabled';
+
+/** Nur für den Start-Check und die Tests. */
+export const containerSecurityFacts = () => ({
+  hubRunsAsRoot: hubRunsAsRoot(),
+  containerUser: containerUser(),
+  unpinnedImages: unpinnedImages(),
+  digestRequired: digestRequired(),
+});
