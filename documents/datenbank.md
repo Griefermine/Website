@@ -330,9 +330,144 @@ Admin-Passwort initialisiert worden – dann hilft nur `BOT_HUB_MYSQL_RESET=1`.
 | `BOT_HUB_DB_NAME`                  | `bot_hub`    | Name der Datenbank                              |
 | `BOT_HUB_DB_USER`                  | `bot_hub`    | Name des Arbeitsbenutzers; `root` ist abgelehnt |
 | `BOT_HUB_DB_PORT`                  | `3307`       | Port auf dem Host; 1024–65535                   |
+| `BOT_HUB_MYSQL_ROTATE`             | –            | `app` oder `admin`; erneuert ein Passwort       |
 
 Die letzten drei gelten auch für `BOT_HUB_DB=mysql` – dort sind sie allerdings
 Pflicht, weil es ohne sie nichts gäbe.
+
+### Passwörter erneuern
+
+`BOT_HUB_MYSQL_ROTATE=app` oder `=admin` ersetzt beim nächsten Start das
+Passwort **nur dieses einen** Benutzers. Kein Bot-Token, kein Panel-Token und
+kein Bot-Speicher wird dabei angerührt.
+
+Das geht ohne Adminrechte, weil ein MySQL-Benutzer sein eigenes Passwort mit
+`ALTER USER USER() IDENTIFIED BY …` ändern darf. Das ist wichtig, weil es von
+außen keinen Adminzugang mehr gibt – die Rechte, die man dafür bräuchte, sind
+mit `root@'%'` gemeinsam verschwunden.
+
+Zwei Fehler, die dabei nicht passieren dürfen, sind im Ablauf abgefangen: Das
+Passwort wird **vor** dem SQL in die Datei geschrieben, nicht danach. Bricht
+genau dazwischen etwas ab, weiß sonst niemand mehr, welcher der beiden Werte
+gilt. Scheitert das `ALTER`, wird der alte Wert zurückgeschrieben – MySQL
+kennt dann weiterhin das alte Passwort, und der Hub kommt beim nächsten
+Versuch wieder herein. Für den Arbeitsbenutzer ist die Änderung ohne Neustart
+wirksam, weil dieser Durchlauf vor dem Verbindungsaufbau liegt.
+
+### phpMyAdmin (`BOT_HUB_PHPMYADMIN=1`)
+
+Wer die Daten auch mal ansehen und von Hand reparieren will, bekommt eine
+Oberfläche. Sie ist **Zusatz, nicht Bestandteil**: ohne diesen Wert entsteht
+kein Container, kein Verwaltungsbenutzer und damit auch kein zweites
+Datenbankpasswort.
+
+```env
+BOT_HUB_DB=mysql-container
+BOT_HUB_PHPMYADMIN=1     # vor dem ersten Start setzen
+```
+
+Anmelden unter <http://127.0.0.1:8081> als `bot_hub_admin`. Das Passwort steht in:
+
+```bash
+cat data/secrets/phpmyadmin.env    # 0600, in einem 0700-Verzeichnis
+```
+
+Von einem anderen Rechner aus über einen SSH-Tunnel. Der Hub setzt vor der
+Oberfläche nichts weiter: kein Rate-Limit, keine zweite Anmeldung. Die
+Loopback-Bindung ist die einzige Schranke, die hier steht.
+
+```bash
+ssh -L 8081:127.0.0.1:8081 user@server
+```
+
+#### Warum ein eigener Benutzer
+
+`bot_hub_admin` bekommt **dieselben Rechte wie der Hub** und nur auf `bot_hub`:
+kein `GRANT OPTION`, kein Zugriff auf `mysql.*`, kein `CREATE DATABASE`.
+Getrennt sind die **Zugangsdaten**, nicht die Befugnisse – wer der Oberfläche
+mehr gäbe als dem Hub selbst, bekäme mehr MySQL als der Hub.
+
+Der praktische Gewinn ist ein anderer: das Passwort des Arbeitsbenutzers muss
+nie in ein Formular getippt werden, und die Oberfläche lässt sich abschalten,
+ohne dass irgendetwas den Hub-Betrieb anfasst. Der Hub stellt keine
+Bot-Datenabfrage als `bot_hub_admin`. Er meldet sich genau zweimal damit an: um
+zu prüfen, ob der Zugang noch funktioniert, und um beim Erneuern dieses eine
+Passwort zu ersetzen.
+
+#### Was der Hub zusichert
+
+- **Kein Volume, kein Mount, kein docker.sock.** Die Oberfläche bekommt nichts
+  vom Host und nichts von den Bots. Es gibt keinen Pfad, über den sie Daten
+  herausholen könnte – nicht einmal den, den ein Bot von außen benutzt.
+- **uid 33 statt root, `cap-drop ALL`, `no-new-privileges`.** Das Image startet
+  sonst als root.
+- **Nur Loopback.** `127.0.0.1:8081:80`, nie `0.0.0.0`. Bot-Container hängen an
+  der Default-Bridge und haben zum Netz von MySQL keine Route – für sie ist
+  phpMyAdmin genauso unerreichbar wie die Datenbank.
+- **Kein `PMA_USER`, kein `PMA_PASSWORD`.** Wer die Werte fest einträgt, legt
+  das Passwort in die Container-Umgebung, und die steht für jeden mit
+  Docker-Zugriff in `docker inspect`.
+- **`PMA_ARBITRARY=0`.** Ohne das darf phpMyAdmin über die Adresse im Formular
+  jeden beliebigen Datenbankserver ansteuern, den sein Container sieht – nicht
+  nur das eigene MySQL.
+- **Kein Passwort im HTML.** Weder in der Anmeldemaske noch auf der Seite
+  danach – getestet in `test/mysql-container.test.js`.
+
+#### Abschalten
+
+`BOT_HUB_PHPMYADMIN` aus `.env` streichen genügt: beim nächsten Start stoppt der
+Hub den Container, und er bleibt gestoppt – auch nach einem Neustart des
+Docker-Daemons, weil die Neustartregel `unless-stopped` einen von Hand
+gestoppten Container in Ruhe lässt.
+
+Das Passwort in `data/secrets/phpmyadmin.env` bleibt dabei liegen. Das ist
+Absicht: der Benutzer existiert in MySQL weiter, und ohne die Datei wüsste der
+Hub nicht mehr, womit er sich anmelden soll – er würde beim nächsten Start mit
+gesetzter Variable behaupten, der Benutzer sei nie angelegt worden. Wird die
+Variable später wieder gesetzt, kommt dieselbe Oberfläche mit demselben
+Benutzer und demselben Passwort zurück.
+
+#### Warum vor dem ersten Start
+
+Der Verwaltungsbenutzer entsteht im selben einmaligen Durchlauf wie der
+Arbeitsbenutzer. Wird `BOT_HUB_PHPMYADMIN=1` erst gesetzt, wenn MySQL schon
+läuft, lässt er sich nicht mehr nachholen: es gibt keinen Adminzugang, der ihn
+anlegen könnte, und der einzige Weg zurück wäre ein Reset mit Datenverlust.
+
+Der Hub startet in dem Fall **keinen** Container, an dem sich niemand anmelden
+kann, sondern sagt, was zu tun ist:
+
+```
+BOT_HUB_PHPMYADMIN=1 ist gesetzt, aber der Benutzer bot_hub_admin existiert
+nicht: er entsteht nur beim ersten Einrichten, und danach gibt es keinen
+Adminzugang mehr, der ihn nachholen könnte. Bitte BOT_HUB_PHPMYADMIN=1 vor dem
+ersten Start setzen. Oder … wird mit BOT_HUB_MYSQL_RESET=1 verworfen …
+```
+
+#### Was phpMyAdmin nicht kann
+
+- **Keine Rechte, die der Hub nicht auch hat.** Kein `CREATE DATABASE`, kein
+  `DROP USER`, kein Zugriff auf andere Datenbanken oder auf `mysql.*`.
+- **Kein `root`.** Auch mit dem richtigen Admin-Passwort nicht – das gilt
+  seit dem ersten Durchlauf nicht mehr, und phpMyAdmin ist kein Weg daran
+  vorbei.
+- **Nur eine Datenbank, nur dieser Server.** `PMA_HOST` zeigt auf das eigene
+  MySQL, `PMA_ARBITRARY=0` verhindert jedes andere Ziel.
+
+#### Einstellungen
+
+| Variable                    | Standard                      | Zweck                         |
+| --------------------------- | ----------------------------- | ----------------------------- |
+| `BOT_HUB_PHPMYADMIN`        | –                             | `1` startet die Oberfläche    |
+| `BOT_HUB_PHPMYADMIN_PORT`   | `8081`                        | Port auf dem Host; 1024–65535 |
+| `BOT_HUB_PHPMYADMIN_IMAGE`  | `phpmyadmin/phpmyadmin:5.2.3` | Image des Containers          |
+| `BOT_HUB_PHPMYADMIN_MEMORY` | `512m`                        | Speichergrenze                |
+| `BOT_HUB_PHPMYADMIN_CPUS`   | `1`                           | CPU-Grenze                    |
+| `BOT_HUB_MYSQL_ADMIN_USER`  | `bot_hub_admin`               | Name des Verwaltungsbenutzers |
+
+Das Image gehört in dieselbe Digest-Prüfung wie die Bot-Images: mit
+`BOT_HUB_REQUIRE_IMAGE_DIGEST=1` muss auch es über einen Digest festgelegt
+sein, sonst startet der Hub nicht.
 
 ## Was der Hub nicht kann und nicht beabsichtigt
 
@@ -372,3 +507,18 @@ Zugriff mit dem Panel-Token (`403`), fehlende und falsche Token (`401`),
 Grenzwerte für Werte und Seiten, ungültige Namen, ein Schlüssel mit
 SQL-Text darin, die Reihenfolge der Liste und – auf MySQL – dieselben Wege über
 die HTTP-API mit einem echten Bot-Prozess.
+
+Für den verwalteten Container gibt es einen eigenen Lauf, der sich MySQL und
+phpMyAdmin selbst mitbringt. Er wird ohne Docker übersprungen:
+
+```bash
+npm run test:mysql-container
+```
+
+Geprüft wird dort, was sich mit Attrappen nicht prüfen lässt: dass `root@'%'`
+nach dem Einrichten wirklich nicht mehr existiert, dass die Ports wirklich nur
+auf Loopback lauschen, dass ein Bot-Container wirklich nicht herankommt, dass
+der Healthcheck **ohne** Passwort funktioniert, und – für phpMyAdmin – dass die
+Anmeldung mit dem Verwaltungsbenutzer klappt, `root` nicht hineinkommt, kein
+Passwort im HTML steht und ein Bot auch nicht über `host.docker.internal`
+hereinkommt.

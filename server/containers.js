@@ -3,6 +3,8 @@ import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
+import { managedConfig, managedMySqlActive } from './mysql.js';
+
 const RUNTIME = process.env.BOT_HUB_CONTAINER_RUNTIME || 'docker';
 const PREFIX = process.env.BOT_HUB_CONTAINER_PREFIX || 'bot-hub';
 
@@ -73,11 +75,36 @@ const IMAGES = { ...BASE_IMAGES, ...PINNED_IMAGES, ...imageOverrides() };
  * gestern – und der Code darin läuft mit den Rechten des Containers. Für einen
  * Betrieb mit festem Anspruch ist das der Unterschied zwischen "ungeprüft" und
  * "unveränderlich".
+ *
+ * Die Bilder der Datenbankverwaltung gehören in dieselbe Liste: MySQL und
+ * phpMyAdmin laufen mit denselben Rechten wie ein Bot-Container, und `latest`
+ * bedeutet dort dasselbe wie hier. Sie zählen aber nur, wenn sie auch wirklich
+ * gezogen werden – wer SQLite oder ein eigenes MySQL fährt, hat diese Bilder
+ * nicht und darf von ihnen nicht abhängig sein.
  */
-const unpinnedImages = () =>
-  Object.entries(IMAGES)
-    .filter(([, reference]) => !reference.includes('@sha256:'))
-    .map(([language, reference]) => ({ language, reference }));
+const unpinnedImages = () => {
+  const sprache = Object.entries(IMAGES).map(([language, reference]) => ({
+    language,
+    reference,
+  }));
+  // Ohne den verwalteten Container wird `managedConfig` gar nicht erst
+  // gelesen: es gibt dann keine MySQL-Bilder, und eine kaputte
+  // MySQL-Einstellung darf die Prüfung der Bot-Bilder nicht stumm abschalten.
+  const verwaltet = managedMySqlActive()
+    ? (() => {
+        const managed = managedConfig();
+        return [
+          { language: 'mysql', reference: managed.image },
+          ...(managed.phpmyadmin.enabled
+            ? [{ language: 'phpmyadmin', reference: managed.phpmyadmin.image }]
+            : []),
+        ];
+      })()
+    : [];
+  return [...sprache, ...verwaltet].filter(
+    ({ reference }) => !reference.includes('@sha256:'),
+  );
+};
 
 /** Soll ein Image ohne Digest abgelehnt werden? */
 const digestRequired = () =>

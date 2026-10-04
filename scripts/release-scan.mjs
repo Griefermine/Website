@@ -68,6 +68,12 @@ const BINARY = new Set([
   '.sqlite',
   '.sqlite3',
   '.db',
+  // Ein SQL-Dump ist ein Export: er enthält die Daten *und* regelmäßig die
+  // Anweisungen, mit denen sie wieder hereinkommen – inklusive
+  // `IDENTIFIED BY`. Wer einen Dump committet, gibt damit die Datenbank preis.
+  '.sql',
+  '.sql.gz',
+  '.dump',
   '.so',
   '.dylib',
   '.dll',
@@ -162,8 +168,26 @@ const ASSIGNMENT_PATTERNS = [
     // `\s` wäre falsch: es greift über den Zeilenumbruch hinweg und nähme dann
     // die nächste Zeile als Wert. `[^\S\r\n]` ist nur horizontaler Whitespace.
     muster:
-      /^[^\S\r\n]*(?:export[^\S\r\n]+)?(DISCORD_CLIENT_SECRET|DISCORD_BOT_TOKEN|BOT_HUB_TOKEN|BOT_HUB_SESSION_SECRET|BOT_HUB_DB_PASSWORD|MYSQL_PASSWORD)[^\S\r\n]*=[^\S\r\n]*(.+)$/gm,
+      /^[^\S\r\n]*(?:export[^\S\r\n]+)?(DISCORD_CLIENT_SECRET|DISCORD_BOT_TOKEN|BOT_HUB_TOKEN|BOT_HUB_SESSION_SECRET|BOT_HUB_DB_PASSWORD|BOT_HUB_ADMIN_DB_PASSWORD|MYSQL_PASSWORD|MYSQL_ROOT_PASSWORD)[^\S\r\n]*=[^\S\r\n]*(.+)$/gm,
     istPlatzhalter,
+  },
+  {
+    name: 'Datenbank-Passwort in SQL',
+    // `CREATE USER … IDENTIFIED BY` und `SET PASSWORD` stehen in jedem Dump,
+    // den mysqldump mit `--all-databases` oder `--users` erzeugt. Der Wert ist
+    // wörtlich derselbe, mit dem sich jemand anmelden kann.
+    //
+    // Zwei Gruppen, weil die Auswertung an einer Stelle für alle Muster gilt:
+    // Gruppe 1 landet in der Meldung, Gruppe 2 geht an `istPlatzhalter`.
+    // Wichtig ist die Reihenfolge – die Meldung nennt nur `IDENTIFIED BY`,
+    // nie den Wert dahinter. Ein Scanner, der beim Treffer das Passwort
+    // ausgibt, kopiert es in die Konsole und damit in jedes Log, in dem die
+    // Ausgabe landet.
+    muster:
+      /\b(IDENTIFIED\s+BY|SET\s+PASSWORD(?:\s+FOR\s+[^\s]+)?)\s*[:=]?\s*['"]([^'"]{8,})['"]/gi,
+    // Ein Wert in Anführungszeichen hinter diesen Stichwörtern ist immer
+    // wörtlich gemeint – es gibt dort nichts zu erraten.
+    istPlatzhalter: () => false,
   },
 ];
 
@@ -196,6 +220,8 @@ const UNWANTED_PATTERNS = [
   { muster: /(^|\/)\.env\..*\.local$/, grund: 'lokale Konfiguration' },
   { muster: /(^|\/)id_(rsa|dsa|ecdsa|ed25519)$/, grund: 'privater Schlüssel' },
   { muster: /\.sqlite(-wal|-shm)?$/, grund: 'Bot-Speicher' },
+  { muster: /\.sql(\.gz)?$/, grund: 'Datenbank-Export' },
+  { muster: /\.dump$/, grund: 'Datenbank-Export' },
   { muster: /(^|\/)npm-debug\.log/, grund: 'Logdatei' },
 ];
 

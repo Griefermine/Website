@@ -162,6 +162,71 @@ einen Bot ändert das nichts: er erreicht seinen Bereich weiterhin nur über
   und abgelehnt, wenn er nicht passt.
 - **Kein Weg zu `BOT_HUB_DB_PASSWORD` in `.env`.** Bei diesem Treiberwert wird
   die Variable abgelehnt, genau wie `BOT_HUB_DB_HOST` und `BOT_HUB_DB_SOCKET`.
+- **Ein Healthcheck, der ohne Passwort auskommt.** `mysqladmin ping -h 127.0.0.1`
+  antwortet mit „mysqld is alive", sobald der Server Verbindungen annimmt – auch
+  dann, wenn der Zugang abgewiesen wird. Das ist hier der entscheidende Punkt:
+  nach `DROP USER 'root'@'%'` gibt es kein Passwort mehr, mit dem sich ein
+  Healthcheck anmelden könnte. Er misst „nimmt mysqld Verbindungen an?",
+  und das bleibt er auch ohne Adminzugang.
+
+Was das kostet, steht unter [Was nicht abgesichert
+ist](#was-nicht-abgesichert-ist).
+
+## phpMyAdmin (`BOT_HUB_PHPMYADMIN=1`)
+
+Eine reine Verwaltungsoberfläche für dieselbe Datenbank. Sie ist aus, bis man sie
+verlangt: ohne die Variable entsteht kein Container, kein Verwaltungsbenutzer
+und damit auch **kein zweites Datenbankpasswort**. Für einen Bot ändert sich
+nichts – er sieht weder den Container noch das Netz, in dem er hängt.
+
+- **Ein eigener Benutzer, `bot_hub_admin`, mit denselben Rechten wie der Hub.**
+  Getrennt sind die **Zugangsdaten**, nicht die Befugnisse: kein `GRANT OPTION`,
+  kein `*.*`, kein Zugriff auf `mysql.*`, kein `CREATE DATABASE`. Wer der
+  Oberfläche mehr gäbe als dem Hub selbst, bekäme mehr MySQL als der Hub. Der
+  Hub stellt unter diesem Benutzer keine Bot-Datenabfrage; er meldet sich damit
+  nur an, um zu prüfen, ob der Zugang noch lebt, und um bei
+  `BOT_HUB_MYSQL_ROTATE=admin` genau dieses eine Passwort zu ersetzen.
+- **Kein Volume, kein Mount, kein docker.sock.** Die Oberfläche bekommt nichts vom
+  Host und nichts von den Bots. Es gibt für sie keinen Pfad, über den sie Daten
+  herausholen könnte – nicht einmal den, den ein Bot von außen benutzt.
+- **uid 33, `cap-drop ALL`, `no-new-privileges`.** Das Image startet sonst als
+  root. Dass ein uid 33 trotzdem Port 80 belegen darf, ist eine Eigenschaft des
+  Debian-Grundsystems im Image (`net.ipv4.ip_unprivileged_port_start=0`), keine
+  zusätzlich vergebene Berechtigung.
+- **Nur Loopback.** `127.0.0.1:<Port>:80`, nie `0.0.0.0`. Bot-Container hängen an
+  der Default-Bridge und haben zum Netz von MySQL keine Route – für sie ist
+  phpMyAdmin genauso unerreichbar wie die Datenbank.
+- **Kein `PMA_USER`, kein `PMA_PASSWORD`.** Wer die Werte fest einträgt, legt das
+  Passwort in die Container-Umgebung, und die steht für jeden mit Docker-Zugriff
+  in `docker inspect`. Ohne die beiden meldet sich jeder selbst an.
+- **`PMA_ARBITRARY=0`.** Ohne das darf phpMyAdmin über die Adresse im Formular
+  jeden beliebigen Datenbankserver ansteuern, den sein Container sieht – nicht
+  nur das eigene MySQL.
+- **Kein Passwort im HTML.** Weder in der Anmeldemaske noch auf der Seite danach.
+  Das HTML wird im Browser zwischengespeichert, in Lesezeichen mitgenommen und in
+  Support-Screenshots weitergereicht.
+- **`root` kommt nicht hinein**, auch nicht mit dem richtigen Admin-Passwort aus
+  dem einmaligen Durchlauf. phpMyAdmin ist kein Weg an der Zusage vorbei, dass es
+  von außen keinen Adminzugang gibt.
+- **Das Verwaltungspasswort steht in `data/secrets/phpmyadmin.env`** (`0600` in
+  einem Verzeichnis `0700`) und wird **nie** ausgegeben – weder ins Log noch in
+  eine Fehlermeldung. Was der Hub anzeigt, ist der Pfad.
+- **Vor dem ersten Start setzen.** Der Verwaltungsbenutzer entsteht im selben
+  einmaligen Durchlauf wie der Arbeitsbenutzer. Wird die Variable erst danach
+  gesetzt, startet der Hub **keinen** Container, an dem sich niemand anmelden
+  kann, sondern sagt, dass ein Reset nötig wäre – mit allen Daten.
+- **Abschalten heisst stoppen.** Nach dem Entfernen der Variable stoppt der Hub
+  den Container beim nächsten Start und sagt es ins Log. Das Passwort in
+  `data/secrets/phpmyadmin.env` bleibt dabei liegen, damit sich die Oberfläche
+  später mit demselben Benutzer wieder zuschalten lässt; ohne die Datei wüsste
+  der Hub nicht mehr, womit er sich anmelden soll, und hielte den Benutzer für
+  nie angelegt.
+- **Passwörter erneuern ohne Tokens anzufassen.** `BOT_HUB_MYSQL_ROTATE=app` oder
+  `=admin` ersetzt das Passwort genau eines Benutzers. Das geht ohne
+  Adminrechte, weil ein Benutzer sein eigenes Passwort mit
+  `ALTER USER USER() IDENTIFIED BY …` ändern darf. Das Passwort wird dabei **vor**
+  dem SQL in die Datei geschrieben; scheitert das `ALTER`, wird der alte Wert
+  zurückgeschrieben, damit Datei und MySQL nicht auseinanderlaufen.
 
 Was das kostet, steht unter [Was nicht abgesichert
 ist](#was-nicht-abgesichert-ist).
@@ -305,6 +370,32 @@ Stunde und ist an die Bot-ID gebunden; 30 Aufrufe je Bot und Minute.
   gebraucht, hilft nur `BOT_HUB_MYSQL_RESET=1`, und das räumt
   `data/mysql` vollständig. Der Hub sagt das beim Start deutlich, statt es
   später zu zeigen.
+- **Das Verwaltungspasswort bleibt dauerhaft gültig.** Anders als beim Adminzugang
+  kann der Hub ein vergessenes `bot_hub_admin`-Passwort nicht vergessen machen,
+  ohne den Container zu verwerfen – deshalb gibt es dafür
+  `BOT_HUB_MYSQL_ROTATE=admin`. Praktisch heißt das: wer
+  `data/secrets/phpmyadmin.env` liest, hat **dauerhaft** einen vollwertigen
+  Datenbankzugang, und eine Kopie der Datei bleibt auch nach dem Löschen brauchbar.
+  Das ist der Preis dafür, dass die Oberfläche überhaupt bedienbar ist; ohne
+  gespeichertes Passwort gäbe es phpMyAdmin nur mit einer zweiten Datenbank
+  `CREATE DATABASE`-Rechten auf `*.*`, und die hätte der Hub nicht vergeben.
+- **phpMyAdmin kennt keine Ratenbegrenzung.** Der Hub setzt keine, und das Image
+  bietet dafür auch keine Umgebungsvariable. Wer den Loopback-Port erreicht, darf
+  beliebig oft raten. Die Schranke ist damit genau die eine: der Port lauscht nur
+  auf `127.0.0.1`, und alles, was dort landet, steht schon auf diesem Rechner.
+- **Die Oberfläche ist ein zweiter Weg an dieselben Daten vorbei.** Sie kennt
+  dieselben Rechte wie der Hub und umgeht dabei die Bot-Trennung: wer sich dort
+  einloggt, sieht und ändert den Speicher **aller** Bots, während `/api/hub/db`
+  einem Bot nur seinen eigenen Bereich zeigt. Das ist gewollt – es soll ja
+  gerade die Sicht des Betreibers sein – und zugleich der Grund, warum die
+  Oberfläche abgeschaltet bleibt, wenn sie nicht gebraucht wird. Das Herunterladen
+  der Datenbank ist über dieselben Rechte möglich und gehört zur Bedienbarkeit
+  dazu, nicht zu einer Lücke: es gibt nichts, was der Bot-Speicher nicht ohnehin
+  preisgäbe, sobald jemand Zugriff auf die Datei oder den Docker-Daemon hat.
+- **phpMyAdmin lässt sich nur vorher zuschalten.** Der Verwaltungsbenutzer
+  entsteht beim ersten Einrichten. Wird `BOT_HUB_PHPMYADMIN=1` erst danach
+  gesetzt, hilft nur der Weg über `BOT_HUB_MYSQL_RESET=1` – mit allen Daten. Der
+  Hub weist darauf hin und startet nichts, was niemand benutzen könnte.
 
 ## Was nach einem Neustart beachtet werden muss
 

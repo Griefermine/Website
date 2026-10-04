@@ -13,7 +13,7 @@ import {
   resolveDatabaseConfig,
   storeOutsideDataDir,
 } from './database.js';
-import { provisionManagedMySql } from './mysql.js';
+import { managedMySqlActive, provisionManagedMySql } from './mysql.js';
 
 // BOT_HUB_TEST_MODE schaltet Anmeldung, Rate-Limits und Pfadprüfung ab.
 // Das darf in einer veröffentlichten Instanz niemals passieren – sonst
@@ -61,15 +61,21 @@ try {
   // Container hochfahren, Datenbank und Arbeitsbenutzer anlegen, den Admin
   // wieder wegschliessen. Erst danach loest `resolveDatabaseConfig` ueberhaupt
   // auf, weil das Passwort erst dabei entsteht.
-  if (
-    String(process.env.BOT_HUB_DB ?? 'sqlite')
-      .trim()
-      .toLowerCase() === 'mysql-container'
-  ) {
-    const { status, beschreibung } = await provisionManagedMySql();
+  if (managedMySqlActive()) {
+    const { status, beschreibung, phpmyadmin } = await provisionManagedMySql();
     console.log(
       `[hub] MySQL ${status === 'bereit' ? 'bereit' : 'eingerichtet'}: ${beschreibung}`,
     );
+    if (phpmyadmin) {
+      console.log(`[hub] phpMyAdmin: ${phpmyadmin}`);
+      // Die Oberfläche hört nur auf Loopback, und der Hub setzt davor nichts
+      // weiter: kein Rate-Limit, keine zweite Anmeldung. Wer sie von einem
+      // anderen Rechner braucht, tunneliert sie – sonst steht sie irgendwann
+      // doch im Internet, und dann ist die Schleife offen.
+      console.warn(
+        '[hub] HINWEIS: phpMyAdmin ist nur über 127.0.0.1 erreichbar. Von einem anderen Rechner aus z. B. mit "ssh -L 8081:127.0.0.1:8081 user@server". Ohne Rate-Limit davor gehört phpMyAdmin nicht ins Internet.',
+      );
+    }
   }
   databaseConfig = resolveDatabaseConfig();
   await prepareDatabase(databaseConfig);

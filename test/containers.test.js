@@ -126,3 +126,71 @@ describe('Bilder auf eine Digest-Version festnageln', () => {
       assert.equal(await withImages(value), 'python:3.12-bookworm', value);
   });
 });
+
+describe('Die Digest-Liste kennt nur Bilder, die wirklich gezogen werden', () => {
+  const namen = async (env) => {
+    Object.assign(process.env, env);
+    try {
+      const module = await import(`../server/containers.js?v=${Math.random()}`);
+      return module
+        .containerSecurityFacts()
+        .unpinnedImages.map(({ language }) => language);
+    } finally {
+      for (const key of Object.keys(env)) delete process.env[key];
+    }
+  };
+
+  it('nennt MySQL nicht, wenn der Hub keine eigene Datenbank startet', async () => {
+    // Sonst müsste eine Installation mit SQLite ein MySQL-Image festnageln,
+    // das sie nie zieht – und dürfte wegen einer Einstellung nicht starten, die
+    // sie gar nicht benutzt.
+    const liste = await namen({ BOT_HUB_DB: 'sqlite' });
+    assert.ok(
+      !liste.includes('mysql'),
+      `ohne mysql-container darf mysql nicht in der Liste stehen: ${liste}`,
+    );
+    assert.ok(!liste.includes('phpmyadmin'));
+  });
+
+  it('nennt MySQL, sobald der Hub den Container selbst startet', async () => {
+    const liste = await namen({ BOT_HUB_DB: 'mysql-container' });
+    assert.ok(liste.includes('mysql'), `mysql fehlt: ${liste}`);
+    assert.ok(
+      !liste.includes('phpmyadmin'),
+      `ohne BOT_HUB_PHPMYADMIN darf phpmyadmin nicht mitlaufen: ${liste}`,
+    );
+  });
+
+  it('nennt auch die Oberfläche, wenn sie eingeschaltet ist', async () => {
+    const liste = await namen({
+      BOT_HUB_DB: 'mysql-container',
+      BOT_HUB_PHPMYADMIN: '1',
+    });
+    assert.ok(liste.includes('mysql') && liste.includes('phpmyadmin'));
+  });
+
+  it('lässt einen ausnahmsweise festgelegten Digest aus der Liste', async () => {
+    const digest = 'e'.repeat(64);
+    const liste = await namen({
+      BOT_HUB_DB: 'mysql-container',
+      BOT_HUB_PHPMYADMIN: '1',
+      BOT_HUB_MYSQL_IMAGE: `mysql:8.4@sha256:${digest}`,
+      BOT_HUB_PHPMYADMIN_IMAGE: `phpmyadmin/phpmyadmin@sha256:${digest}`,
+    });
+    assert.ok(!liste.includes('mysql'), `mysql fehlt: ${liste}`);
+    assert.ok(!liste.includes('phpmyadmin'), `phpmyadmin fehlt: ${liste}`);
+  });
+
+  it('prüft die Bot-Bilder auch mit kaputter MySQL-Einstellung weiter', async () => {
+    // `managedConfig` wirft bei manchen Werten. Finge man das mit einem
+    // `try`/`catch` ab und gäbe dann eine leere Liste zurück, wäre die ganze
+    // Digest-Prüfung lautlos weg – genau die Art stiller Abschaltung, die hier
+    // nirgends sonst vorkommt.
+    const liste = await namen({
+      BOT_HUB_DB: 'sqlite',
+      BOT_HUB_MYSQL_ADMIN_USER: 'root',
+    });
+    assert.ok(liste.includes('python'), `die Bot-Bilder fehlen: ${liste}`);
+    assert.ok(liste.includes('rust'), `die Bot-Bilder fehlen: ${liste}`);
+  });
+});
