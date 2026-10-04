@@ -49,7 +49,15 @@ const DEFAULT_LIST = 100;
 const MAX_OFFSET = 100_000;
 const MAX_CONNECTIONS = 8;
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost', '[::1]']);
-const DRIVERS = new Set(['sqlite', 'mysql']);
+/**
+ * `mysql-container` ist `mysql` mit einem Unterschied: den Container, das
+ * Passwort, die Datenbank und den Benutzer legt der Hub selbst an (siehe
+ * `server/mysql.js`). Der Treiberwert ist trotzdem `mysql`, damit die
+ * Abfragepfade identisch bleiben – alles andere wäre ein zweiter Satz Code für
+ * dieselben Anweisungen.
+ */
+const DRIVERS = new Set(['sqlite', 'mysql', 'mysql-container']);
+const MANAGED = 'mysql-container';
 
 /**
  * Quotas pro Bot gegen Ressourcenmissbrauch / DoS.
@@ -379,7 +387,7 @@ export const projectRootOf = (env = process.env) =>
  * aber schon. Deshalb wird ein Link von Hand aufgelöst, auch wenn sein Ziel
  * noch gar nicht existiert.
  */
-const realPathDeepest = (target) => {
+export const realPathDeepest = (target) => {
   let current = resolve(target);
   // Teile, die es noch nicht gab – in Pfadrichtung, damit `join` sie richtig
   // anhängt.
@@ -412,9 +420,46 @@ const realPathDeepest = (target) => {
 };
 
 /** Liegt `target` wirklich – auch über SymLinks – in `root`? */
-const staysInside = (root, target) => {
+export const staysInside = (root, target) => {
   const rel = relative(root, target);
   return Boolean(rel) && !rel.startsWith('..') && !isAbsolute(rel);
+};
+
+/**
+ * Name und Port des verwalteten MySQL (`BOT_HUB_DB=mysql-container`).
+ *
+ * Hier und nicht im Provisionierer: die Auflösung der Konfiguration ist die
+ * Aufgabe dieses Moduls, und `server/mysql.js` braucht dieselbe Antwort, um
+ * seinen Container zu bauen. Ein Import in die andere Richtung würde einen
+ * Zyklus erzeugen – und zwar genau dann, wenn er am unauffälligsten ist,
+ * nämlich beim ersten Start.
+ */
+export const managedNames = (env = process.env) => {
+  const name = (value, key, fallback) => {
+    const text = String(value ?? '').trim() || fallback;
+    // Keine Backticks, keine Anführungszeichen, kein `%`: der Name landet in
+    // SQL und im Namen des Containers.
+    if (!/^[A-Za-z0-9_]{1,32}$/.test(text))
+      throw new Error(
+        `${key} darf nur aus Buchstaben, Ziffern und _ bestehen und höchstens 32 Zeichen lang sein.`,
+      );
+    return text;
+  };
+  const user = name(env.BOT_HUB_DB_USER, 'BOT_HUB_DB_USER', 'bot_hub');
+  if (user.toLowerCase() === 'root')
+    throw new Error(
+      'BOT_HUB_DB_USER=root ist nicht erlaubt. Der Hub arbeitet mit einem eigenen Benutzer, der nur auf seine Datenbank zugreift.',
+    );
+  const port = Number(String(env.BOT_HUB_DB_PORT ?? '').trim() || 3307);
+  if (!Number.isInteger(port) || port < 1024 || port > 65535)
+    throw new Error(
+      'BOT_HUB_DB_PORT muss eine ganze Zahl zwischen 1024 und 65535 sein – darunter läge ein Port, der üblicherweise einem Systemdienst gehört.',
+    );
+  return {
+    database: name(env.BOT_HUB_DB_NAME, 'BOT_HUB_DB_NAME', 'bot_hub'),
+    user,
+    port,
+  };
 };
 
 export const resolveDatabaseConfig = ({
@@ -467,8 +512,37 @@ export const resolveDatabaseConfig = ({
     return { driver, file, maxValueBytes: MAX_VALUE_BYTES };
   }
 
-  const socket = String(env.BOT_HUB_DB_SOCKET ?? '').trim();
-  const host = String(env.BOT_HUB_DB_HOST ?? '127.0.0.1').trim() || '127.0.0.1';
+  // `mysql-container`: Adresse, Socket und Passwort stehen nicht mehr zur Wahl.
+  // Der Container veröffentlicht nur auf Loopback, und sein Passwort erzeugt der
+  // Hub selbst – ein hier gesetztes wäre entweder wirkungslos (der Wert im
+  // env hat Vorrang und stünde im Klartext in .env) oder verwirrend. Beides
+  // wird deshalb abgelehnt, statt stillschweigend eines zu ignorieren.
+  const managed = driver === MANAGED;
+  if (managed) {
+    for (const [key, message] of [
+      [
+        'BOT_HUB_DB_HOST',
+        'Der verwaltete MySQL-Container veröffentlicht nur auf 127.0.0.1. BOT_HUB_DB_HOST hier zu setzen würde diese Zusage aufheben.',
+      ],
+      [
+        'BOT_HUB_DB_SOCKET',
+        'Der verwaltete MySQL-Container gibt keinen Unix-Socket nach aussen. Für ein Socket BOT_HUB_DB=mysql mit eigenem MySQL nehmen.',
+      ],
+      [
+        'BOT_HUB_DB_PASSWORD',
+        'Das Passwort erzeugt der Hub selbst und legt es in data/secrets/db.env ab. In .env gehört es nicht – wer es dort findet, hat es im Klartext im Projekt.',
+      ],
+    ])
+      if (String(env[key] ?? '').trim())
+        throw new Error(
+          `${key} ist bei BOT_HUB_DB=${MANAGED} nicht erlaubt. ${message}`,
+        );
+  }
+
+  const socket = managed ? '' : String(env.BOT_HUB_DB_SOCKET ?? '').trim();
+  const host = managed
+    ? '127.0.0.1'
+    : String(env.BOT_HUB_DB_HOST ?? '127.0.0.1').trim() || '127.0.0.1';
   // Der Punkt der ganzen Sache: der Bot-Speicher bleibt auf diesem Rechner.
   if (!socket && !LOOPBACK.has(host))
     throw new Error(
@@ -476,11 +550,11 @@ export const resolveDatabaseConfig = ({
     );
 
   const database = required(
-    env.BOT_HUB_DB_NAME,
+    managed ? managedNames(env).database : env.BOT_HUB_DB_NAME,
     'BOT_HUB_DB_NAME fehlt – welche Datenbank soll der Hub nehmen?',
   ).replace(/[^\w$]/g, '');
   const user = required(
-    env.BOT_HUB_DB_USER,
+    managed ? managedNames(env).user : env.BOT_HUB_DB_USER,
     'BOT_HUB_DB_USER fehlt – der Hub braucht einen eigenen MySQL-Benutzer für diese Datenbank.',
   );
   if (user.toLowerCase() === 'root')
@@ -488,7 +562,9 @@ export const resolveDatabaseConfig = ({
       'BOT_HUB_DB_USER=root ist nicht erlaubt. Nimm einen eigenen Benutzer, der nur auf diese Datenbank zugreift.',
     );
 
-  const port = Number(env.BOT_HUB_DB_PORT ?? 3306);
+  const port = managed
+    ? managedNames(env).port
+    : Number(env.BOT_HUB_DB_PORT ?? 3306);
   if (!Number.isInteger(port) || port < 1 || port > 65535)
     throw new Error(
       'BOT_HUB_DB_PORT muss eine Zahl zwischen 1 und 65535 sein.',
@@ -503,7 +579,8 @@ export const resolveDatabaseConfig = ({
   );
 
   return {
-    driver,
+    // Beide MySQL-Varianten benutzen denselben Anfragepfad.
+    driver: managed ? 'mysql' : driver,
     database,
     user,
     password,
@@ -726,6 +803,17 @@ const mysqlDriver = async (config) => {
             `${SELECT_USAGE} FOR UPDATE`,
             [botId],
           );
+          return rows[0] ?? null;
+        },
+        // Muss auf derselben Verbindung laufen wie der Schreibvorgang: die
+        // Quota wird aus den echten Zeilen neu berechnet, und zwar innerhalb
+        // derselben Transaktion. Über den Pool bezogen sähe eine parallele
+        // Änderung nicht, die der Zähler selbst aber schon – der Zähler wäre
+        // dann genau der Wert, den man nicht mehr trauen darf.
+        usageTotals: async (botId) => {
+          const [rows] = await connection.execute(usageTotalsSql('mysql'), [
+            botId,
+          ]);
           return rows[0] ?? null;
         },
       };

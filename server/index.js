@@ -13,6 +13,7 @@ import {
   resolveDatabaseConfig,
   storeOutsideDataDir,
 } from './database.js';
+import { provisionManagedMySql } from './mysql.js';
 
 // BOT_HUB_TEST_MODE schaltet Anmeldung, Rate-Limits und Pfadprüfung ab.
 // Das darf in einer veröffentlichten Instanz niemals passieren – sonst
@@ -56,6 +57,20 @@ const host = process.env.HOST || '0.0.0.0';
 // die Erreichbarkeit - ein Hub darf starten, während MySQL noch hochlaeuft.
 let databaseConfig = null;
 try {
+  // Bei `mysql-container` steht vor dem Verbindungsaufbau das Einrichten:
+  // Container hochfahren, Datenbank und Arbeitsbenutzer anlegen, den Admin
+  // wieder wegschliessen. Erst danach loest `resolveDatabaseConfig` ueberhaupt
+  // auf, weil das Passwort erst dabei entsteht.
+  if (
+    String(process.env.BOT_HUB_DB ?? 'sqlite')
+      .trim()
+      .toLowerCase() === 'mysql-container'
+  ) {
+    const { status, beschreibung } = await provisionManagedMySql();
+    console.log(
+      `[hub] MySQL ${status === 'bereit' ? 'bereit' : 'eingerichtet'}: ${beschreibung}`,
+    );
+  }
   databaseConfig = resolveDatabaseConfig();
   await prepareDatabase(databaseConfig);
 } catch (error) {

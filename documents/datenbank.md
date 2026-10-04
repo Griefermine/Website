@@ -198,6 +198,11 @@ FLUSH PRIVILEGES;
 Der Hub legt beim ersten Zugriff nur die Tabelle `bot_store` an. `root` als
 Benutzer lehnt er ab.
 
+Hinweis zum `GRANT`: Für das Anlegen der Tabelle braucht der Benutzer zusätzlich
+`CREATE`, `ALTER`, `INDEX` und `DROP` auf `bot_hub.*` – sonst startet der Hub
+zwar, scheitert aber beim ersten Speichern eines Bots. Genau das nimmt der
+Abschnitt [Eigenes MySQL](#eigenes-mysql-bothub_dbmysql-container) einem ab.
+
 Drei Schranken beim Start:
 
 1. `BOT_HUB_DB_HOST` muss auf diesem Rechner liegen – sonst Abbruch mit dem
@@ -213,6 +218,121 @@ Drei Schranken beim Start:
 Unter einem Unix-Socket ist die Verbindung ohne Netz; auf Loopback ohne
 Verschlüsselung, was für Verkehr, den niemand mitlesen kann, in Ordnung ist und
 im Klartext der Anleitung steht.
+
+## Eigenes MySQL (`BOT_HUB_DB=mysql-container`)
+
+Wer MySQL betreiben will, ohne es selbst aufzusetzen, nimmt diesen Wert:
+
+```env
+BOT_HUB_DB=mysql-container
+```
+
+Damit startet der Hub seinen **eigenen** MySQL-Container und richtet ihn beim
+ersten Start selbst ein. Sonst ändert sich für einen Bot nichts: er erreicht
+seinen Bereich weiterhin nur über `/api/hub/db` und bekommt weiterhin keine
+Zugangsdaten. Der Unterschied liegt allein darin, wer den Container baut.
+
+Beim ersten Start passiert, in dieser Reihenfolge:
+
+1. Netz `<präfix>-mysql-net` anlegen und Container `<präfix>-mysql` erstellen.
+   Daten landen in `data/mysql`.
+2. Zwei zufällige Passwörter erzeugen, je 48 Zeichen aus
+   `A–Z a–z 0–9 - _`, aus `crypto.randomBytes`. Der Hub verlangt mindestens 30
+   Zeichen und lehnt kürzere ab.
+3. Das Admin-Passwort in `data/secrets/mysql-init.env` schreiben (Modus `0600`
+   in einem Verzeichnis `0700`) und den Container damit starten. MySQL liest es
+   genau einmal, beim ersten Initialisieren des Datenspeichers.
+4. Warten, bis `mysqld` antwortet, dann als Admin die Datenbank anlegen, den
+   Arbeitsbenutzer samt Rechten erzeugen und `FLUSH PRIVILEGES` ausführen.
+5. **`DROP USER IF EXISTS 'root'@'%'`** – danach kann sich von außen niemand
+   mehr als root anmelden, auch nicht mit dem richtigen Admin-Passwort.
+6. Die Datei mit dem Admin-Passwort löschen.
+7. Das Arbeitspasswort nach `data/secrets/db.env` (Modus `0600`) schreiben.
+
+`root@'localhost'` bleibt bewusst bestehen. Den kann nur benutzen, wer sich über
+`docker exec` im Container befindet – und wer das kann, braucht kein Passwort.
+
+Bei jedem weiteren Start prüft der Hub zuerst, ob er mit dem gespeicherten
+Arbeitspasswort hineinkommt. Wenn ja, passiert gar nichts (das dauert unter einer
+Sekunde). Wenn nein, bricht er ab **statt** neu einzurichten: ein stiller zweiter
+Bootstrap würde einen zweiten Admin-Zugang erzeugen, und genau den gibt es hier
+nicht.
+
+### Warum die Rechte so geschnitten sind
+
+Der Arbeitsbenutzer bekommt `SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER,
+INDEX, DROP, REFERENCES` – und zwar ausschließlich auf `bot_hub.*`:
+
+- Kein `GRANT OPTION`. Der Benutzer kann keine Rechte weitergeben, die er
+  nicht hat.
+- Nichts außerhalb der Hub-Datenbank. `CREATE DATABASE` für eine zweite
+  Datenbank scheitert, ebenso jeder Zugriff auf `mysql.user`.
+- Kein `FILE`, kein `SUPER`, kein `PROCESS`. Damit lässt sich weder auf dem
+  Server Dateien lesen und schreiben noch etwas über die anderen Prozesse
+  herausfinden.
+- `CREATE`, `ALTER`, `INDEX` und `DROP` gehören dazu, weil der Treiber seine
+  Tabellen beim ersten Verbinden selbst anlegt und spätere Schemaänderungen
+  ohne den Hub-Betrieb möglich sein sollen.
+
+Dasselbe in eigener Regie nachzubauen ist möglich, aber mit einem Unterschied:
+ein Betreiber hat danach einen Admin-Zugang, den niemand mehr wegnimmt. Genau den
+gibt es hier nicht.
+
+### Erreichbarkeit
+
+Der Container veröffentlicht `127.0.0.1:<Port>:3306` – Standardport `3307`, weil
+`3306` auf dem Host häufig schon belegt ist. Nie `0.0.0.0`. Er hängt zusätzlich
+an einem eigenen Netz, an dem kein Bot-Container hängt: Bot-Container laufen auf
+der Default-Bridge und haben dorthin keine Route. Ein Bot erreicht die Datenbank
+also weder direkt noch über `host.docker.internal`, selbst wenn
+`BOT_HUB_CONTAINER_URL` gesetzt ist – getestet in `test/mysql-container.test.js`.
+
+`BOT_HUB_DB_HOST`, `BOT_HUB_DB_SOCKET` und `BOT_HUB_DB_PASSWORD` werden bei
+diesem Treiberwert **abgelehnt**, nicht ignoriert. Wer eines davon setzt,
+rechnet mit einer Adresse oder einem Passwort, das es hier nicht gibt; ein
+stillschweigendes Übergehen wäre die schlechtere Antwort.
+
+### Wenn etwas nicht geht
+
+**Der Arbeitsbenutzer kommt nicht mehr hinein**, zum Beispiel weil
+`data/secrets/db.env` verloren ging. Es gibt keinen zweiten Weg: der
+Admin-Zugang von außen ist absichtlich weg, und das war die Zusage. Der Hub
+sagt das beim Start auch so und nennt den Ausweg:
+
+```env
+BOT_HUB_MYSQL_RESET=1
+```
+
+Damit werden Container, Netz und `data/mysql` verworfen und mit neuen Passwörtern
+neu angelegt. **Danach sind alle Bot-Daten weg.** Der Hub warnt laut, bevor er
+es tut, und räumt am Ende auf.
+
+**Der erste Start dauert zu lange.** mysqld initialisiert erst den
+Datenspeicher; je nach Rechner kann das eine Weile brauchen:
+
+```env
+BOT_HUB_MYSQL_STARTUP_TIMEOUT_MS=300000
+```
+
+Bei „Access denied" ist der Datenspeicher bereits mit einem _anderen_
+Admin-Passwort initialisiert worden – dann hilft nur `BOT_HUB_MYSQL_RESET=1`.
+
+### Einstellungen
+
+| Variable                           | Standard     | Zweck                                           |
+| ---------------------------------- | ------------ | ----------------------------------------------- |
+| `BOT_HUB_MYSQL_IMAGE`              | `mysql:8.4`  | Image des Containers                            |
+| `BOT_HUB_MYSQL_DATA`               | `data/mysql` | Datenverzeichnis; darf nicht in `bots/` liegen  |
+| `BOT_HUB_MYSQL_MEMORY`             | `1g`         | Speichergrenze des Containers                   |
+| `BOT_HUB_MYSQL_CPUS`               | `2`          | CPU-Grenze des Containers                       |
+| `BOT_HUB_MYSQL_STARTUP_TIMEOUT_MS` | `180000`     | Wartezeit auf den ersten Start                  |
+| `BOT_HUB_MYSQL_RESET`              | –            | `1` verwirft alles und richtet es neu ein       |
+| `BOT_HUB_DB_NAME`                  | `bot_hub`    | Name der Datenbank                              |
+| `BOT_HUB_DB_USER`                  | `bot_hub`    | Name des Arbeitsbenutzers; `root` ist abgelehnt |
+| `BOT_HUB_DB_PORT`                  | `3307`       | Port auf dem Host; 1024–65535                   |
+
+Die letzten drei gelten auch für `BOT_HUB_DB=mysql` – dort sind sie allerdings
+Pflicht, weil es ohne sie nichts gäbe.
 
 ## Was der Hub nicht kann und nicht beabsichtigt
 

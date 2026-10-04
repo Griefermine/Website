@@ -37,6 +37,20 @@ DISCORD_BOT_TOKEN="…"
 API_KEY="…"
 ```
 
+Eine zweite Datei mit derselben Sicherheitstufe trägt das Passwort des
+verwalteten MySQL-Containers: `data/secrets/db.env`, ebenfalls `0600` in `0700`.
+
+```dotenv
+BOT_HUB_DB_PASSWORD="…"
+BOT_HUB_DB_BOOTSTRAPPED="1"
+```
+
+Der zweite Eintrag merkt sich, dass der einmalige Admin-Durchlauf stattgefunden
+hat. Ohne ihn gäbe es kein Gewissen darüber, ob ein zweiter Durchlauf erlaubt
+wäre – und genau der ist es nicht. Das Admin-Passwort selbst steht dort **nicht**:
+es existiert nur während des Durchlaufs in `data/secrets/mysql-init.env` und wird
+danach gelöscht.
+
 Beim Start liest der Hub diese Datei und trägt die Werte wieder in den
 Speicher ein. Frühere Stände, bei denen die Werte noch in `bots.json` standen,
 wird er beim ersten Start einmalig umgezogen: erst in die Datei mit `0600`,
@@ -109,6 +123,49 @@ Start aber gemeldet: im Arbeitsordner eines Bots dürfte sie nicht liegen, sonst
 könnte dieser sie direkt lesen und die API umgehen. Details in
 [datenbank.md](datenbank.md).
 
+## Der eigene MySQL-Container
+
+`BOT_HUB_DB=mysql-container` lässt den Hub seine Datenbank selbst aufsetzen. Für
+einen Bot ändert das nichts: er erreicht seinen Bereich weiterhin nur über
+`/api/hub/db` und bekommt weiterhin keine Zugangsdaten. Die Grenzen, die dazukommen:
+
+- **Der Admin-Zugang gilt einmal.** Der Container startet mit einem zufälligen
+  `root`-Passwort. Der Hub legt damit Datenbank und Arbeitsbenutzer an und führt
+  danach `DROP USER IF EXISTS 'root'@'%'` aus. Von außen kann sich danach
+  niemand mehr als root anmelden – **auch nicht mit dem richtigen Passwort**;
+  `test/mysql-container.test.js` macht genau diesen Versuch. Übrig bleibt
+  `root@'localhost'`, erreichbar nur über `docker exec` im Container.
+- **Kein Geheimnis in der Argumentliste.** Das Admin-Passwort wird über
+  `--env-file data/secrets/mysql-init.env` gereicht (`0600` in einem Verzeichnis
+  `0700`), nicht über `--env NAME=WERT`, das in `ps` und in `docker inspect`
+  stünde. Die Datei wird nach dem Durchlauf gelöscht, auch dann, wenn er
+  fehlschlägt.
+- **Kein stiller zweiter Versuch.** Steht der Hub vor einem eingerichteten
+  Container und kommt nicht mehr hinein, bricht er ab und nennt
+  `BOT_HUB_MYSQL_RESET=1`. Ein erneuter Admin-Durchlauf fände kein
+  Admin-Passwort mehr vor und würde nur eine zweite Tür erzeugen, die niemand
+  schließt.
+- **Nur Loopback, eigenes Netz.** Der Container veröffentlicht
+  `127.0.0.1:<Port>:3306`, nie `0.0.0.0`, und hängt an einem eigenen Netz
+  (`<präfix>-mysql-net`). Bot-Container laufen auf der Default-Bridge und haben
+  dorthin keine Route. Damit erreicht ein Bot die Datenbank weder direkt noch
+  über `host.docker.internal` – beides ist im Test mit einem echten Wegwerf-
+  Container geprüft.
+- **Der Arbeitsbenutzer kann nichts außerhalb seiner Datenbank.** Kein
+  `GRANT OPTION`, kein `*.*`, kein `FILE`, kein `SUPER`. `CREATE DATABASE` für eine
+  zweite Datenbank und jeder Zugriff auf `mysql.user` scheitern.
+- **Das Passwort liegt nur in `data/secrets/db.env`.** 48 Zeichen aus
+  `crypto.randomBytes`, aus `A–Z a–z 0–9 - _`. Dieses Alphabet ist nicht
+  zufällig gewählt: weil es keine Anführungszeichen und keine Backslashes
+  enthält, muss der Wert beim Zusammensetzen der `CREATE USER`-Anweisung nicht
+  escaped werden. Stattdessen wird er vorher gegen genau dieses Muster geprüft
+  und abgelehnt, wenn er nicht passt.
+- **Kein Weg zu `BOT_HUB_DB_PASSWORD` in `.env`.** Bei diesem Treiberwert wird
+  die Variable abgelehnt, genau wie `BOT_HUB_DB_HOST` und `BOT_HUB_DB_SOCKET`.
+
+Was das kostet, steht unter [Was nicht abgesichert
+ist](#was-nicht-abgesichert-ist).
+
 ## Startschutz
 
 Zwei Konfigurationen führen zum Abbruch statt zu einem unsicheren Betrieb:
@@ -117,7 +174,15 @@ Zwei Konfigurationen führen zum Abbruch statt zu einem unsicheren Betrieb:
 [hub] ABBRUCH: BOT_HUB_TEST_MODE=1 hebt Anmeldung und Rate-Limits auf und ist nur mit NODE_ENV=test erlaubt …
 [hub] ABBRUCH: BOT_HUB_CONTAINER_MODE=disabled ist in Produktion nicht erlaubt …
 [hub] ABBRUCH: Bot-Speicher: BOT_HUB_DB_HOST="10.0.0.5" ist nicht lokal …
+[hub] ABBRUCH: Bot-Speicher: BOT_HUB_DB_PASSWORD ist bei BOT_HUB_DB=mysql-container nicht erlaubt …
+[hub] ABBRUCH: Bot-Speicher: BOT_HUB_DB_USER=root ist nicht erlaubt …
+[hub] ABBRUCH: Bot-Speicher: BOT_HUB_MYSQL_DATA darf nicht innerhalb von bots/ liegen …
 ```
+
+Bei `BOT_HUB_DB=mysql-container` kommen vier weitere Gründe dazu, alle davon
+eine Ablehnung statt einer stillen Anpassung: Adresse, Socket und Passwort von
+Hand, `root` als Arbeitsbenutzer, ein Datenverzeichnis in `bots/`, ein
+Datenbank- oder Benutzername, der in SQL etwas anderes wäre als eine Tabelle.
 
 Der Testmodus heißt `BOT_HUB_TEST_MODE=1` und verlangt zusätzlich
 `NODE_ENV=test`. Er fällt bewusst weg: keine Anmeldung, keine
@@ -215,6 +280,31 @@ Stunde und ist an die Bot-ID gebunden; 30 Aufrufe je Bot und Minute.
   Meldungen aus einem Bot heraus (`/api/hub/state`, `/api/hub/notify`) ist also
   entweder `BOT_HUB_CONTAINER_URL` zu setzen oder in `BOT_HUB_URL` eine Adresse
   einzutragen, die auch aus dem Container erreichbar ist.
+- **Das Admin-Passwort ist in `docker inspect` sichtbar.** Der MySQL-Container
+  bekommt es über `--env-file`, und Docker legt den Inhalt solcher Dateien in
+  die Konfiguration des Containers. Wer den Docker-Socket bedienen darf, liest
+  es damit – auch nach dem Löschen der Datei, denn der Container existiert ja
+  weiter. Das ist keine Lücke, die sich schließen ließe, ohne den Docker-Socket
+  selbst abzuschneiden (was der Hub nicht kann, weil er Container startet).
+  Verkleinert wird der Schaden dadurch, dass `root@'%'` unmittelbar nach dem
+  Durchlauf verschwindet: das Passwort ist danach wertlos. Wer den Socket hat,
+  kommt aber über `docker exec` ohnehin an `root@'localhost'` – es bleibt der
+  Weg über die lokale Unix-Socket-Autorität des Daemons.
+- **`root@'localhost'` bleibt bestehen.** Der Container könnte stattdessen ganz
+  ohne root-Benutzer laufen. Dann wäre aber der Weg nach innen dicht, auch für
+  jemanden, der aus einem legitimen Grund an die Datenbank muss, und die
+  Wiederherstellung nach einem beschädigten Datenspeicher wäre nur noch über
+  `BOT_HUB_MYSQL_RESET=1` möglich – also über das Wegwerfen aller Bot-Daten. Die
+  Folge dieser Entscheidung ist konkret: **das Admin-Passwort bleibt dauerhaft
+  gültig**, und wer eine neue Datenbank oder einen neuen Benutzer braucht, muss
+  `data/mysql` verwerfen. Der Zugriff ist an den Docker-Daemon gebunden, nicht
+  an das Netz – aber „nur wer den Docker-Socket hat" ist eine echte Schranke,
+  keine Redensart.
+- **Eine neue Datenbank oder ein neuer Benutzer kostet alle Daten.** Der
+  Admin-Durchlauf gibt es genau einmal. Wird danach eine weitere Datenbank
+  gebraucht, hilft nur `BOT_HUB_MYSQL_RESET=1`, und das räumt
+  `data/mysql` vollständig. Der Hub sagt das beim Start deutlich, statt es
+  später zu zeigen.
 
 ## Was nach einem Neustart beachtet werden muss
 

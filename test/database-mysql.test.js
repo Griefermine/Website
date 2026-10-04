@@ -1,8 +1,17 @@
 /**
  * Dieselben Zusicherungen wie in `database.test.js`, aber gegen eine echte
  * MySQL/MariaDB. Ohne ausdrückliche Freigabe wird die Datei übersprungen –
- * MySQL bleibt eine Wahl, kein Zwang. Mit `BOT_HUB_TEST_MYSQL=1` laufen die
- * Tests gegen:
+ * MySQL bleibt eine Wahl, kein Zwang.
+ *
+ * Zwei Wege, sich eine Datenbank zu beschaffen:
+ *
+ * **Selbst mitbringen** (empfohlen). Der Hub startet seinen eigenen Container,
+ * legt Datenbank und Benutzer an und räumt am Ende wieder auf:
+ *
+ *   BOT_HUB_TEST_MYSQL=1 BOT_HUB_TEST_MYSQL_CONTAINER=1 \
+ *     node --test test/database-mysql.test.js
+ *
+ * **Eigene MySQL.** Dann bis heute nötig, ein MySQL vorher zu starten:
  *
  *   docker run -d --name bothub-db-test \
  *     -e MYSQL_ROOT_PASSWORD=probe-root -e MYSQL_DATABASE=bothub_probe \
@@ -11,11 +20,15 @@
  *
  *   BOT_HUB_TEST_MYSQL=1 node --test test/database-mysql.test.js
  *
+ * Der erste Weg ist keine Bequemlichkeit: über den zweiten ist diese Datei
+ * praktisch nie gelaufen, und prompt was nur SQLite prüfte, ist an ihm
+ * vorbeigegangen – ein fehlendes `tx.usageTotals` blieb dadurch unentdeckt.
+ *
  * Jeder Lauf bekommt eigene Bot-IDs und räumt seine Einträge am Ende wieder weg,
  * damit wiederholte Läufe sich nicht in die Quere kommen.
  */
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -26,7 +39,10 @@ process.env.BOT_HUB_TEST_MODE = '1';
 
 const enabled = process.env.BOT_HUB_TEST_MYSQL === '1';
 const reason = 'BOT_HUB_TEST_MYSQL=1 fehlt';
-const env = {
+/** Soll der Hub sich seine MySQL selbst stellen? */
+const withContainer = process.env.BOT_HUB_TEST_MYSQL_CONTAINER === '1';
+
+let env = {
   BOT_HUB_DB: 'mysql',
   BOT_HUB_DB_HOST: '127.0.0.1',
   BOT_HUB_DB_PORT: process.env.BOT_HUB_TEST_MYSQL_PORT || '13306',
@@ -39,8 +55,10 @@ let store;
 let reachable = false;
 const runId = `${process.pid}x${Date.now().toString(36)}`;
 const angelegt = [];
+/** Nur für den selbstgestellten Container, damit am Ende aufzuräumen ist. */
+let aufraeumen = null;
+let aufraeumenDir = null;
 
-/** Bot-ID für diesen Lauf und Liste zum Aufräumen. */
 const botId = (name) => {
   const id = `t${runId}-${name}`.slice(0, 64);
   angelegt.push(id);
@@ -52,8 +70,71 @@ const put = async (bot, collection, key, value) => {
   return { bot, collection, key };
 };
 
+const freePort = async () =>
+  new Promise((done) => {
+    const server = createServer();
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address();
+      server.close(() => done(port));
+    });
+  });
+
+/** Hub-MySQL für diesen Lauf aufsetzen und die Zugangsdaten zurückgeben. */
+const eigenerContainer = async () => {
+  const { provisionManagedMySql } = await import('../server/mysql.js');
+  const { readSecretValues } = await import('../server/secrets.js');
+  const dir = mkdtempSync(join(tmpdir(), 'bot-hub-mysql-suite-'));
+  const port = await freePort();
+  const projekt = {
+    BOT_HUB_CONTAINER_PREFIX: `bothub-test${process.pid.toString(36)}`,
+    BOT_HUB_DB_PORT: String(port),
+    BOT_HUB_MYSQL_STARTUP_TIMEOUT_MS: '300000',
+  };
+  const ergebnis = await provisionManagedMySql({
+    env: projekt,
+    projectRoot: dir,
+  });
+  const config = ergebnis.config;
+  return {
+    dir,
+    config,
+    env: {
+      BOT_HUB_DB: 'mysql',
+      BOT_HUB_DB_HOST: '127.0.0.1',
+      BOT_HUB_DB_PORT: String(port),
+      BOT_HUB_DB_NAME: config.database,
+      BOT_HUB_DB_USER: config.user,
+      BOT_HUB_DB_PASSWORD: readSecretValues(dir, 'db').BOT_HUB_DB_PASSWORD,
+    },
+  };
+};
+
 before(async () => {
   if (!enabled) return;
+  if (withContainer) {
+    try {
+      const gestellt = await eigenerContainer();
+      env = gestellt.env;
+      const { createProvisioner } = await import('../server/mysql.js');
+      // Für das Aufräumen: derselbe Provisionierer kennt Container, Netz und
+      // Datenverzeichnis. `reset()` nimmt genau das auseinander.
+      aufraeumen = () =>
+        createProvisioner({
+          env: {
+            BOT_HUB_CONTAINER_PREFIX: `bothub-test${process.pid.toString(36)}`,
+          },
+          projectRoot: gestellt.dir,
+        }).reset();
+      // Der Ordner bleibt bis zum Ende stehen, weil `reset` darin das
+      // Datenverzeichnis löscht – beides zusammen erst danach.
+      aufraeumenDir = gestellt.dir;
+    } catch (error) {
+      console.error(
+        `[hub] Hub-MySQL konnte nicht gestartet werden: ${error.message}`,
+      );
+      return;
+    }
+  }
   const { createTestStore, resolveDatabaseConfig } =
     await import('../server/database.js');
   store = createTestStore(resolveDatabaseConfig({ env }));
@@ -68,10 +149,15 @@ before(async () => {
 });
 
 after(async () => {
-  if (!reachable) return;
-  for (const { bot, collection, key } of angelegt)
-    await store.remove(bot, collection, key).catch(() => {});
-  await store.close();
+  if (reachable) {
+    for (const { bot, collection, key } of angelegt)
+      await store.remove(bot, collection, key).catch(() => {});
+    await store.close();
+  }
+  // Erst Container und Netz abräumen, dann das Verzeichnis: `reset` löscht
+  // darin das Datenverzeichnis.
+  if (aufraeumen) await aufraeumen().catch(() => {});
+  if (aufraeumenDir) rmSync(aufraeumenDir, { recursive: true, force: true });
 });
 
 describe('Bot-Speicher auf MySQL', () => {
