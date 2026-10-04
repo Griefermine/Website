@@ -22,6 +22,7 @@ import {
   delimiter,
 } from 'node:path';
 import { LANGUAGES, fillDeps, getFramework, getLanguage } from './languages.js';
+import * as dateien from './botFiles.js';
 import {
   cleanupTempEnvFiles,
   dotenvKey,
@@ -76,6 +77,13 @@ const DATA_FILE = join(PROJECT_ROOT, 'data', 'bots.json');
 const ACCESS_FILE = join(PROJECT_ROOT, 'data', 'access.json');
 const MAX_LOG_LINES = 800;
 const MAX_BOTS = 24;
+
+/**
+ * Obergrenze für den JSON-Body einer Datei-Route. Rechnet man die Quotation
+ * mit, muss das Limit über der Datei liegen, sonst wäre eine Datei an der
+ * Grenze von der Grenze zu retten.
+ */
+const MAX_FILE_BODY_BYTES = dateien.MAX_FILE_BYTES * 2;
 const INSTALL_TIMEOUT = 15 * 60 * 1000;
 const rateBuckets = new Map();
 const rateLimit = (req, url) => {
@@ -240,7 +248,11 @@ const toFile = () =>
  * Pfad-Sicherheit: Bots dürfen nur innerhalb des Projektordners
  * gestartet werden, damit der Server keine fremden Befehle ausführt.
  * ------------------------------------------------------------------ */
-const safeProjectPath = (input, fallback = '.') => {
+const safeProjectPath = (
+  input,
+  fallback = '.',
+  { nurProjekt = false } = {},
+) => {
   const candidate = isAbsolute(input)
     ? input
     : join(PROJECT_ROOT, input || fallback);
@@ -252,8 +264,13 @@ const safeProjectPath = (input, fallback = '.') => {
     const trusted = realpathSync(full);
     const trustedRel = relative(root, trusted);
     if (trustedRel.startsWith('..') || isAbsolute(trustedRel)) return null;
+    // Im Betrieb gehört der Startordner eines Bots in sein eigenes Verzeichnis
+    // unter `bots/`. Das ist die Schranke, die einen Bot davon abhält, im
+    // Ordner eines anderen oder in `data/` zu starten. Im Testmodus entfällt
+    // sie: die Testbots laufen aus einem fremden Verzeichnis, und eine
+    // Schranke, die nur zufällig nicht greift, wäre schlimmer als keine.
     const workspaceBase = join(root, 'bots');
-    if (existsSync(workspaceBase)) {
+    if (!nurProjekt && existsSync(workspaceBase)) {
       const workspaceRoot = realpathSync(workspaceBase);
       const workspaceRel = relative(workspaceRoot, trusted);
       if (
@@ -334,7 +351,8 @@ const migrateWorkspace = (id, source, target) => {
 };
 
 const safeBotPath = (bot, input = '.') => {
-  if (process.env.BOT_HUB_TEST_MODE === '1') return safeProjectPath(input, '.');
+  if (process.env.BOT_HUB_TEST_MODE === '1')
+    return safeProjectPath(input, '.', { nurProjekt: true });
   const workspaceInput = bot.workspaceRoot || `bots/${bot.id}/workspace`;
   if (isAbsolute(workspaceInput)) return null;
   const workspace = resolve(PROJECT_ROOT, workspaceInput);
@@ -520,6 +538,10 @@ const publicBot = (bot) => {
     secretEnv: maskEnv(bot.secretEnv),
     secretKeys: Object.keys(bot.secretEnv),
     panel: publicPanel(bot),
+    // Nur der Pfad und die Anzahl, nie ein Dateiname: ein Zähler reicht der
+    // Oberfläche, und die Liste holt sie sich ohnehin über eine eigene Route.
+    startFolder: dateien.startFolderOf(bot),
+    fileCount: dateien.count(bot, PROJECT_ROOT),
   };
 };
 
@@ -533,6 +555,13 @@ const setStatus = (bot, status, extra = {}) => {
 
 const hydrate = (config) => {
   const workspace = workspaceConfig(config);
+  // Jeder Bot bekommt seinen Startordner, beim ersten Start genauso wie beim
+  // zehnten. Hier muss sichergestellt werden, dass es ihn gibt – nicht nur beim
+  // Anlegen, sonst fiele er bei einem Bot, der eine Nacht alt ist, einfach weg.
+  dateien.ensureStartFolder(
+    { id: config.id, workspaceRoot: workspace.workspaceRoot },
+    PROJECT_ROOT,
+  );
   const secrets = migrateSecrets(config);
   return {
     id: config.id,
@@ -1004,7 +1033,7 @@ const installDependencies = async (bot, dir, { state, force = false } = {}) => {
  * Aus einem Installationsbefehl wird eine Folge von Schritten.
  *
  * Ein String bleibt ein Schritt und geht über den bestehenden geprüften Weg.
- * Ein Objekt beschreibt eine Bedingung im Arbeitsordner – etwa "nutze den
+ * Ein Objekt beschreibt eine Bedingung im Startordner – etwa "nutze den
  * Wrapper im Projekt, wenn es ihn gibt, sonst Maven". Die Bedingung wird hier
  * im Hub ausgewertet; ein `if [ -f ... ]` im Befehl selbst wäre wieder
  * Shell-Syntax und fiele durch die Befehlsprüfung.
@@ -1174,14 +1203,14 @@ const prepareStart = (bot) => {
   if (!dir)
     throw httpError(
       400,
-      'Arbeitsordner liegt außerhalb des Bot-Workspace (außerhalb des Projekts)',
+      'Der Startordner liegt ausserhalb des Workspace dieses Bots',
     );
   if (process.env.BOT_HUB_TEST_MODE !== '1')
     for (const other of bots.values()) {
       if (other.id !== bot.id && safeBotPath(other, other.cwd) === dir)
         throw httpError(
           409,
-          'Arbeitsordner wird bereits von einem anderen Bot verwendet',
+          'Der Startordner wird bereits von einem anderen Bot verwendet',
         );
     }
   if (!existsSync(dir) || !statSync(dir).isDirectory()) {
@@ -1190,10 +1219,38 @@ const prepareStart = (bot) => {
   return dir;
 };
 
+/**
+ * Den Startordner in den Workspace spiegeln, bevor der Bot startet.
+ *
+ * Bewusst vor `ensureContainer`: ist der Container schon da und das Spiegeln
+ * scheitert, hängt der Betreiber an einem Container, der den alten Code
+ * fährt – und die Meldung käme erst, wenn der Bot sich schon meldet. Die
+ * Dateien sind die Grundlage, nicht eine Nebensache.
+ */
+const uebernehmen = (bot) => {
+  const ergebnis = dateien.sync(bot, PROJECT_ROOT);
+  if (ergebnis.kopiert)
+    pushLine(
+      bot.id,
+      'system',
+      `${ergebnis.kopiert} Datei(en) aus dem Startordner übernommen`,
+    );
+  if (ergebnis.entfernt)
+    pushLine(
+      bot.id,
+      'system',
+      `${ergebnis.entfernt} Datei(en) entfernt – im Startordner nicht mehr vorhanden`,
+    );
+  for (const eintrag of ergebnis.uebersprungen.slice(0, 5))
+    pushLine(bot.id, 'system', `Startordner: übersprungen – ${eintrag}`);
+  return ergebnis;
+};
+
 async function startBot(id, { manual = true } = {}) {
   const bot = bots.get(id);
   if (!bot) throw httpError(404, 'Bot nicht gefunden');
   const dir = prepareStart(bot);
+  uebernehmen(bot);
 
   bot.manual = manual;
   bot.env = { ...bot.env };
@@ -1363,6 +1420,86 @@ const normaliseConfig = (input, existing) => {
   };
 };
 
+/**
+ * Der Startordner über HTTP.
+ *
+ *   GET    /api/bots/:id/files              auflisten
+ *   GET    /api/bots/:id/files/<pfad>       eine Datei lesen
+ *   PUT    /api/bots/:id/files/<pfad>       schreiben, dann spiegeln
+ *   DELETE /api/bots/:id/files/<pfad>       löschen, dann spiegeln
+ *   POST   /api/bots/:id/files              Ordner anlegen oder übernehmen
+ *
+ * Der Pfad wird aus dem Pfadnamen der URL gelesen und wieder zusammengesetzt –
+ * jeder Abschnitt einzeln dekodiert, damit ein Schrägstrich in einem Dateinamen
+ * nicht still zu einem Unterordner wird.
+ *
+ * Jeder schreibende Zugang spiegelt sofort. Das ist die Zusage an den
+ * Betreiber: was er hier hochlädt, ist danach im Workspace, ohne dass er noch
+ * irgendetwas anklicken muss. Nach dem Schreiben wird gespiegelt, nicht vorher
+ * – ein Fehler beim Spiegeln darf die Datei nicht verschlucken, und der
+ * Betreiber sieht die Meldung statt eines verschwundenen Uploads.
+ */
+const handleFileRoutes = async (req, res, url, bot) => {
+  const praefix = `/api/bots/${bot.id}/files`;
+  if (!url.pathname.startsWith(praefix)) return false;
+
+  const rest = url.pathname.slice(praefix.length);
+  const pfad = rest
+    .split('/')
+    .filter(Boolean)
+    .map((teil) => decodeURIComponent(teil))
+    .join('/');
+
+  if (!pfad) {
+    if (req.method === 'GET')
+      return sendJson(res, 200, {
+        startordner: dateien.startFolderOf(bot),
+        ...dateien.list(bot, PROJECT_ROOT),
+      });
+    if (req.method === 'POST') {
+      const body = await readBody(req, MAX_FILE_BODY_BYTES);
+      if (body.uebernehmen === true || body.ordner === undefined)
+        return sendJson(res, 200, { files: uebernehmen(bot) });
+      if (
+        typeof body.ordner !== 'string' ||
+        !dateien.makeDir(bot, PROJECT_ROOT, body.ordner)
+      )
+        throw httpError(400, 'Dieser Ordner kann nicht angelegt werden');
+      return sendJson(res, 201, { ...dateien.list(bot, PROJECT_ROOT) });
+    }
+    throw httpError(405, 'Methode nicht erlaubt');
+  }
+
+  if (req.method === 'GET') {
+    const datei = dateien.read(bot, PROJECT_ROOT, pfad);
+    if (!datei) throw httpError(404, 'Datei nicht gefunden');
+    return sendJson(res, 200, { pfad, ...datei });
+  }
+  if (req.method === 'PUT') {
+    const body = await readBody(req, MAX_FILE_BODY_BYTES);
+    // Nur Text. Binärdaten (Bilder, .jar) haben hier keinen Platz, und eine
+    // Base64-Hülle täuscht hier eine Dateigrösse vor, die keine ist.
+    if (typeof body.inhalt !== 'string')
+      throw httpError(400, 'Nur Textdateien sind erlaubt');
+    if (!dateien.write(bot, PROJECT_ROOT, pfad, body.inhalt))
+      throw httpError(400, 'Diese Datei kann nicht geschrieben werden');
+    return sendJson(res, 200, {
+      pfad,
+      files: uebernehmen(bot),
+      ...dateien.list(bot, PROJECT_ROOT),
+    });
+  }
+  if (req.method === 'DELETE') {
+    if (!dateien.remove(bot, PROJECT_ROOT, pfad))
+      throw httpError(404, 'Datei nicht gefunden');
+    return sendJson(res, 200, {
+      files: uebernehmen(bot),
+      ...dateien.list(bot, PROJECT_ROOT),
+    });
+  }
+  throw httpError(405, 'Methode nicht erlaubt');
+};
+
 const handleApi = async (req, res, url) => {
   const segments = url.pathname.split('/').filter(Boolean); // ['api', ...]
   const [, resource, id, action] = segments;
@@ -1504,7 +1641,7 @@ const handleApi = async (req, res, url) => {
           if (!safeBotPath({ id, workspaceRoot }, config.cwd))
             throw httpError(
               400,
-              'Arbeitsordner muss im eigenen Workspace liegen',
+              'Der Startordner muss im eigenen Workspace des Bots liegen',
             );
         }
         const bot = hydrate({ ...config, id });
@@ -1529,7 +1666,14 @@ const handleApi = async (req, res, url) => {
       const body = await readBody(req);
       const config = normaliseConfig(body, bot);
       if (!safeBotPath(bot, config.cwd))
-        throw httpError(400, 'Arbeitsordner muss im eigenen Workspace liegen');
+        throw httpError(
+          400,
+          'Der Startordner muss im eigenen Workspace des Bots liegen',
+        );
+      // Vor der Konfiguration, nicht danach: der Startordner ist die Quelle,
+      // und eine halb gespeicherte Konfiguration über halb kopierten Dateien
+      // ist die unangenehmere Hälfte davon.
+      const uebernommen = uebernehmen(bot);
       const nextBot = { ...bot, ...config };
       syncBotEnv(nextBot);
       Object.assign(bot, config, { updatedAt: Date.now() });
@@ -1538,7 +1682,7 @@ const handleApi = async (req, res, url) => {
       schedulePersist();
       const updated = publicBot(bot);
       broadcast('bot', updated);
-      return sendJson(res, 200, { bot: updated });
+      return sendJson(res, 200, { bot: updated, files: uebernommen });
     }
     if (!action && req.method === 'DELETE') {
       permission('bots.delete');
@@ -1559,11 +1703,21 @@ const handleApi = async (req, res, url) => {
       });
       return sendJson(res, 202, { bot: publicBot(bot) });
     }
+    if (action === 'files') {
+      permission('bots.manage');
+      const handled = await handleFileRoutes(req, res, url, bot);
+      if (handled !== false) return handled;
+      throw httpError(404, 'Unbekannter Datei-Endpunkt');
+    }
+
     if (action === 'install' && req.method === 'POST') {
       permission('bots.manage');
       const dir = safeBotPath(bot, bot.cwd);
       if (!dir)
-        throw httpError(400, 'Arbeitsordner liegt außerhalb des Bot-Workspace');
+        throw httpError(
+          400,
+          'Der Startordner liegt ausserhalb des Workspace dieses Bots',
+        );
       if (bot.busy) throw httpError(409, 'Installation läuft bereits');
       const body = await readBody(req);
       const { language, install } = depsFor(bot);

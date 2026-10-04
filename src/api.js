@@ -11,6 +11,19 @@ const request = async (path, options = {}) => {
 };
 
 /**
+ * Jeder Pfadabschnitt einzeln kodiert: `src/hilfe.py` soll als zwei Teile
+ * ankommen, nicht als ein Segment mit einem Schrägstrich darin – sonst
+ * liest der Server `src%2Fhilfe.py` als Dateinamen mit einem unmöglichen
+ * Zeichen darin.
+ */
+const encodePath = (path) =>
+  String(path)
+    .split('/')
+    .filter(Boolean)
+    .map((teil) => encodeURIComponent(teil))
+    .join('/');
+
+/**
  * Ein einziger SSE-Stream für die ganze Oberfläche. Wer sich über `events`
  * anmeldet, bekommt dieselben Ereignisse – nötig, weil z. B. das Bot-Fenster
  * den Stream mitbenutzt, ohne einen zweiten aufzubauen.
@@ -70,6 +83,30 @@ export const api = {
   restart: (id) => request(`/bots/${id}/restart`, { method: 'POST' }),
   logs: (id, tail = 200) =>
     request(`${id ? `/bots/${id}` : ''}/logs?tail=${tail}`),
+
+  /** Dateien im Startordner: auflisten, lesen, schreiben, löschen. */
+  files: (id) => request(`/bots/${encodeURIComponent(id)}/files`),
+  fileRead: (id, path) =>
+    request(`/bots/${encodeURIComponent(id)}/files/${encodePath(path)}`),
+  fileWrite: (id, path, inhalt) =>
+    request(`/bots/${encodeURIComponent(id)}/files/${encodePath(path)}`, {
+      method: 'PUT',
+      body: { inhalt },
+    }),
+  fileDelete: (id, path) =>
+    request(`/bots/${encodeURIComponent(id)}/files/${encodePath(path)}`, {
+      method: 'DELETE',
+    }),
+  fileMkdir: (id, path) =>
+    request(`/bots/${encodeURIComponent(id)}/files`, {
+      method: 'POST',
+      body: { ordner: path },
+    }),
+  filesSync: (id) =>
+    request(`/bots/${encodeURIComponent(id)}/files`, {
+      method: 'POST',
+      body: { uebernehmen: true },
+    }),
 
   panel: (id) => request(`/bots/${id}/panel`),
   panelDiscordConfig: (id) => request(`/bots/${id}/panel/discord/config`),

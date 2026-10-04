@@ -614,7 +614,7 @@ export const prepareDatabase = async (config) => {
 /**
  * Liegt die SQLite-Datei ausserhalb von `data/`? Dann ist es zwar kein Fehler –
  * ein Systemdienst darf die Datei gern unter `/var/lib` halten –, aber der Ort
- * verdient einen Hinweis: Liegt sie im Arbeitsordner eines Bots, kann dieser die
+ * verdient einen Hinweis: Liegt sie im Startordner eines Bots, kann dieser die
  * Datei direkt lesen und damit die API umgehen. Genau das soll hier nicht
  * passieren, deshalb steht der Hinweis beim Start und nicht im Forum.
  */

@@ -3,7 +3,7 @@
  *
  * Zwei Wege, wie ein Bot anknüpft:
  *
- *   1. Manifest – der Arbeitsordner enthält `bot-hub.json`. Kein Code nötig,
+ *   1. Manifest – der Startordner enthält `bot-hub.json`. Kein Code nötig,
  *      der Hub liest die Datei und rendert Seite, Settings und Aktionen.
  *   2. Laufzeit  – der vom Hub gestartete Prozess meldet sich mit dem Token aus
  *      `BOT_HUB_TOKEN` an und liefert Manifest, Live-Zustand und Aktionen
@@ -973,7 +973,10 @@ const botDir = (bot) => {
   const dir = realpathSync(resolve(workspace, bot.cwd || '.'));
   const rel = relative(workspace, dir);
   if (rel.startsWith('..') || isAbsolute(rel))
-    throw httpError(400, 'Arbeitsordner liegt außerhalb des Bot-Workspace');
+    throw httpError(
+      400,
+      'Der Startordner liegt ausserhalb des Workspace dieses Bots',
+    );
   return dir;
 };
 

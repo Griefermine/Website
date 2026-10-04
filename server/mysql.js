@@ -199,7 +199,7 @@ export const managedConfig = ({ env = process.env, projectRoot } = {}) => {
   );
 
   // Dieselbe Schranke wie bei der SQLite-Datei: das Datenverzeichnis darf
-  // nicht im Arbeitsordner eines Bots liegen. Bei Containern ist das ohnehin
+  // nicht im Startordner eines Bots liegen. Bei Containern ist das ohnehin
   // unmöglich, mit `BOT_HUB_CONTAINER_MODE=disabled` aber nicht – dann liefe
   // ein Bot als derselbe Benutzer und könnte die Dateien direkt lesen.
   const botsRoot = resolve(root, 'bots');

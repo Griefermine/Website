@@ -1,4 +1,5 @@
 import { el, clear } from './dom.js';
+import { mountStartFolder } from './startFolder.js';
 
 const TOKEN_KEY = 'DISCORD_BOT_TOKEN';
 const MASK = '••••••••';
@@ -117,43 +118,48 @@ export const openBotForm = ({ bot, languages, onSubmit }) => {
     const check = fillDeps(language.check, deps);
     const install = fillDeps(language.install, deps);
     clear(depsPreview);
+    // `append` im Gegensatz zu `el` nimmt auch `null` an und setzt dann das
+    // Wort „null“ in die Zeile – bei „Sonstiges“ ohne Prüfbefehl wäre das
+    // jedes Mal im Formular zu lesen.
     depsPreview.append(
-      el('span', { class: 'deps__title' }, `📦 ${framework.name}`),
-      check
-        ? el(
-            'div',
-            { class: 'deps__row' },
-            el('span', { class: 'deps__label' }, 'Prüfung'),
-            el('code', {}, check),
-          )
-        : null,
-      install
-        ? el(
-            'div',
-            { class: 'deps__row' },
-            el('span', { class: 'deps__label' }, 'Installation'),
-            el('code', {}, install),
-          )
-        : el(
-            'span',
-            { class: 'deps__hint' },
-            'Keine automatische Installation möglich',
-          ),
-      language.prepare
-        ? el(
-            'div',
-            { class: 'deps__row' },
-            el('span', { class: 'deps__label' }, 'Umgebung'),
-            el('code', {}, fillDeps(language.prepare, deps)),
-          )
-        : null,
-      el(
-        'span',
-        { class: 'deps__hint' },
-        language.venv
-          ? `Fehlt die Library, legt der Hub zuerst ${language.venv} an und installiert dort – dein System-Python bleibt unangetastet (PEP 668).`
-          : 'Fehlt die Library, installiert der Hub sie beim Start automatisch in deinem Projektordner.',
-      ),
+      ...[
+        el('span', { class: 'deps__title' }, `📦 ${framework.name}`),
+        check
+          ? el(
+              'div',
+              { class: 'deps__row' },
+              el('span', { class: 'deps__label' }, 'Prüfung'),
+              el('code', {}, check),
+            )
+          : null,
+        install
+          ? el(
+              'div',
+              { class: 'deps__row' },
+              el('span', { class: 'deps__label' }, 'Installation'),
+              el('code', {}, install),
+            )
+          : el(
+              'span',
+              { class: 'deps__hint' },
+              'Keine automatische Installation möglich',
+            ),
+        language.prepare
+          ? el(
+              'div',
+              { class: 'deps__row' },
+              el('span', { class: 'deps__label' }, 'Umgebung'),
+              el('code', {}, fillDeps(language.prepare, deps)),
+            )
+          : null,
+        el(
+          'span',
+          { class: 'deps__hint' },
+          language.venv
+            ? `Fehlt die Library, legt der Hub zuerst ${language.venv} an und installiert dort – dein System-Python bleibt unangetastet (PEP 668).`
+            : 'Fehlt die Library, installiert der Hub sie beim Start automatisch in deinem Projektordner.',
+        ),
+      ].filter(Boolean),
     );
   };
 
@@ -197,6 +203,10 @@ export const openBotForm = ({ bot, languages, onSubmit }) => {
       : 'Bot-Token einfügen',
     spellcheck: 'false',
   });
+
+  // Wird gleich an seinen Platz im Formular gehängt. Ohne Bot gibt es nichts
+  // zu zeigen – der Bereich erklärt das dann selbst.
+  const startOrdner = el('div', { class: 'start-folder' });
 
   const form = el(
     'form',
@@ -247,9 +257,9 @@ export const openBotForm = ({ bot, languages, onSubmit }) => {
       'div',
       { class: 'form__grid' },
       field(
-        'Arbeitsordner',
-        input('cwd', model.cwd, { placeholder: '.' }),
-        'Relativ zum Projektordner',
+        'Startordner',
+        el('div', { class: 'start-folder' }, startOrdner),
+        'Quelle für den Container · Dateien werden beim Speichern übernommen',
       ),
       field(
         'Guild-ID (optional)',
@@ -380,7 +390,6 @@ export const openBotForm = ({ bot, languages, onSubmit }) => {
       framework: data.get('framework').toString(),
       entrypoint: data.get('entrypoint').toString().trim(),
       command: data.get('command').toString().trim(),
-      cwd: data.get('cwd').toString().trim() || '.',
       guildId: data.get('guildId').toString().trim(),
       autoRestart: data.get('autoRestart') !== null,
       autoInstall: data.get('autoInstall') !== null,
@@ -395,5 +404,6 @@ export const openBotForm = ({ bot, languages, onSubmit }) => {
 
   document.body.append(dialog);
   dialog.showModal();
+  mountStartFolder(startOrdner, bot);
   form.querySelector('[name="name"]').focus();
 };

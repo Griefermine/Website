@@ -268,7 +268,7 @@ describe('Bot-Seite aus einem Manifest', () => {
     assert.equal(data.bridge.token, undefined);
   });
 
-  it('liefert die Dateien der Bot-Seite aus – aber nur im Arbeitsordner', async () => {
+  it('liefert die Dateien der Bot-Seite aus – aber nur im Startordner', async () => {
     const page = await fetch(
       `${baseUrl}/api/bots/${bot.id}/panel/file/page.html`,
     );

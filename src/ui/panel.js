@@ -299,7 +299,7 @@ const linkTab = (bot, panel) => {
         { class: 'panel__text' },
         'Datei ',
         el('code', {}, 'bot-hub.json'),
-        ' im Arbeitsordner:',
+        ' im Startordner:',
       ),
       el('div', { class: 'code-row' }, code(manifest), copyButton(manifest)),
       el(

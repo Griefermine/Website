@@ -6,6 +6,75 @@ Workspace dieses Bots als `/workspace` eingebunden und bleibt für spätere
 Starts erhalten. Abhängigkeiten, Build-Schritte und der eigentliche Bot-Prozess
 laufen vollständig im Container.
 
+## Startordner und Workspace
+
+Zu jedem Bot gehören zwei Ordner, und der Unterschied ist der ganze Punkt:
+
+```
+bots/<id>/startordner/   der Startordner – vom Betreiber gepflegt
+bots/<id>/workspace/     der Workspace – was als /workspace einhängt
+```
+
+Der Hub legt den Startordner selbst an. Es gibt kein Feld, in dem man einen
+Pfad einträgt: ein getippter Pfad ist der eine Fehler, der erst auffällt, wenn
+der Bot seinen Einstiegspunkt nicht findet. Dateien kommen über das Panel
+(hier hochladen, dort bearbeiten, löschen) oder – für alle, die lieber ihren
+Editor daneben offen haben – direkt auf die Platte.
+
+Beim **Anlegen**, beim **Bearbeiten**, beim **Hochladen einer Datei** und beim
+**Start** spiegelt der Hub den Startordner in den Workspace. Das ist der Punkt
+der Trennung: der Bot bekommt die Dateien, aber nie den Ordner, in dem sie
+liegen. Schreibt er in seinen Workspace – `node_modules`, Caches, ein
+Exportversuch –, landet das im Workspace und nicht zwischen den Quelldateien.
+
+### Die Merkliste
+
+`bots/<id>/start-sync.json` (neben dem Startordner, also außerhalb des
+gemounteten Workspace) merkt sich für jede geschriebene Datei ihre Größe und
+eine Prüfsumme des Inhalts. Daraus folgt:
+
+- **Neue und geänderte Dateien** werden kopiert. Ob etwas sich geändert hat,
+  entscheidet der Inhalt, nicht der Zeitstempel – Dateisysteme, die auf
+  Sekunden runden, liefern für dieselbe Datei verschiedene Zahlen, und in der
+  Sekunde, in der der Bot eine Datei anfasst, wäre eine Änderung über den
+  Zeitstempel gar nicht zu sehen.
+- **Gelöschte Dateien** verschwinden auch im Workspace. Nur, was in der
+  Merkliste steht, wird entfernt.
+- **Was der Bot selbst erzeugt hat**, steht nicht in der Merkliste und bleibt:
+  `node_modules`, `.venv`, Caches. Ein Spiegel, der sie mitnehmen würde, würde
+  bei jedem Start die Installation des Bots wieder über den Haufen werfen.
+- **Was der Bot im Container verändert** hat, wird zurückgeschrieben. Der
+  Startordner ist die Quelle; sonst gewönne der Bot mit der Zeit das Recht,
+  die eigene Quelle zu überschreiben.
+
+### Was nicht übernommen wird
+
+`.env`, `.env.*` und `.git` bleiben im Startordner und kommen nicht in den
+Workspace. Geheimnisse kommen aus den Umgebungsvariablen des Bots
+(`data/secrets/<id>.env`), und sie in den Container zu legen hieße, sie jedem
+Prozess des Bots zu geben, der dieselbe UID hat. Übersprungene Einträge werden
+gemeldet, nicht verschwiegen – ein still fehlendes `config.py` ist schlimmer
+als ein Hinweis im Protokoll. Symlinks im Startordner werden ebenfalls
+übersprungen: ein Verweis auf `/etc` ist kein Dateiinhalt, den man kopieren
+kann.
+
+Eine Quelldatei namens `secrets.py` ist übrigens Quellcode und gehört in den
+Bot. Anders als bei der Migration alter Bot-Ordner wird hier nichts an der
+Benennung erraten.
+
+### Grenzen
+
+- **Nur Text.** Maximal 512 kB je Datei. Bilder, `.jar` und andere Binärdaten
+  haben hier keinen Platz – ein Bot baut seine `.jar` im Container, nicht über
+  den Hub.
+- **Bots aus der Zeit vor dem Startordner.** Ihr `Arbeitsordner` (ein Unterordner
+  im Workspace) bleibt, wie er ist; der Startordner wird beim nächsten Hub-Start
+  daneben angelegt und von da an gespiegelt. Der Einstiegspunkt eines solchen
+  Bots muss dort liegen, wo sein bisheriges Feld es hinlegt.
+- **Ein Löschen im Panel löscht keine Dateien.** Wie bisher bleiben Workspace
+  und Container stehen; der Startordner kommt hinzu. Wer einen Bot endgültig
+  weghaben will, entfernt `bots/<id>` von Hand.
+
 Der Container läuft mit derselben UID/GID wie der Bot-Hub-Prozess. Dadurch
 bleiben die restriktiven Host-Dateirechte wirksam, ohne dass der Container für
 den Zugriff auf den Workspace als privilegierter Root-Prozess laufen muss.

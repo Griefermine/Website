@@ -154,7 +154,7 @@ BOT_HUB_DB_FILE=/var/lib/bot-hub/speicher.sqlite
 ```
 
 Liegt die Datei außerhalb von `data/`, weist der Hub beim Start darauf hin. Das
-ist erlaubt – aber sie darf nicht im Arbeitsordner eines Bots liegen, sonst
+ist erlaubt – aber sie darf nicht im Startordner eines Bots liegen, sonst
 könnte dieser sie direkt lesen und die API umgehen.
 
 Sichern heißt: Datei kopieren. Im laufenden Betrieb eignen sich

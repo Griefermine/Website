@@ -450,10 +450,15 @@ const openForm = (bot) => {
           : await api.create(config);
 
         upsertBot(saved);
+        if (bot) {
+          toast('Bot aktualisiert', 'success');
+          return;
+        }
         toast(
-          bot ? 'Bot aktualisiert' : `${saved.name} angelegt`,
+          `${saved.name} angelegt – jetzt die Dateien hochladen`,
           'success',
         );
+        openForm(saved);
       } catch (error) {
         toast(error.message, 'error');
       }
@@ -569,8 +574,11 @@ toast('Bot aktualisiert', 'success');
 Beim Erstellen:
 
 ```js
-toast(`${saved.name} angelegt`, 'success');
+toast(`${saved.name} angelegt – jetzt die Dateien hochladen`, 'success');
 ```
+
+Der Text nennt den zweiten Schritt mit, weil der Startordner eines neuen Bots
+noch leer ist.
 
 Fehler werden ebenfalls angezeigt:
 
@@ -579,6 +587,16 @@ catch (error) {
   toast(error.message, 'error');
 }
 ```
+
+### Nach dem Anlegen das Formular wieder öffnen
+
+```js
+openForm(saved);
+```
+
+Das passiert nur beim Erstellen. Der Grund ist einfach: ohne diesen Schritt wäre
+nirgends zu sehen, wohin die Dateien des neuen Bots gehören. Beim Bearbeiten
+wäre das Doppelarbeit – das Formular ist ja schon offen.
 
 ---
 
@@ -954,6 +972,28 @@ if (action === 'edit') return openForm(bot);
 
 Das Formular wird mit dem bestehenden Bot geöffnet. Dadurch sind die bisherigen Werte bereits eingetragen und können verändert werden.
 
+### Der Startordner gehört dazu
+
+`openBotForm` hängt beim Öffnen den Startordner in das Formular ein:
+
+```js
+mountStartFolder(startOrdner, bot);
+```
+
+Der Abschnitt zeigt den Pfad auf dem Server, die Liste der Dateien und zwei
+Knöpfe: **Dateien hochladen** und **In den Container übernehmen**. Jeder dieser
+Vorgänge spiegelt sofort in den Workspace des Bots – was hier hochgeladen wird,
+läuft danach im Container, ohne dass noch etwas anzuklicken wäre.
+
+Beim Speichern des Formulars spiegelt der Hub ebenfalls. Das ist der Grund, warum
+ein `cwd`-Feld im Formular nichts mehr verloren hat: Der Betreiber gibt keinen
+Pfad mehr an, sondern Dateien. Was davon im Container ankommt, entscheidet der
+Hub.
+
+Für einen neuen Bot (`bot === null`) gibt es noch keine Kennung und damit nichts
+zu zeigen. Der Abschnitt sagt das dann ausdrücklich, statt eine leere Liste zu
+zeigen, die nach einem Fehler aussieht.
+
 ---
 
 ## 17. Bot löschen
@@ -962,7 +1002,8 @@ Das Formular wird mit dem bestehenden Bot geöffnet. Dadurch sind die bisherigen
 if (action === 'delete') {
   if (
     !confirm(
-      `"${bot.name}" wirklich löschen? Konfiguration und Logs gehen verloren.`,
+      `"${bot.name}" wirklich löschen? Konfiguration und Logs gehen verloren. ` +
+        'Die Dateien im Startordner bleiben liegen.',
     )
   )
     return undefined;
@@ -982,7 +1023,13 @@ Vor dem Löschen wird gefragt:
 ```text
 "Mein Bot" wirklich löschen?
 Konfiguration und Logs gehen verloren.
+Die Dateien im Startordner bleiben liegen.
 ```
+
+Der letzte Satz steht da, weil es wahr ist: Ein Löschen im Panel entfernt nur
+den Bot aus dem Hub. Startordner und Workspace bleiben als Ordner auf der
+Platte stehen, damit niemand hochgeladene Quelldateien aus Versehen verliert.
+Wer sie auch weghaben will, entfernt `bots/<id>` von Hand.
 
 Wenn der Benutzer abbricht, wird nichts weiter ausgeführt:
 

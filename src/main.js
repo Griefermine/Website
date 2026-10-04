@@ -60,7 +60,18 @@ const openForm = (bot) => {
           ? await api.update(bot.id, config)
           : await api.create(config);
         upsertBot(saved);
-        toast(bot ? 'Bot aktualisiert' : `${saved.name} angelegt`, 'success');
+        if (bot) {
+          toast('Bot aktualisiert', 'success');
+          return;
+        }
+        // Nach dem Anlegen das Formular gleich wieder öffnen, diesmal im
+        // Bearbeitungs-Modus: der Startordner ist beim Anlegen noch leer, und
+        // ohne diesen Schritt wäre nicht zu sehen, wo die Dateien hingehören.
+        toast(
+          `${saved.name} angelegt – jetzt die Dateien hochladen`,
+          'success',
+        );
+        openForm(saved);
       } catch (error) {
         toast(error.message, 'error');
       }
@@ -114,7 +125,11 @@ const wireControls = () => {
     if (action === 'delete') {
       if (
         !confirm(
-          `"${bot.name}" wirklich löschen? Konfiguration und Logs gehen verloren.`,
+          // Der Startordner und der Workspace bleiben auf der Platte – wie
+          // bisher. Wer sie mitnimmt, nimmt hochgeladene Quelldateien mit,
+          // und das ist eine Entscheidung, die man nicht aus Versehen trifft.
+          `"${bot.name}" wirklich löschen? Konfiguration und Logs gehen verloren. ` +
+            'Die Dateien im Startordner bleiben liegen.',
         )
       )
         return undefined;

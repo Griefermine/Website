@@ -119,7 +119,7 @@ Daneben Ratenbegrenzungen je Bot: 120 Schreibvorgänge, 60 Löschungen,
 
 Die SQLite-Datei liegt unter `data/db/` (Verzeichnis `0700`, Datei `0600`). Ein
 per `BOT_HUB_DB_FILE` gesetzter Ort außerhalb von `data/` ist erlaubt, wird beim
-Start aber gemeldet: im Arbeitsordner eines Bots dürfte sie nicht liegen, sonst
+Start aber gemeldet: im Startordner eines Bots dürfte sie nicht liegen, sonst
 könnte dieser sie direkt lesen und die API umgehen. Details in
 [datenbank.md](datenbank.md).
 
@@ -304,6 +304,35 @@ Ausnahme: Der Hub ruft dann auch Ziele außerhalb des eigenen Rechners auf, und
 der Betreiber trägt diese Verantwortung. Eine angemeldete Adresse gilt eine
 Stunde und ist an die Bot-ID gebunden; 30 Aufrufe je Bot und Minute.
 
+## Startordner
+
+Zu jedem Bot gehören zwei Ordner: `bots/<id>/startordner/` ist die Quelle, die
+der Betreiber pflegt, `bots/<id>/workspace/` ist die Kopie, die als
+`/workspace` in den Container hängt. Der Hub legt den Startordner selbst an
+(`0700`), und nur er kommt hinein – der Container sieht ihn nicht.
+
+- **Was der Hub liest, landet im Container.** Der Hub spiegelt alles aus dem
+  Startordner in den Workspace. Ein Startordner ist also Vertrauensgrenze in
+  derselben Weise wie ein Workspace: wer ihn füllen kann, bestimmt, was der Bot
+  ausführt.
+- **Symlinks werden nicht mitgenommen.** Ein Verweis im Startordner zeigt auf
+  irgendwohin; ihn zu kopieren hieße, dem Bot den Inhalt dort zu geben. Sie
+  werden gemeldet und übersprungen. Dasselbe gilt für Pfade, die aus dem
+  Startordner hinauszeigen: sie werden abgewiesen, auch wenn ein Symlink sie
+  scheinbar hineinführen lässt.
+- **`.env` bleibt draußen.** Geheimnisse kommen aus
+  `data/secrets/<bot-id>.env` und werden als Umgebung gesetzt. Ein `.env` im
+  Startordner in den Container zu legen hieße, es jedem Prozess des Bots zu
+  geben, der dieselbe UID hat.
+- **Der Startordner ist nicht schreibgeschützt.** Er wird bei jedem Start neu
+  gelesen und mit dem Workspace verglichen. Wer einen Bot zur Laufzeit am
+  Quellcode vorbeimodifiziert, holt ihn sich beim nächsten Start zurück.
+- **`bots/<id>/start-sync.json`** liegt neben dem Startordner und damit außerhalb
+  des gemounteten Workspace. Sie merkt sich Größe und Prüfsumme der Dateien, die
+  der Hub geschrieben hat, und entscheidet so, was beim nächsten Spiegeln
+  entfernt wird. Der Bot sieht sie nicht; sie ist kein Geheimnis, sondern eine
+  Liste von Pfaden.
+
 ## Was nicht abgesichert ist
 
 - **Container ohne Netzwerk-Firewall.** Die Grenzen sind Benutzer, Rechte,
@@ -312,6 +341,11 @@ Stunde und ist an die Bot-ID gebunden; 30 Aufrufe je Bot und Minute.
   demselben Hub erzwingen.
 - **`bots/shared` ist Vertrauensgrenze.** Jeder Workspace darf daraus lesen.
   Ein Workspace ist damit so vertrauenswürdig wie sein Besitzer.
+- **Der Startordner gibt dem Bot seinen Code, nicht umgekehrt.** Er ist nicht
+  schreibgeschützt: wer ihn füllen kann, bestimmt, was der Bot ausführt. Das ist
+  keine Lücke, sondern die Aufgabe – der Hub führt Bots, die jemand gebaut hat.
+  Abgesichert ist nur die Richtung, die interessiert: der Bot kommt nicht an den
+  Ordner selbst und nicht an die Dateien, die nicht für ihn bestimmt sind.
 - **Der Bot-Speicher ist kein Geheimnisspeicher.** Er ist lesbar für jeden mit
   Zugriff auf die Datenbankdatei, und er hat keine Rechte auf Bot-Ebene: wer den
   Laufzeit-Token eines Bots hat, hat den ganzen Bereich dieses Bots.

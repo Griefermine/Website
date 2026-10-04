@@ -629,7 +629,113 @@ ergibt:
 
 ---
 
-## 12. Panel-Funktionen
+## 12. Dateien im Startordner
+
+Der Startordner eines Bots (`bots/<id>/startordner/`) ist die Quelle, aus der
+der Hub die Dateien in den Container des Bots spiegelt. Diese sechs Funktionen
+sind die Dateiverwaltung im Hub:
+
+```js
+files: (id) => request(`/bots/${encodeURIComponent(id)}/files`),
+```
+
+Listet alle Dateien auf, die beim Spiegeln in den Container wandern:
+
+```js
+api.files('3f2a-…');
+```
+
+liefert:
+
+```json
+{
+  "startordner": "bots/3f2a-…/startordner",
+  "dateien": [{ "pfad": "bot.py", "groesse": 42, "mtimeMs": 1730000000000 }],
+  "uebersprungen": [".env (Geheimnis)"],
+  "mehr": false
+}
+```
+
+`uebersprungen` nennt die Einträge, die absichtlich nicht mitgenommen werden –
+Geheimnisse und Verweise. Sie werden gemeldet, nicht verschwiegen.
+
+```js
+fileRead: (id, path) =>
+  request(`/bots/${encodeURIComponent(id)}/files/${encodePath(path)}`),
+```
+
+Liest eine einzelne Datei und liefert ihren Inhalt als Text.
+
+```js
+fileWrite: (id, path, inhalt) =>
+  request(`/bots/${encodeURIComponent(id)}/files/${encodePath(path)}`, {
+    method: 'PUT',
+    body: { inhalt },
+  }),
+```
+
+Schreibt eine Datei – und spiegelt sie sofort in den Workspace. Man muss danach
+nichts weiter anklicken: was hier hochgeladen wird, ist danach im Container.
+
+```js
+fileDelete: (id, path) =>
+  request(`/bots/${encodeURIComponent(id)}/files/${encodePath(path)}`, {
+    method: 'DELETE',
+  }),
+```
+
+Löscht eine Datei aus dem Startordner und aus dem Workspace.
+
+```js
+fileMkdir: (id, path) =>
+  request(`/bots/${encodeURIComponent(id)}/files`, {
+    method: 'POST',
+    body: { ordner: path },
+  }),
+```
+
+Legt einen Ordner an, damit Unterordner in der Dateiliste auftauchen.
+
+```js
+filesSync: (id) =>
+  request(`/bots/${encodeURIComponent(id)}/files`, {
+    method: 'POST',
+    body: { uebernehmen: true },
+  }),
+```
+
+Übernimmt den ganzen Startordner in den Workspace. Nötig, wenn jemand Dateien
+auf dem Server oder neben dem Browser geändert hat.
+
+### Warum `encodePath` und nicht `encodeURIComponent`?
+
+Ein Dateipfad kann einen Schrägstrich enthalten – und der ist genau das Zeichen,
+das einen Pfad von einem Dateinamen trennt. Deshalb wird jeder Abschnitt einzeln
+kodiert und wieder mit einem Schrägstrich verbunden:
+
+```js
+encodePath('src/hilfe.py')
+```
+
+ergibt:
+
+```text
+src/hilfe.py
+```
+
+und `encodePath('mein ordner/x.txt')` ergibt:
+
+```text
+mein%20ordner/x.txt
+```
+
+Mit einem einzigen `encodeURIComponent` für den ganzen Pfad wäre daraus
+`src%2Fhilfe.py` geworden – ein einziger „Dateiname“ mit einem unmöglichen
+Zeichen darin.
+
+---
+
+## 13. Panel-Funktionen
 
 Ein Panel ist vermutlich die Bedienoberfläche oder das Statusfenster eines Bots.
 
@@ -741,7 +847,7 @@ So bleibt der Befehl ein sicherer und gültiger Teil der URL.
 
 ---
 
-## 13. Live-Ereignisse abonnieren
+## 14. Live-Ereignisse abonnieren
 
 ```js
 events: (onEvent) => {
@@ -789,7 +895,7 @@ Wichtig: Die Verbindung selbst wird hier nicht geschlossen. Sie kann weiterhin v
 
 ---
 
-## 14. Ein kompletter Beispielablauf
+## 15. Ein kompletter Beispielablauf
 
 Der folgende Code:
 
@@ -822,7 +928,7 @@ try {
 
 ---
 
-## 15. Zusammenfassung in einfachen Worten
+## 16. Zusammenfassung in einfachen Worten
 
 `api.js` ist die zentrale Fernbedienung der Weboberfläche:
 
@@ -830,6 +936,8 @@ try {
 - Die Funktionen `health`, `list`, `create`, `update` und `remove` verwalten Bot-Daten.
 - `start`, `install`, `stop`, `kill` und `restart` steuern laufende Bots.
 - `logs` lädt Protokollausgaben.
+- Die `files...`-Funktionen verwalten die Dateien im Startordner eines Bots und
+  spiegeln sie in dessen Container.
 - Die `panel...`-Funktionen verwalten die Bot-Panels.
 - `events` und `EventSource` liefern Live-Änderungen vom Server.
 - JSON wird beim Senden erzeugt und beim Empfangen wieder gelesen.

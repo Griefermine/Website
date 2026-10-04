@@ -87,7 +87,7 @@ const storeOutside = storeOutsideDataDir(databaseConfig);
 if (storeOutside)
   console.warn(
     `[hub] HINWEIS: Der Bot-Speicher liegt in ${storeOutside} und damit ausserhalb von data/.\n` +
-      '         Das ist erlaubt, solange die Datei nicht im Arbeitsordner eines Bots\n' +
+      '         Das ist erlaubt, solange die Datei nicht im Startordner eines Bots\n' +
       '         liegt – sonst könnte dieser sie direkt lesen und die API umgehen.',
   );
 

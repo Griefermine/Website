@@ -849,6 +849,133 @@ select.input {
   color: #6b7488;
 }
 
+/* Der Startordner: Pfad, zwei Knöpfe, die Dateiliste. Bewusst schmal und
+   ohne Rahmen – er ist ein Arbeitsbereich, kein Karton mit Deckel. */
+.start-folder {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.start-folder__head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.start-folder__label {
+  font-size: 11px;
+  color: #6b7488;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.start-folder__path {
+  font-size: 11.5px;
+  color: #8b949e;
+  overflow-wrap: anywhere;
+}
+
+.start-folder__tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* Das Dateifeld steckt im Knopf statt daneben – zwei Knöpfe nebeneinander, von
+   denen einer nur ein Feld für den Dateidialog ist, sieht nach zwei Aktionen
+   aus. Ohne Zugriff per Tastatur ist es trotzdem kein Weg zum Hochladen, also
+   bleibt es sichtbar, nur winzig. */
+.start-folder__input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.start-folder__list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  max-height: 190px;
+  overflow-y: auto;
+  border-radius: 7px;
+  background: #10131a;
+}
+
+.start-folder__row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 6px;
+  align-items: center;
+  padding: 4px 8px;
+}
+
+.start-folder__row:hover {
+  background: #161b24;
+}
+
+.start-folder__name {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.start-folder__meta {
+  font-size: 11px;
+  color: #6b7488;
+  white-space: nowrap;
+}
+
+.start-folder__empty {
+  padding: 10px;
+  font-size: 12px;
+  color: #6b7488;
+  line-height: 1.5;
+}
+
+.start-folder__hint {
+  font-size: 11.5px;
+  color: #6b7488;
+  min-height: 1em;
+  overflow-wrap: anywhere;
+}
+
+.start-folder__hint--warn {
+  color: #d8a657;
+}
+
+.start-folder__hint--error {
+  color: #e5534b;
+}
+
+/* Steht links, die Knöpfe bleiben rechts: die Fussnote sagt, was man da
+   bearbeitet – nach dem Klick wären die Knöpfe das Erste, was man sucht. */
+.start-folder__fussnote {
+  margin-right: auto;
+  font-size: 11.5px;
+  color: #6b7488;
+}
+
+.start-folder__editor {
+  width: 100%;
+  min-height: 320px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+  line-height: 1.55;
+  resize: vertical;
+}
+
 .env-list {
   display: flex;
   flex-direction: column;

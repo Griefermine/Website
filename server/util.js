@@ -89,13 +89,18 @@ export const isEvalFlag = (arg) => {
   return value.length > 2 && EVAL_FLAGS.has(`-${value[1]}`);
 };
 
-export const readBody = (req) =>
+/**
+ * Der JSON-Body einer Anfrage. `limit` gilt nur diesem Aufrufer – der
+ * Startordner einer Datei braucht mehr als die Voreinstellung, ohne dass
+ * deshalb eine andere Route mit einer grösseren Grenze dasteht.
+ */
+export const readBody = (req, limit = MAX_BODY_BYTES) =>
   new Promise((resolveBody, rejectBody) => {
     let size = 0;
     const chunks = [];
     req.on('data', (chunk) => {
       size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
+      if (size > limit) {
         rejectBody(httpError(413, 'Anfrage zu groß'));
         req.destroy();
         return;

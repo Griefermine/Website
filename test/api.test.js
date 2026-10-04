@@ -337,7 +337,7 @@ describe('Bot-Hub API', () => {
       method: 'POST',
     });
     assert.equal(status, 400);
-    assert.match(data.error, /außerhalb des Projekts/);
+    assert.match(data.error, /ausserhalb des Workspace/);
   });
 
   it('lehnt Interpreter-Evaluation beim Bot-Start ab', async () => {
