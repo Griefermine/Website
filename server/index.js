@@ -202,7 +202,10 @@ const collectSecurityFindings = ({
           'BOT_HUB_CONTAINER_IMAGES mit Digest-Referenzen setzen.',
       );
     } else if (production) {
-      warnings.push(text);
+      errors.push(
+        `${text} In Produktion sind Digest-gepinnte Images Pflicht – bitte ` +
+          'BOT_HUB_CONTAINER_IMAGES mit Digest-Referenzen setzen.',
+      );
     }
   }
 

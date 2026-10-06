@@ -1161,11 +1161,14 @@ describe('Callback-Adresse', () => {
 
   it('nimmt eine ausdrücklich freigegebene Adresse an', async () => {
     const vorher = process.env.BOT_HUB_CALLBACK_ALLOW;
-    process.env.BOT_HUB_CALLBACK_ALLOW = 'bot.example.test:9999';
+    // V19 #18: Allowlist umgeht DNS-Schutz niemals. Ein Name ohne DNS-Eintrag
+    // wird abgelehnt (400); eine allowlistete IP ohne Metadaten wird angenommen.
+    process.env.BOT_HUB_CALLBACK_ALLOW =
+      'bot.example.test:9999,93.184.216.34:9999';
     try {
-      // Ohne DNS-Eintrag lässt sich der Name nicht auflösen – das ist die
-      // richtige Antwort, solange es keinen gibt.
-      const { status } = await setzen('http://bot.example.test:9999/hook');
+      const unaufloesbar = await setzen('http://bot.example.test:9999/hook');
+      assert.equal(unaufloesbar.status, 400);
+      const { status } = await setzen('http://93.184.216.34:9999/hook');
       assert.equal(status, 200);
       await setzen(null);
     } finally {

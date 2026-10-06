@@ -13,7 +13,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { after, before, describe, it } from 'node:test';
+import { after, afterEach, before, beforeEach, describe, it } from 'node:test';
 
 import * as dateien from '../server/botFiles.js';
 
@@ -328,36 +328,177 @@ describe('Dateien im Startordner verwalten', () => {
     );
   });
 
-  it('listet Dateien und lässt Geheimnisse weg', () => {
-    // Die Liste zeigt, was beim Spiegeln ankommt. Ein `.env` gehört nicht dazu
-    // – es wird gemeldet, nicht verschwiegen.
-    dateien.write(bot, root, 'a.py', '1');
-    dateien.write(bot, root, 'src/b.py', '2');
-    dateien.write(bot, root, '.env', 'GEHEIM=1');
-    const ergebnis = dateien.list(bot, root);
-    const pfade = ergebnis.dateien.map((f) => f.pfad);
-    assert.ok(pfade.includes('a.py'));
-    assert.ok(pfade.includes('src/b.py'));
-    assert.ok(!pfade.some((p) => p.endsWith('.env')), 'ein .env in der Liste');
-    assert.equal(ergebnis.dateien.find((f) => f.pfad === 'a.py').groesse, 1);
-    assert.ok(ergebnis.uebersprungen.some((e) => e.includes('.env')));
-  });
-
   it('löscht Dateien und räumt leere Ordner mit auf', () => {
     dateien.write(bot, root, 'weg/tief/x.py', '1');
-    assert.equal(dateien.remove(bot, root, 'weg/tief/x.py'), true);
+    assert.deepEqual(dateien.remove(bot, root, 'weg/tief/x.py'), {
+      ordner: false,
+      eintraege: 1,
+    });
     assert.ok(!existsSync(quelle(root, 'weg')), 'der leere Ordner blieb');
   });
 
-  it('löscht keinen Ordner, in dem noch etwas liegt', () => {
+  it('löscht einen Ordner mitsamt seinem Inhalt', () => {
+    // Der Explorer zeigt einen Ordner als eine Zeile; „löschen“ heisst dort
+    // „dieser Ordner samt Inhalt“. 400 einzelne Anfragen wären keine Lösung,
+    // sondern eine Zumutung.
     dateien.write(bot, root, 'voll/a.py', '1');
-    assert.equal(dateien.remove(bot, root, 'voll'), false);
-    assert.ok(existsSync(quelle(root, 'voll', 'a.py')));
+    dateien.write(bot, root, 'voll/tief/b.py', '2');
+    dateien.write(bot, root, 'voll/tief/noch/c.txt', '3');
+    dateien.write(bot, root, 'daneben/d.py', '4');
+
+    const ergebnis = dateien.remove(bot, root, 'voll');
+    assert.equal(ergebnis.ordner, true);
+    // 3 Dateien und 2 Ordner – die Ordner zählen mit, weil sie beim Löschen mit
+    // verschwinden und die Rückfrage sagen soll, was auf einmal weg ist.
+    assert.equal(ergebnis.eintraege, 5);
+    assert.ok(!existsSync(quelle(root, 'voll')));
+    assert.ok(existsSync(quelle(root, 'daneben', 'd.py')), 'ein Nachbar');
   });
 
-  it('legt Ordner an – nur einmal', () => {
+  it('löst beim Löschen eines Ordners einen Verweis auf, statt ihm zu folgen', () => {
+    // `rmSync` mit `recursive` steigt in das Ziel eines Verweises nicht ab.
+    // Wäre dem anders, könnte ein Verweis im Startordner auf ein beliebiges
+    // Verzeichnis des Hosts zeigen – und das Löschen eines Ordners wäre dann ein
+    // Löschen an ganz woanders.
+    const anderswo = join(root, 'anderswo');
+    mkdirSync(anderswo, { recursive: true });
+    writeFileSync(join(anderswo, 'x.txt'), 'x', 'utf8');
+    dateien.write(bot, root, 'mitverweis/a.py', '1');
+    symlinkSync(anderswo, quelle(root, 'mitverweis', 'verweis'));
+
+    dateien.remove(bot, root, 'mitverweis');
+    assert.ok(!existsSync(quelle(root, 'mitverweis')));
+    assert.ok(
+      existsSync(join(anderswo, 'x.txt')),
+      'das Ziel eines Verweises wurde mitgelöscht',
+    );
+  });
+
+  it('nimmt beim Löschen eines Ordners auch .env und .git mit', () => {
+    // Die Ausnahme beim Spiegeln gilt dem Inhalt, den der Bot bekommen soll –
+    // nicht dem Recht des Betreibers, seine eigenen Ordner zu leeren.
+    dateien.write(bot, root, 'mitgeheimnis/.env', 'GEHEIM=1');
+    dateien.write(bot, root, 'mitgeheimnis/.git/config', '[core]');
+    assert.equal(dateien.remove(bot, root, 'mitgeheimnis').ordner, true);
+    assert.ok(!existsSync(quelle(root, 'mitgeheimnis')));
+  });
+
+  it('weist einen Ordner zum Löschen ab, den es nicht gibt', () => {
+    assert.equal(dateien.remove(bot, root, 'gibt/es/nicht'), null);
+    assert.equal(dateien.remove(bot, root, '../../etc'), null);
+    assert.equal(dateien.remove(bot, root, '/etc'), null);
+  });
+
+  it('legt Ordner an – auch in mehreren Ebenen und mehrfach', () => {
+    // Mehrfach aufrufbar: der Explorer könnte denselben Namen zweimal vergeben,
+    // und eine Fehlermeldung wäre dann eine Lüge.
     assert.equal(dateien.makeDir(bot, root, 'neu'), true);
-    assert.equal(dateien.makeDir(bot, root, 'neu'), false);
+    assert.equal(dateien.makeDir(bot, root, 'neu'), true);
     assert.equal(statSync(quelle(root, 'neu')).mode & 0o777, 0o700);
+    assert.equal(dateien.makeDir(bot, root, 'tief/a/b/c'), true);
+    assert.ok(statSync(quelle(root, 'tief', 'a', 'b', 'c')).isDirectory());
+  });
+
+  it('legt keinen Ordner über eine Datei', () => {
+    dateien.write(bot, root, 'datei.txt', 'x');
+    assert.equal(dateien.makeDir(bot, root, 'datei.txt'), false);
+    assert.ok(statSync(quelle(root, 'datei.txt')).isFile());
+  });
+
+  it('verweigert ein Löschen, das die Grenze überschreiten würde', () => {
+    // Eine Grenze, die man erst beim Löschen merkt, ist keine Grenze. Also wird
+    // erst gezählt – und nichts gelöscht, solange das Ergebnis nicht feststeht.
+    const viel = quelle(root, 'viel');
+    mkdirSync(viel, { recursive: true });
+    for (let i = 0; i <= dateien.MAX_REMOVE_ENTRIES; i++)
+      writeFileSync(join(viel, `f${i}`), '', 'utf8');
+
+    assert.deepEqual(dateien.remove(bot, root, 'viel'), { ueberlimit: true });
+    assert.ok(existsSync(viel), 'der Ordner blieb unangetastet');
+  });
+});
+
+/**
+ * Das Auflisten bekommt für jeden Test einen frischen Startordner: es geht um
+ * die *Reihenfolge* und den *Umfang* der Liste, und beides ist nur zu prüfen,
+ * wenn genau die Dinge drinliegen, die der Test hingelegt hat.
+ */
+describe('Den Startordner auflisten', () => {
+  let root;
+  let bot;
+
+  beforeEach(() => {
+    ({ root, bot } = setup());
+    dateien.ensureStartFolder(bot, root);
+  });
+
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it('zeigt Ordner und Dateien', () => {
+    // Der Explorer navigiert mit dieser Liste: Ordner müssen drin stehen, sonst
+    // gäbe es kein Hineingehen. `.env` gehört nicht dazu – es wird gemeldet,
+    // nicht verschwiegen.
+    dateien.write(bot, root, 'a.py', '1');
+    dateien.write(bot, root, 'src/b.py', '2');
+    dateien.write(bot, root, '.env', 'GEHEIM=1');
+
+    const wurzel = dateien.list(bot, root);
+    assert.deepEqual(
+      wurzel.eintraege.map((f) => f.pfad),
+      ['src', 'a.py'],
+    );
+    assert.equal(wurzel.eintraege.find((f) => f.pfad === 'src').art, 'ordner');
+    assert.equal(wurzel.eintraege.find((f) => f.pfad === 'a.py').groesse, 1);
+    assert.equal(wurzel.ordner, '');
+    assert.ok(wurzel.uebersprungen.some((e) => e.includes('.env')));
+  });
+
+  it('zeigt, was in einem Unterordner liegt', () => {
+    dateien.write(bot, root, 'src/b.py', '2');
+    const drin = dateien.list(bot, root, 'src');
+    assert.deepEqual(
+      drin.eintraege.map((f) => f.pfad),
+      ['src/b.py'],
+    );
+    assert.equal(drin.eintraege[0].art, 'datei');
+    assert.equal(drin.ordner, 'src');
+    assert.deepEqual(drin.uebergeordnete, []);
+  });
+
+  it('sortiert Ordner vor Dateien und dann nach Namen', () => {
+    // Der Explorer ist eine Arbeitsfläche, keine Datenbank: wer hier nach einem
+    // Ordner sucht, klickt nicht durch drei Dateien hindurch, um ihn zu finden.
+    dateien.write(bot, root, 'zzz.py', '1');
+    dateien.write(bot, root, 'aaa.py', '1');
+    dateien.makeDir(bot, root, 'zordner');
+    dateien.makeDir(bot, root, 'aordner');
+    assert.deepEqual(
+      dateien.list(bot, root).eintraege.map((f) => f.name),
+      ['aordner', 'zordner', 'aaa.py', 'zzz.py'],
+    );
+  });
+
+  it('gibt null zurück, wenn es den Ordner nicht gibt', () => {
+    assert.equal(dateien.list(bot, root, 'gibt/es/nicht'), null);
+    // Ein Pfad, der nicht hineingehört, ist nicht etwa ein leerer Ordner,
+    // sondern eine Ablehnung: still nichts anzuzeigen wäre hier eine Lüge.
+    assert.equal(dateien.list(bot, root, '../../etc'), null);
+    assert.equal(dateien.list(bot, root, '/etc/shadow'), null);
+  });
+
+  it('nennt Verweise und Versionsordner nicht, aber meldet sie', () => {
+    const anderswo = join(root, 'anderswo');
+    mkdirSync(anderswo, { recursive: true });
+    symlinkSync(anderswo, quelle(root, 'verweis'));
+    mkdirSync(quelle(root, '.git'), { recursive: true });
+    dateien.write(bot, root, 'sichtbar.txt', 'x');
+
+    const ergebnis = dateien.list(bot, root);
+    assert.deepEqual(
+      ergebnis.eintraege.map((f) => f.name),
+      ['sichtbar.txt'],
+    );
+    assert.ok(ergebnis.uebersprungen.some((e) => e.includes('Verweis')));
+    assert.ok(ergebnis.uebersprungen.some((e) => e.includes('.git')));
   });
 });

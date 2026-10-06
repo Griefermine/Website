@@ -181,10 +181,15 @@ export const createBotHubApi = ({
       request('notify', { method: 'POST', body: { message, kind } }),
     registerPanel: (panel) =>
       request('panel', { method: 'POST', body: { panel } }),
-    callback: (url, callbackToken = accessToken) =>
+    callback: (url, callbackToken) =>
       request('callback', {
         method: 'POST',
-        body: { url, token: callbackToken },
+        // Kein Default auf den Runtime-Token: BOT_HUB_TOKEN ist ein
+        // Hub-Auth-Credential und darf nicht als Callback-Secret
+        // weitergereicht werden. Wer keinen separaten Token übergibt,
+        // registriert ohne Secret (Server speichert '').
+        body:
+          callbackToken === undefined ? { url } : { url, token: callbackToken },
       }),
 
     /**

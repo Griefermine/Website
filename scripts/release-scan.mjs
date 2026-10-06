@@ -24,7 +24,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { extname, join, resolve } from 'node:path';
 import process from 'node:process';
 
@@ -168,7 +168,7 @@ const ASSIGNMENT_PATTERNS = [
     // `\s` wäre falsch: es greift über den Zeilenumbruch hinweg und nähme dann
     // die nächste Zeile als Wert. `[^\S\r\n]` ist nur horizontaler Whitespace.
     muster:
-      /^[^\S\r\n]*(?:export[^\S\r\n]+)?(DISCORD_CLIENT_SECRET|DISCORD_BOT_TOKEN|BOT_HUB_TOKEN|BOT_HUB_SESSION_SECRET|BOT_HUB_DB_PASSWORD|BOT_HUB_ADMIN_DB_PASSWORD|MYSQL_PASSWORD|MYSQL_ROOT_PASSWORD)[^\S\r\n]*=[^\S\r\n]*(.+)$/gm,
+      /^[^\S\r\n]*(?:export[^\S\r\n]+)?(DISCORD_CLIENT_SECRET|DISCORD_CLIENT_TOKEN|DISCORD_BOT_TOKEN|BOT_HUB_TOKEN|BOT_HUB_SESSION_SECRET|BOT_HUB_DB_PASSWORD|BOT_HUB_ADMIN_DB_PASSWORD|MYSQL_PASSWORD|MYSQL_ROOT_PASSWORD)[^\S\r\n]*=[^\S\r\n]*(.+)$/gm,
     istPlatzhalter,
   },
   {
@@ -246,6 +246,57 @@ const tracked = () => {
   }
 };
 
+/** Release-Archive (*.tgz/*.tar.gz/*.zip im Root) auf Geheimnis-Pfade prüfen. */
+const scanArchiveNamen = () => {
+  const funde = [];
+  let eintraege = [];
+  try {
+    eintraege = readdirSync(ROOT);
+  } catch {
+    return funde;
+  }
+  for (const name of eintraege) {
+    if (!/\.(tgz|tar\.gz|zip)$/i.test(name)) continue;
+    const pfad = join(ROOT, name);
+    let liste = '';
+    try {
+      if (/\.zip$/i.test(name))
+        liste = execFileSync('unzip', ['-l', pfad], {
+          encoding: 'utf8',
+          maxBuffer: 8 * 1024 * 1024,
+        });
+      else
+        liste = execFileSync('tar', ['-tzf', pfad], {
+          encoding: 'utf8',
+          maxBuffer: 8 * 1024 * 1024,
+        });
+    } catch {
+      funde.push({
+        art: 'Release-Archiv',
+        pfad: name,
+        grund: 'Archiv lässt sich nicht auflisten – bitte manuell prüfen',
+      });
+      continue;
+    }
+    for (const line of liste.split('\n')) {
+      const rel = line.trim().split(/\s+/).pop() ?? '';
+      if (!rel) continue;
+      if (
+        /^\.env($|\.)/.test(rel) ||
+        rel.startsWith('data/') ||
+        rel.startsWith('data/secrets/') ||
+        /\.pem$|\.key$|\.p12$|\.pfx$|\.sqlite$|\.sql$|\.dump$/.test(rel)
+      )
+        funde.push({
+          art: 'Release-Archiv',
+          pfad: `${name}:${rel}`,
+          grund: 'Geheimnis-Pfad im Release-Archiv',
+        });
+    }
+  }
+  return funde;
+};
+
 /**
  * Dateien, die hier liegen, von Git aber ignoriert werden, und zu weit lesbar
  * sind. Kein Veröffentlichungsproblem – ein Rechnerproblem, deshalb nur eine
@@ -271,6 +322,7 @@ const lokaleWarnungen = () => {
 
 const fund = [];
 const geprueft = tracked();
+for (const eintrag of scanArchiveNamen()) fund.push(eintrag);
 
 if (geprueft) {
   for (const rel of geprueft) {

@@ -32,6 +32,10 @@ const DEFAULT_PERMISSIONS = [
   'panel.read',
   'panel.manage',
   'access.manage',
+  'files.read',
+  'files.write',
+  'files.upload',
+  'files.delete',
 ];
 const ACCESS_ROLES = {
   owner: DEFAULT_PERMISSIONS,
@@ -44,6 +48,10 @@ const ACCESS_ROLES = {
     'logs.read',
     'panel.read',
     'panel.manage',
+    'files.read',
+    'files.write',
+    'files.upload',
+    'files.delete',
   ],
   viewer: [],
 };
@@ -253,6 +261,7 @@ export const ensureAccessUser = (user) => {
       permissions: [
         ...(bootstrapOwner ? ACCESS_ROLES.owner : ACCESS_ROLES.viewer),
       ],
+      bots: {},
       updatedAt: Date.now(),
     };
     saveAccess();
@@ -265,23 +274,27 @@ export const ensureAccessUser = (user) => {
   return access.users[user.id];
 };
 
-export const hasPermission = (req, permission) => {
+export const hasPermission = (req, permission, options = {}) => {
   if (process.env.BOT_HUB_TEST_MODE === '1') return true;
   const user = currentUser(req);
   if (!user) return false;
   const entry = ensureAccessUser(user);
-  return effectivePermissions(entry).includes(permission);
+  return effectivePermissions(entry, options.botId).includes(permission);
 };
 
-const effectivePermissions = (entry) => {
+const effectivePermissions = (entry, botId) => {
   if (!entry || !Object.hasOwn(ACCESS_ROLES, entry.role)) return [];
   const allowed = new Set(ACCESS_ROLES[entry.role]);
-  return [...new Set(entry.permissions)].filter((permission) =>
+  const global = [...new Set(entry.permissions ?? [])].filter((permission) =>
     allowed.has(permission),
   );
+  if (!botId) return global;
+  const perBot = entry.bots?.[botId]?.permissions ?? [];
+  const merged = [...new Set([...global, ...perBot])];
+  return merged.filter((permission) => allowed.has(permission));
 };
 
-export const publicAccess = (userId) => {
+export const publicAccess = (userId, botId) => {
   const entry = access.users[userId];
   if (!entry) return null;
   return {
@@ -289,7 +302,8 @@ export const publicAccess = (userId) => {
     name: entry.name,
     username: entry.username,
     role: entry.role,
-    permissions: effectivePermissions(entry),
+    permissions: effectivePermissions(entry, botId),
+    bots: entry.bots ?? {},
     updatedAt: entry.updatedAt,
   };
 };
@@ -304,6 +318,7 @@ export const accessState = (req) => ({
       [...permissions],
     ]),
   ),
+  bots: [],
 });
 
 export const updateAccess = (id, input, actorId) => {
@@ -349,8 +364,19 @@ export const updateAccess = (id, input, actorId) => {
   const permissions = [...new Set(requestedPermissions)].filter((permission) =>
     allowed.has(permission),
   );
+  const requestedBots =
+    input.bots && typeof input.bots === 'object' ? input.bots : existing.bots ?? {};
+  const botsClean = {};
+  for (const [bid, cfg] of Object.entries(requestedBots)) {
+    if (!/^[A-Za-z0-9._-]{1,64}$/.test(bid)) continue;
+    const perms = Array.isArray(cfg?.permissions)
+      ? [...new Set(cfg.permissions.filter((p) => DEFAULT_PERMISSIONS.includes(p)))]
+      : [];
+    botsClean[bid] = { permissions: perms.filter((p) => allowed.has(p)) };
+  }
   existing.role = role;
   existing.permissions = permissions;
+  existing.bots = botsClean;
   existing.updatedAt = Date.now();
   saveAccess();
   return publicAccess(id);
@@ -381,7 +407,8 @@ export const authSession = (req) => {
     authenticated: Boolean(current),
     user: current?.user ?? null,
     guilds: current?.guilds ?? [],
-    permissions: effectivePermissions(permissions),
+    bots: permissions?.bots ?? {},
+    permissions: effectivePermissions(permissions, null),
     role: permissions?.role ?? null,
   };
 };

@@ -71,14 +71,17 @@ describe('Der Startordner über HTTP', () => {
     assert.equal(bot.startFolder, `bots/${bot.id}/startordner`);
     assert.ok(existsSync(startordner()));
     assert.equal(statSync(startordner()).mode & 0o777, 0o700);
-    assert.equal(bot.fileCount, 0);
+    // Jeder neue Bot bekommt die Beispiel-Webseite (bot-hub.json + panel/).
+    assert.equal(bot.fileCount, 4);
+    assert.ok(existsSync(startordner('bot-hub.json')));
+    assert.ok(existsSync(startordner('panel', 'index.html')));
   });
 
   it('nennt in der Botliste den Pfad und die Zahl der Dateien', async () => {
     const { data } = await call('/bots');
     const gelistet = data.bots.find((b) => b.id === bot.id);
     assert.equal(gelistet.startFolder, `bots/${bot.id}/startordner`);
-    assert.equal(gelistet.fileCount, 0);
+    assert.equal(gelistet.fileCount, 4);
   });
 
   it('nimmt eine hochgeladene Datei sofort in den Workspace', async () => {
@@ -101,9 +104,34 @@ describe('Der Startordner über HTTP', () => {
     });
     assert.ok(existsSync(workspace('src', 'hilfe.py')));
     const { data } = await call(`/bots/${bot.id}/files`);
-    const pfade = data.dateien.map((f) => f.pfad);
-    assert.deepEqual(pfade, ['bot.py', 'src/hilfe.py']);
-    assert.equal(data.dateien.find((f) => f.pfad === 'bot.py').groesse, 14);
+    assert.deepEqual(
+      data.eintraege.map((f) => f.pfad),
+      ['panel', 'src', 'bot-hub.json', 'bot.py'],
+    );
+    assert.equal(data.eintraege[0].art, 'ordner');
+    assert.equal(data.eintraege.find((f) => f.pfad === 'bot.py').groesse, 14);
+  });
+
+  it('listet einen Unterordner für sich', async () => {
+    // Der Explorer navigiert mit `?pfad=`; die Wurzel antwortet mit allem, was
+    // oben liegt, ein Unterordner nur mit seinem eigenen Inhalt.
+    const { status, data } = await call(
+      `/bots/${bot.id}/files?pfad=${encodeURIComponent('src')}`,
+    );
+    assert.equal(status, 200);
+    assert.equal(data.ordner, 'src');
+    assert.deepEqual(
+      data.eintraege.map((f) => f.pfad),
+      ['src/hilfe.py'],
+    );
+  });
+
+  it('meldet einen Ordner, den es nicht gibt, als solchen', async () => {
+    const { status, data } = await call(
+      `/bots/${bot.id}/files?pfad=gibt%2Fes%2Fnicht`,
+    );
+    assert.equal(status, 404);
+    assert.match(data.error, /gibt es nicht/);
   });
 
   it('liest eine Datei wieder', async () => {
@@ -119,7 +147,7 @@ describe('Der Startordner über HTTP', () => {
       body: { uebernehmen: true },
     });
     assert.equal(data.files.kopiert, 0);
-    assert.equal(data.files.unveraendert, 2);
+    assert.equal(data.files.unveraendert, 6);
   });
 
   it('übernimmt beim Speichern, was der Betreiber von Hand geändert hat', async () => {
@@ -170,7 +198,7 @@ describe('Der Startordner über HTTP', () => {
     assert.ok(existsSync(workspace('node_modules', 'discord.js', 'index.js')));
   });
 
-  it('legt einen Ordner auf Zuruf an', async () => {
+  it('legt einen Ordner auf Zuruf an – auch in mehreren Ebenen', async () => {
     const { status } = await call(`/bots/${bot.id}/files`, {
       method: 'POST',
       body: { ordner: 'daten' },
@@ -178,6 +206,20 @@ describe('Der Startordner über HTTP', () => {
     assert.equal(status, 201);
     assert.ok(existsSync(startordner('daten')));
     assert.equal(statSync(startordner('daten')).mode & 0o777, 0o700);
+
+    const tief = await call(`/bots/${bot.id}/files`, {
+      method: 'POST',
+      body: { ordner: 'daten/roh/2026' },
+    });
+    assert.equal(tief.status, 201);
+    assert.ok(statSync(startordner('daten', 'roh', '2026')).isDirectory());
+
+    // Und noch einmal: ein Ordner, der schon da ist, ist kein Fehler.
+    const nochmal = await call(`/bots/${bot.id}/files`, {
+      method: 'POST',
+      body: { ordner: 'daten' },
+    });
+    assert.equal(nochmal.status, 201);
   });
 });
 
@@ -241,16 +283,42 @@ describe('Der Startordner weist zu', () => {
     assert.ok(statSync(startordner('ordner')).isDirectory());
   });
 
+  it('legt keinen Ordner über eine Datei an', async () => {
+    await call(`/bots/${bot.id}${pfad('bot.py')}`, {
+      method: 'PUT',
+      body: { inhalt: 'print("x")' },
+    });
+    const { status } = await call(`/bots/${bot.id}/files`, {
+      method: 'POST',
+      body: { ordner: 'bot.py' },
+    });
+    assert.equal(status, 400);
+    assert.ok(statSync(startordner('bot.py')).isFile());
+  });
+
   it('verweigert ein Löschen, das den Ordner leeren würde', async () => {
     await call(`/bots/${bot.id}${pfad('voll/a.txt')}`, {
       method: 'PUT',
       body: { inhalt: 'a' },
     });
-    const { status } = await call(`/bots/${bot.id}${pfad('voll')}`, {
+    await call(`/bots/${bot.id}${pfad('voll/tief/b.txt')}`, {
+      method: 'PUT',
+      body: { inhalt: 'b' },
+    });
+    const { status, data } = await call(`/bots/${bot.id}${pfad('voll')}`, {
       method: 'DELETE',
     });
-    assert.equal(status, 404);
-    assert.ok(existsSync(startordner('voll', 'a.txt')));
+    // Ein Ordner ist im Explorer *eine* Zeile, und löschen heisst dort
+    // „dieser Ordner samt Inhalt“. 404 wäre die Antwort auf die alte Frage
+    // „darf dieser Ordner leer werden?“ – die stellt niemand mehr.
+    assert.equal(status, 200);
+    assert.equal(data.ordnerGeloescht, true);
+    assert.equal(data.entfernt, 3, '2 Dateien und 1 Ordner');
+    assert.ok(!existsSync(startordner('voll')));
+    // Und beides ist auch aus dem Workspace verschwunden: die Merkliste
+    // entscheidet das beim Spiegeln, nicht die Anfrage.
+    assert.equal(data.files.entfernt, 2);
+    assert.ok(!existsSync(workspace('voll')));
   });
 
   it('übernimmt die Dateien, bevor der Bot startet', async () => {
@@ -277,9 +345,13 @@ describe('Der Startordner weist zu', () => {
     const { data } = await call(`/bots/${bot.id}/files`);
     assert.equal(data.startordner, `bots/${bot.id}/startordner`);
     // Es wird nichts zurückgegeben, was nicht im Startordner liegt.
-    assert.deepEqual(data.dateien.map((f) => f.pfad).sort(), [
+    // (src/hilfe.py wurde weiter oben gelöscht, leere Ordner räumt der Hub weg.)
+    assert.deepEqual(data.eintraege.map((f) => f.pfad).sort(), [
+      'bot-hub.json',
       'bot.py',
-      'voll/a.txt',
+      'daten',
+      'ordner',
+      'panel',
     ]);
   });
 });

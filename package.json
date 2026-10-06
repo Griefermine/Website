@@ -13,7 +13,7 @@
     "start": "node server/index.js",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "node --test test/api.test.js && node --test test/panel.test.js && node --test test/secrets.test.js && node --test test/startup.test.js && node --test test/containers.test.js && node --test test/commands.test.js && node --test test/quota.test.js && node --test test/botFiles.test.js && node --test test/botFiles-api.test.js && node --test test/mysql.test.js && node --test test/database.test.js",
+    "test": "node --test test/api.test.js && node --test test/panel.test.js && node --test test/secrets.test.js && node --test test/startup.test.js && node --test test/containers.test.js && node --test test/commands.test.js && node --test test/quota.test.js && node --test test/botFiles.test.js && node --test test/botFiles-api.test.js && node --test test/startFolder.test.js && node --test test/mysql.test.js && node --test test/database.test.js && node --test test/security-v19.test.js && node --test test/panel-scaffold.test.js",
     "test:mysql": "BOT_HUB_TEST_MYSQL=1 BOT_HUB_TEST_MYSQL_CONTAINER=1 node --test test/database-mysql.test.js",
     "test:mysql-container": "node --test test/mysql-container.test.js",
     "release:scan": "node scripts/release-scan.mjs"

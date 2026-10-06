@@ -31,6 +31,24 @@
     'JetBrains Sans', ui-sans-serif, system-ui, -apple-system, 'Segoe UI',
     sans-serif;
   --mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+  --accent-orange: #ff9a40;
+  --accent-orange-8: color-mix(in srgb, var(--accent-orange) 8%, transparent);
+  --accent-orange-12: color-mix(in srgb, var(--accent-orange) 12%, transparent);
+  --accent-orange-16: color-mix(in srgb, var(--accent-orange) 16%, transparent);
+  --accent-orange-20: color-mix(in srgb, var(--accent-orange) 20%, transparent);
+  --accent-orange-28: color-mix(in srgb, var(--accent-orange) 28%, transparent);
+  --accent-orange-40: color-mix(in srgb, var(--accent-orange) 40%, transparent);
+  --rim-orange-top: radial-gradient(
+    140% 120% at 50% 0%,
+    var(--accent-orange-16) 0%,
+    var(--accent-orange-8) 38%,
+    transparent 72%
+  );
+  --rim-orange-soft: radial-gradient(
+    120% 120% at 50% 50%,
+    var(--accent-orange-12) 0%,
+    transparent 70%
+  );
 }
 
 * {
@@ -192,10 +210,32 @@ h3 {
 }
 
 .btn--primary {
+  position: relative;
+  isolation: isolate;
   background: linear-gradient(135deg, var(--accent), #7c3aed);
   border-color: transparent;
   color: #fff;
   box-shadow: 0 14px 30px -16px rgba(124, 58, 237, 0.9);
+}
+.btn--primary::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: var(--rim-orange-soft);
+  opacity: 0.5;
+  transition: opacity 0.15s ease;
+}
+.btn--primary:hover::after {
+  opacity: 0.65;
+}
+.btn--primary:active::after {
+  opacity: 0.55;
+}
+.btn--primary:focus-visible {
+  outline: 2px solid var(--accent-orange-40);
+  outline-offset: 2px;
 }
 
 .btn--primary:hover:not(:disabled) {
@@ -354,6 +394,8 @@ h3 {
 }
 
 .panel {
+  position: relative;
+  isolation: isolate;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -364,6 +406,17 @@ h3 {
   flex-direction: column;
   gap: 16px;
   min-width: 0;
+}
+.panel::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: -1;
+  background: var(--rim-orange-top);
+  mask: radial-gradient(120% 80% at 50% 0%, black 0%, transparent 70%);
+  opacity: 0.9;
 }
 
 .panel__head {
@@ -464,8 +517,27 @@ select.input {
 }
 
 .chip.is-active {
+  position: relative;
+  isolation: isolate;
   background: linear-gradient(135deg, var(--accent), #7c3aed);
   color: #fff;
+}
+.chip.is-active::after {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  pointer-events: none;
+  background: var(--rim-orange-soft);
+  opacity: 0.45;
+  transition: opacity 0.15s ease;
+}
+.chip.is-active:hover::after {
+  opacity: 0.6;
+}
+.chip.is-active:focus-visible {
+  outline: 2px solid var(--accent-orange-40);
+  outline-offset: 2px;
 }
 
 /* ---------------------------- Bot-Karten ---------------------------- */
@@ -477,6 +549,7 @@ select.input {
 
 .bot-card {
   position: relative;
+  isolation: isolate;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -493,6 +566,17 @@ select.input {
     transform 0.2s ease,
     border-color 0.2s ease,
     box-shadow 0.2s ease;
+}
+.bot-card::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: -1;
+  background: var(--rim-orange-top);
+  mask: radial-gradient(130% 70% at 50% 0%, black 0%, transparent 72%);
+  opacity: 0.85;
 }
 
 .bot-card::before {
@@ -793,11 +877,27 @@ select.input {
 }
 
 .access-user {
+  position: relative;
+  isolation: isolate;
   display: flex;
   flex-direction: column;
   gap: 10px;
   margin-bottom: 14px;
   padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(8, 9, 13, 0.55);
+}
+.access-user::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: -1;
+  background: var(--rim-orange-top);
+  mask: radial-gradient(130% 68% at 50% 0%, black 0%, transparent 74%);
+  opacity: 0.8;
 }
 
 .modal__head h2 {
@@ -959,6 +1059,30 @@ select.input {
   color: #e5534b;
 }
 
+/* Der Abschnitt nimmt Dateien an, nicht nur der Explorer dahinter. Der Rand ist
+   im Ruhezustand ganz schwach: Wer hier nichts hinzuziehen hat, soll den Bereich
+   nicht als Ablagefläche lesen – wer etwas hereinträgt, soll es sofort sehen. */
+.start-folder__ablegen {
+  padding: 7px 10px;
+  border: 1px dashed #232a36;
+  border-radius: 8px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: #6b7488;
+}
+
+.start-folder--zieht {
+  border-radius: 9px;
+  outline: 2px dashed var(--accent);
+  outline-offset: 3px;
+}
+
+.start-folder--zieht .start-folder__ablegen {
+  border-color: var(--accent);
+  background: rgba(88, 101, 242, 0.1);
+  color: var(--text);
+}
+
 /* Steht links, die Knöpfe bleiben rechts: die Fussnote sagt, was man da
    bearbeitet – nach dem Klick wären die Knöpfe das Erste, was man sucht. */
 .start-folder__fussnote {
@@ -974,6 +1098,166 @@ select.input {
   font-size: 12.5px;
   line-height: 1.55;
   resize: vertical;
+}
+
+/* Der Explorer: ein Fenster, in das man seinen Projektordner zieht. Er hat in
+   einem Modal nichts verloren, weil es Höhe und Breite braucht – der Weg, die
+   Werkzeuge und die Liste wollen alle Platz, und wer sie untereinander stapelt,
+   sieht auf einem kleinen Bildschirm nur noch den Weg. */
+.explorer {
+  width: min(880px, calc(100vw - 32px));
+}
+
+.explorer__werkzeug {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.modal__head--werkzeug {
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.modal__foot--werkzeug {
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.explorer__koerper {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Der Weg ist kein Text, sondern eine Folge von Sprüngen: jeder Abschnitt führt
+   dorthin, wo man schon war. */
+.explorer__weg {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1px;
+  font-size: 12px;
+}
+
+.explorer__krume {
+  padding: 2px 7px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: #8b949e;
+  font: inherit;
+  cursor: pointer;
+}
+
+.explorer__krume:hover {
+  background: #1b212b;
+  color: var(--text);
+}
+
+.explorer__krume--hier {
+  color: var(--text);
+}
+
+.explorer__trenner {
+  color: #4a5364;
+}
+
+.explorer__weg-hinweis {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: #6b7488;
+}
+
+.explorer__liste {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 4px;
+  /* Sichtbare Mindesthöhe: eine leere Liste, die sofort zusammenschrumpft,
+     sieht aus wie ein Fehler – hier ist nur noch nichts hochgeladen. */
+  min-height: 180px;
+  border-radius: 8px;
+  background: #10131a;
+}
+
+.explorer__zeile {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 6px;
+  border-radius: 7px;
+}
+
+.explorer__zeile:hover {
+  background: #161b24;
+}
+
+/* Der Name ist ein Knopf: ein Ordner wird zum Aufgehen, eine Datei zum
+   Bearbeiten. Ohne wäre der Explorer eine Liste zum Ansehen, und jede Zeile
+   bräuchte ihre eigene Knopfzeile. */
+.explorer__name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 3px 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.explorer__icon {
+  flex: none;
+}
+
+.explorer__beschriftung {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.explorer__meta {
+  font-size: 11px;
+  color: #6b7488;
+  white-space: nowrap;
+}
+
+/* Der Zustand beim Ziehen muss den ganzen Fensterfüllen: es geht nicht darum,
+   wo der Ordner landet, sondern dass es überhaupt irgendwo landet. */
+.explorer--zieht .explorer__liste {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+  background: rgba(88, 101, 242, 0.08);
+}
+
+.explorer__neu {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+/* `display: flex` schlägt das `display: none`, das der Browser aus `hidden`
+   macht – ohne diese Zeile bliebe das Formular immer sichtbar. */
+.explorer__neu[hidden] {
+  display: none;
+}
+
+.explorer__neu .input {
+  flex: 1 1 240px;
+  width: auto;
+  font-size: 12.5px;
 }
 
 .env-list {
@@ -1323,7 +1607,89 @@ select.input {
   flex-wrap: wrap;
 }
 
+.access-subtitle {
+  margin: var(--space-3) 0 var(--space-2);
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.access-bot-perms {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.access-empty {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: 0.95rem;
+}
+
+.access-bot-block {
+  position: relative;
+  isolation: isolate;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elevated);
+  padding: var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.access-bot-block::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: -1;
+  background: var(--rim-orange-top);
+  mask: radial-gradient(130% 68% at 50% 0%, black 0%, transparent 74%);
+  opacity: 0.8;
+}
+
+.access-bot-block__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.access-bot-block__head h4 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.access-bot-add {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  margin-top: var(--space-2);
+  padding: var(--space-2);
+  border-radius: var(--radius);
+  background: var(--bg-secondary);
+}
+
+.access-bot-add select {
+  flex: 1;
+}
+
+.access-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+
 .bot-card__page {
+  position: relative;
+  isolation: isolate;
   appearance: none;
   align-self: flex-start;
   border: 1px solid var(--line-strong);
@@ -1342,6 +1708,23 @@ select.input {
   transition:
     border-color 0.2s ease,
     transform 0.2s ease;
+}
+.bot-card__page::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: var(--rim-orange-soft);
+  opacity: 0.4;
+  transition: opacity 0.15s ease;
+}
+.bot-card__page:hover::after {
+  opacity: 0.55;
+}
+.bot-card__page:focus-visible {
+  outline: 2px solid var(--accent-orange-40);
+  outline-offset: 2px;
 }
 
 .bot-card__page:hover {
