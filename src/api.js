@@ -71,6 +71,7 @@ export const api = {
   health: () => request('/health'),
   languages: () => request('/languages'),
   list: () => request('/bots'),
+  bots: () => request('/bots'),
   create: (config) => request('/bots', { method: 'POST', body: config }),
   update: (id, config) =>
     request(`/bots/${id}`, { method: 'PATCH', body: config }),
@@ -84,8 +85,15 @@ export const api = {
   logs: (id, tail = 200) =>
     request(`${id ? `/bots/${id}` : ''}/logs?tail=${tail}`),
 
-  /** Dateien im Startordner: auflisten, lesen, schreiben, löschen. */
-  files: (id) => request(`/bots/${encodeURIComponent(id)}/files`),
+  /**
+   * Dateien im Startordner. `pfad` ist der Ordner, der aufgelistet werden soll –
+   * leer für die Wurzel, aus der der Explorer startet und in die er nach einem
+   * Hochladen von Dateien zurückkehrt.
+   */
+  files: (id, pfad = '') =>
+    request(
+      `/bots/${encodeURIComponent(id)}/files?pfad=${encodeURIComponent(pfad)}`,
+    ),
   fileRead: (id, path) =>
     request(`/bots/${encodeURIComponent(id)}/files/${encodePath(path)}`),
   fileWrite: (id, path, inhalt) =>

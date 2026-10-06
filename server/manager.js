@@ -71,6 +71,7 @@ import {
   execArgs,
   stopContainer,
 } from './containers.js';
+import { ensurePanelScaffold } from './panelScaffold.js';
 
 const PROJECT_ROOT = resolve(process.env.BOT_DASHBOARD_ROOT || process.cwd());
 const DATA_FILE = join(PROJECT_ROOT, 'data', 'bots.json');
@@ -85,19 +86,38 @@ const MAX_BOTS = 24;
  */
 const MAX_FILE_BODY_BYTES = dateien.MAX_FILE_BYTES * 2;
 const INSTALL_TIMEOUT = 15 * 60 * 1000;
+// Upload-Limits (V19 #5/#14): pro Bot+Session/IP/Route begrenzt.
+const MAX_UPLOADS_PER_MINUTE = 60;
+const MAX_UPLOAD_BYTES_PER_MINUTE = 8 * 1024 * 1024;
+const MAX_CONCURRENT_UPLOADS = 4;
+const MAX_ACTIVE_UPLOADS = 256;
+const MAX_RATE_BUCKETS = 10_000;
+const MAX_PENDING_OUTPUT = 8 * 1024;
+const uploadBytes = new Map();
+const concurrentUploads = new Map();
+let activeUploadCount = 0;
 const rateBuckets = new Map();
 const rateLimit = (req, url) => {
   if (process.env.BOT_HUB_TEST_MODE === '1') return null;
   const path = url.pathname;
   let limit = 0;
-  if (/^\/api\/auth\/discord\/(?:login|callback)$/.test(path)) limit = 30;
-  else if (
+  let rateClass = '';
+  if (/^\/api\/auth\/discord\/(?:login|callback)$/.test(path)) {
+    limit = 30;
+    rateClass = 'auth';
+  } else if (
     /\/panel\/commands(?:\/|$)/.test(path) ||
     /\/(?:start|restart|install)(?:\/|$)/.test(path)
-  )
+  ) {
     limit = 60;
-  else if (/^\/api\/hub(?:\/|$)/.test(path)) limit = 120;
-  else return null;
+    rateClass = 'actions';
+  } else if (/^\/api\/hub(?:\/|$)/.test(path)) {
+    limit = 120;
+    rateClass = 'hub';
+  } else if (/\/files(?:\/|$)/.test(path)) {
+    limit = MAX_UPLOADS_PER_MINUTE;
+    rateClass = 'files';
+  } else return null;
   const now = Date.now();
   const trustedProxies = new Set(
     String(process.env.BOT_HUB_TRUSTED_PROXIES ?? '')
@@ -112,10 +132,11 @@ const rateLimit = (req, url) => {
     .split(',')
     .pop()
     .trim();
-  const botId = path.split('/')[3] ?? '';
-  const key = `${ip}:${botId}:${path.split('/').slice(0, 6).join('/')}`;
+  const key = `${ip}:${rateClass}`;
   const bucket = rateBuckets.get(key);
   if (!bucket || bucket.expiresAt <= now) {
+    if (!bucket && rateBuckets.size >= MAX_RATE_BUCKETS)
+      return httpError(429, 'Zu viele Anfragen');
     rateBuckets.set(key, { count: 1, expiresAt: now + 60_000 });
     return null;
   }
@@ -132,8 +153,72 @@ const rateCleanup = setInterval(() => {
   for (const [key, bucket] of rateBuckets) {
     if (bucket.expiresAt <= now) rateBuckets.delete(key);
   }
+  for (const [key, bucket] of uploadBytes) {
+    if (bucket.expiresAt <= now) uploadBytes.delete(key);
+  }
 }, 60_000);
 rateCleanup.unref();
+
+const uploadKeyOf = (req, url) => {
+  const remote = String(req.socket.remoteAddress ?? '');
+  const cookie = String(req.headers.cookie ?? '');
+  const session =
+    cookie
+      .split(';')
+      .map((p) => p.trim())
+      .find((p) => p.startsWith('bot_hub_session=')) ?? remote;
+  const botId = url.pathname.split('/')[3] ?? '';
+  return `${session}:${botId}:${remote}`;
+};
+
+const takeUploadSlot = (req, url) => {
+  if (process.env.BOT_HUB_TEST_MODE === '1') return null;
+  const key = uploadKeyOf(req, url);
+  const now = Date.now();
+  const cur = concurrentUploads.get(key) ?? 0;
+  if (
+    cur >= MAX_CONCURRENT_UPLOADS ||
+    activeUploadCount >= MAX_ACTIVE_UPLOADS
+  ) {
+    const error = httpError(
+      429,
+      'Zu viele parallele Uploads – bitte kurz warten.',
+    );
+    error.retryAfter = 5;
+    return error;
+  }
+  concurrentUploads.set(key, cur + 1);
+  activeUploadCount += 1;
+  return key;
+};
+
+const releaseUploadSlot = (key) => {
+  if (!key) return;
+  const cur = concurrentUploads.get(key) ?? 1;
+  activeUploadCount = Math.max(0, activeUploadCount - 1);
+  if (cur <= 1) concurrentUploads.delete(key);
+  else concurrentUploads.set(key, cur - 1);
+};
+
+const takeUploadBytes = (req, url, incomingBytes) => {
+  if (process.env.BOT_HUB_TEST_MODE === '1') return null;
+  const key = uploadKeyOf(req, url);
+  const now = Date.now();
+  const bucket = uploadBytes.get(key);
+  if (!bucket || bucket.expiresAt <= now) {
+    if (!bucket && uploadBytes.size >= MAX_RATE_BUCKETS)
+      return httpError(429, 'Zu viele Upload-Anfragen');
+    uploadBytes.set(key, { bytes: incomingBytes, expiresAt: now + 60_000 });
+    return null;
+  }
+  bucket.bytes += incomingBytes;
+  if (bucket.bytes > MAX_UPLOAD_BYTES_PER_MINUTE) {
+    const error = httpError(429, 'Upload-Volumen pro Minute überschritten.');
+    error.retryAfter = Math.ceil((bucket.expiresAt - now) / 1000);
+    return error;
+  }
+  return null;
+};
 
 const bots = new Map();
 const listeners = new Set();
@@ -515,6 +600,41 @@ const pushLine = (botId, stream, line) => {
 
 const pushOutput = (botId, stream, buffer) => {
   for (const line of buffer.split(/\r?\n/)) pushLine(botId, stream, line);
+};
+
+// Keep an unterminated child-process line bounded while still accepting later
+// lines after an oversized one is discarded.
+const outputLineReader = (botId, stream) => {
+  let pending = '';
+  let discarding = false;
+  return {
+    write(data) {
+      const text = data.toString();
+      let start = 0;
+      for (let i = 0; i < text.length; i += 1) {
+        if (text[i] !== '\n') continue;
+        if (discarding) {
+          discarding = false;
+        } else {
+          const line = `${pending}${text.slice(start, i)}`.replace(/\r$/, '');
+          pushLine(botId, stream, line);
+        }
+        pending = '';
+        start = i + 1;
+      }
+      if (discarding) return;
+      pending += text.slice(start);
+      if (pending.length > MAX_PENDING_OUTPUT) {
+        pushLine(botId, stream, '[Ausgabezeile wegen Größenlimit gekürzt]');
+        pending = '';
+        discarding = true;
+      }
+    },
+    flush() {
+      if (!discarding && pending.trim()) pushLine(botId, stream, pending);
+      pending = '';
+    },
+  };
 };
 
 const broadcast = (type, payload) => {
@@ -918,20 +1038,10 @@ const runCommand = (
     );
     bot.busy = child;
 
-    let pendingOut = '';
-    let pendingErr = '';
-    child.stdout.on('data', (data) => {
-      pendingOut += data.toString();
-      const parts = pendingOut.split(/\r?\n/);
-      pendingOut = parts.pop() ?? '';
-      pushOutput(bot.id, 'deps', parts.join('\n'));
-    });
-    child.stderr.on('data', (data) => {
-      pendingErr += data.toString();
-      const parts = pendingErr.split(/\r?\n/);
-      pendingErr = parts.pop() ?? '';
-      pushOutput(bot.id, 'deps', parts.join('\n'));
-    });
+    const outputReader = outputLineReader(bot.id, 'deps');
+    const errorReader = outputLineReader(bot.id, 'deps');
+    child.stdout.on('data', (data) => outputReader.write(data));
+    child.stderr.on('data', (data) => errorReader.write(data));
 
     const killer = setTimeout(() => {
       pushLine(
@@ -953,8 +1063,8 @@ const runCommand = (
     child.on('exit', (code) => {
       clearTimeout(killer);
       if (bot.busy === child) bot.busy = null;
-      if (pendingOut.trim()) pushLine(bot.id, 'deps', pendingOut);
-      if (pendingErr.trim()) pushLine(bot.id, 'deps', pendingErr);
+      outputReader.flush();
+      errorReader.flush();
       resolveRun({ code: code ?? -1 });
     });
   });
@@ -1121,20 +1231,10 @@ const spawnBot = (bot, dir, language) => {
   }
 
   bot.child = child;
-  let pendingOut = '';
-  let pendingErr = '';
-  child.stdout.on('data', (data) => {
-    pendingOut += data.toString();
-    const parts = pendingOut.split(/\r?\n/);
-    pendingOut = parts.pop() ?? '';
-    pushOutput(bot.id, 'stdout', parts.join('\n'));
-  });
-  child.stderr.on('data', (data) => {
-    pendingErr += data.toString();
-    const parts = pendingErr.split(/\r?\n/);
-    pendingErr = parts.pop() ?? '';
-    pushOutput(bot.id, 'stderr', parts.join('\n'));
-  });
+  const outputReader = outputLineReader(bot.id, 'stdout');
+  const errorReader = outputLineReader(bot.id, 'stderr');
+  child.stdout.on('data', (data) => outputReader.write(data));
+  child.stderr.on('data', (data) => errorReader.write(data));
 
   child.on('error', (error) => {
     pushLine(bot.id, 'system', `Prozessfehler: ${error.message}`);
@@ -1143,10 +1243,8 @@ const spawnBot = (bot, dir, language) => {
   child.on('exit', (code, signal) => {
     bot.child = null;
     revokeRuntimeToken(bot.id);
-    if (pendingOut.trim()) pushLine(bot.id, 'stdout', pendingOut);
-    if (pendingErr.trim()) pushLine(bot.id, 'stderr', pendingErr);
-    pendingOut = '';
-    pendingErr = '';
+    outputReader.flush();
+    errorReader.flush();
     if (containerRuntimeEnabled()) stopContainer(bot).catch(() => {});
     pushLine(
       bot.id,
@@ -1361,7 +1459,24 @@ const load = () => {
     );
     for (const config of parsed.slice(0, MAX_BOTS)) {
       if (!config?.id || !config?.name) continue;
-      bots.set(config.id, hydrate(config));
+      const bot = hydrate(config);
+      bots.set(config.id, bot);
+      // Bestehende Bots ohne Webseite bekommen das Beispiel-Scaffold.
+      // Idempotent: vorhandene bot-hub.json/panel-Dateien bleiben unangetastet.
+      // Fehler werden geloggt, verhindern aber nie den Start (Verfügbarkeit
+      // geht vor Beispielseite; der Bot selbst ist vollständig).
+      try {
+        const { created, error } = ensurePanelScaffold(bot, PROJECT_ROOT);
+        if (error)
+          console.warn(
+            `[hub] Beispiel-Webseite für ${config.id} unvollständig: ${error}`,
+          );
+        else if (created.length) uebernehmen(bot);
+      } catch (error) {
+        console.warn(
+          `[hub] Beispiel-Webseite für ${config.id} fehlgeschlagen: ${error?.message ?? error}`,
+        );
+      }
     }
     if (withSecrets) {
       schedulePersist();
@@ -1423,11 +1538,16 @@ const normaliseConfig = (input, existing) => {
 /**
  * Der Startordner über HTTP.
  *
- *   GET    /api/bots/:id/files              auflisten
+ *   GET    /api/bots/:id/files?pfad=…        einen Ordner auflisten
  *   GET    /api/bots/:id/files/<pfad>       eine Datei lesen
  *   PUT    /api/bots/:id/files/<pfad>       schreiben, dann spiegeln
  *   DELETE /api/bots/:id/files/<pfad>       löschen, dann spiegeln
  *   POST   /api/bots/:id/files              Ordner anlegen oder übernehmen
+ *
+ * `DELETE` unterscheidet nicht zwischen Datei und Ordner: was der Explorer als
+ * eine Zeile zeigt, wird als ein Zug gelöscht. Im Workspace verschwindet
+ * danach nur, was der Hub selbst dorthin geschrieben hat – die Merkliste
+ * entscheidet das, nicht die Anfrage.
  *
  * Der Pfad wird aus dem Pfadnamen der URL gelesen und wieder zusammengesetzt –
  * jeder Abschnitt einzeln dekodiert, damit ein Schrägstrich in einem Dateinamen
@@ -1450,51 +1570,107 @@ const handleFileRoutes = async (req, res, url, bot) => {
     .map((teil) => decodeURIComponent(teil))
     .join('/');
 
+  /** Der Ordner, den eine Liste zeigen soll – aus der Anfrage, sonst die Wurzel. */
+  const gewaehlterOrdner = () => url.searchParams.get('pfad') ?? '';
+
+  const auflisten = (antwort) => {
+    const inhalt = dateien.list(bot, PROJECT_ROOT, gewaehlterOrdner());
+    // Die Liste ist die Antwort, kein Beiwerk: sie geht bei jedem Schreibvorgang
+    // mit, damit die Oberfläche nach einem Löschen nicht mit einem Bildschirm
+    // voller Einträge zurückbleibt, die es nicht mehr gibt.
+    if (!inhalt) throw httpError(404, 'Dieser Ordner gibt es nicht (mehr)');
+    return sendJson(res, antwort.status, { ...antwort.body, ...inhalt });
+  };
+
+  const braucht = (recht) => {
+    if (!hasPermission(req, recht, { botId: bot.id }))
+      throw httpError(403, `Berechtigung fehlt: ${recht}`);
+  };
+
   if (!pfad) {
-    if (req.method === 'GET')
-      return sendJson(res, 200, {
-        startordner: dateien.startFolderOf(bot),
-        ...dateien.list(bot, PROJECT_ROOT),
+    if (req.method === 'GET') {
+      braucht('files.read');
+      return auflisten({
+        status: 200,
+        body: { startordner: dateien.startFolderOf(bot) },
       });
+    }
     if (req.method === 'POST') {
       const body = await readBody(req, MAX_FILE_BODY_BYTES);
-      if (body.uebernehmen === true || body.ordner === undefined)
+      if (body.uebernehmen === true || body.ordner === undefined) {
+        braucht('files.write');
         return sendJson(res, 200, { files: uebernehmen(bot) });
-      if (
-        typeof body.ordner !== 'string' ||
-        !dateien.makeDir(bot, PROJECT_ROOT, body.ordner)
-      )
-        throw httpError(400, 'Dieser Ordner kann nicht angelegt werden');
-      return sendJson(res, 201, { ...dateien.list(bot, PROJECT_ROOT) });
+      }
+      braucht('files.write');
+      const ok = await dateien.withBotLock(bot.id, async () => {
+        if (
+          typeof body.ordner !== 'string' ||
+          !dateien.makeDir(bot, PROJECT_ROOT, body.ordner)
+        )
+          return false;
+        return true;
+      });
+      if (!ok) throw httpError(400, 'Dieser Ordner kann nicht angelegt werden');
+      return auflisten({ status: 201, body: { angelegt: body.ordner } });
     }
     throw httpError(405, 'Methode nicht erlaubt');
   }
 
   if (req.method === 'GET') {
+    braucht('files.read');
     const datei = dateien.read(bot, PROJECT_ROOT, pfad);
     if (!datei) throw httpError(404, 'Datei nicht gefunden');
     return sendJson(res, 200, { pfad, ...datei });
   }
   if (req.method === 'PUT') {
-    const body = await readBody(req, MAX_FILE_BODY_BYTES);
-    // Nur Text. Binärdaten (Bilder, .jar) haben hier keinen Platz, und eine
-    // Base64-Hülle täuscht hier eine Dateigrösse vor, die keine ist.
-    if (typeof body.inhalt !== 'string')
-      throw httpError(400, 'Nur Textdateien sind erlaubt');
-    if (!dateien.write(bot, PROJECT_ROOT, pfad, body.inhalt))
-      throw httpError(400, 'Diese Datei kann nicht geschrieben werden');
-    return sendJson(res, 200, {
-      pfad,
-      files: uebernehmen(bot),
-      ...dateien.list(bot, PROJECT_ROOT),
-    });
+    braucht('files.write');
+    const slot = takeUploadSlot(req, url);
+    if (slot instanceof Error) throw slot;
+    // withBotLock serialisiert COUNT → prüfen → write (race-safe Quota).
+    try {
+      const body = await readBody(req, MAX_FILE_BODY_BYTES);
+      // Nur Text. Binärdaten (Bilder, .jar) haben hier keinen Platz, und eine
+      // Base64-Hülle täuscht hier eine Dateigrösse vor, die keine ist.
+      if (typeof body.inhalt !== 'string')
+        throw httpError(400, 'Nur Textdateien sind erlaubt');
+      const incoming = Buffer.byteLength(body.inhalt, 'utf8');
+      const limited = takeUploadBytes(req, url, incoming);
+      if (limited) throw limited;
+      const geschrieben = await dateien.withBotLock(bot.id, async () =>
+        dateien.write(bot, PROJECT_ROOT, pfad, body.inhalt),
+      );
+      if (!geschrieben)
+        throw httpError(
+          400,
+          'Diese Datei kann nicht geschrieben werden (Quota, Pfad oder Typ prüfen)',
+        );
+      return auflisten({
+        status: 200,
+        body: { pfad, files: uebernehmen(bot) },
+      });
+    } finally {
+      releaseUploadSlot(typeof slot === 'string' ? slot : null);
+    }
   }
   if (req.method === 'DELETE') {
-    if (!dateien.remove(bot, PROJECT_ROOT, pfad))
-      throw httpError(404, 'Datei nicht gefunden');
-    return sendJson(res, 200, {
-      files: uebernehmen(bot),
-      ...dateien.list(bot, PROJECT_ROOT),
+    braucht('files.delete');
+    const ergebnis = await dateien.withBotLock(bot.id, async () =>
+      dateien.remove(bot, PROJECT_ROOT, pfad),
+    );
+    if (!ergebnis) throw httpError(404, 'Datei oder Ordner nicht gefunden');
+    if (ergebnis.ueberlimit)
+      throw httpError(
+        413,
+        `Das sind mehr als ${dateien.MAX_REMOVE_ENTRIES} Einträge. Lösch den Ordner auf dem Server – dort ist es ein Befehl statt einer Anfrage.`,
+      );
+    return auflisten({
+      status: 200,
+      body: {
+        pfad,
+        entfernt: ergebnis.eintraege,
+        ordnerGeloescht: ergebnis.ordner,
+        files: uebernehmen(bot),
+      },
     });
   }
   throw httpError(405, 'Methode nicht erlaubt');
@@ -1588,6 +1764,36 @@ const handleApi = async (req, res, url) => {
 
   if (resource === 'events') {
     permission('bots.read');
+    if (process.env.BOT_HUB_TEST_MODE !== '1') {
+      const ip = String(req.socket.remoteAddress ?? 'unknown');
+      const cookie = String(req.headers.cookie ?? '');
+      const sessionMatch =
+        cookie
+          .split(';')
+          .map((p) => p.trim())
+          .find((p) => p.startsWith('bot_hub_session=')) ?? ip;
+      const MAX_DASHBOARD_SSE_PER_IP = 10;
+      const MAX_DASHBOARD_SSE_PER_SESSION = 3;
+      let perIp = 0;
+      let perSession = 0;
+      for (const entry of listeners) {
+        if (entry?.__sseIp === ip) perIp += 1;
+        if (entry?.__sseSession === sessionMatch) perSession += 1;
+      }
+      if (
+        perIp >= MAX_DASHBOARD_SSE_PER_IP ||
+        perSession >= MAX_DASHBOARD_SSE_PER_SESSION
+      ) {
+        const error = httpError(
+          429,
+          'Zu viele Live-Verbindungen – bitte eine schließen.',
+        );
+        error.retryAfter = 10;
+        throw error;
+      }
+      res.__sseIp = ip;
+      res.__sseSession = sessionMatch;
+    }
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-store',
@@ -1599,7 +1805,13 @@ const handleApi = async (req, res, url) => {
       `event: snapshot\ndata: ${JSON.stringify({ bots: [...bots.values()].map(publicBot) })}\n\n`,
     );
     listeners.add(res);
-    const ping = setInterval(() => res.write(': ping\n\n'), 20000);
+    const ping = setInterval(() => {
+      try {
+        res.write(': ping\n\n');
+      } catch {
+        clearInterval(ping);
+      }
+    }, 20000);
     req.on('close', () => {
       clearInterval(ping);
       listeners.delete(res);
@@ -1609,7 +1821,10 @@ const handleApi = async (req, res, url) => {
 
   if (resource === 'logs') {
     permission('logs.read');
-    const tail = Math.min(500, Number(url.searchParams.get('tail') ?? 200));
+    const rawTail = url.searchParams.get('tail') ?? '200';
+    const tail = Number(rawTail);
+    if (!Number.isInteger(tail) || tail < 1 || tail > 500)
+      throw httpError(400, 'tail muss eine ganze Zahl zwischen 1 und 500 sein');
     const scope = id ? bots.get(id) : null;
     if (id && !scope) throw httpError(404, 'Bot nicht gefunden');
     const source = scope
@@ -1647,10 +1862,32 @@ const handleApi = async (req, res, url) => {
         const bot = hydrate({ ...config, id });
         syncBotEnv(bot);
         bots.set(id, bot);
+        // Neuer Bot: Beispiel-Webseite (bot-hub.json + panel/) anlegen,
+        // dann in den Workspace spiegeln. Bestehende Dateien bleiben.
+        // Fehler brechen das Anlegen nicht ab (der Bot ist auch ohne Beispiel
+        // vollständig), werden aber geloggt und in der Antwort gemeldet.
+        let scaffold = { created: [], skipped: [] };
+        try {
+          scaffold = ensurePanelScaffold(bot, PROJECT_ROOT);
+          if (scaffold.error)
+            console.warn(
+              `[hub] Beispiel-Webseite für ${id} unvollständig: ${scaffold.error}`,
+            );
+        } catch (error) {
+          scaffold = {
+            created: [],
+            skipped: [],
+            error: error?.message ?? String(error),
+          };
+          console.warn(
+            `[hub] Beispiel-Webseite für ${id} fehlgeschlagen: ${scaffold.error}`,
+          );
+        }
+        uebernehmen(bot);
         setStatus(bot, 'stopped');
         const fresh = publicBot(bot);
         broadcast('created', fresh);
-        return sendJson(res, 201, { bot: fresh });
+        return sendJson(res, 201, { bot: fresh, scaffold });
       }
       throw httpError(405, 'Methode nicht erlaubt');
     }
@@ -1762,7 +1999,13 @@ const handleApi = async (req, res, url) => {
     }
     if (action === 'logs' && req.method === 'GET') {
       permission('logs.read');
-      const tail = Math.min(500, Number(url.searchParams.get('tail') ?? 300));
+      const rawTail = url.searchParams.get('tail') ?? '300';
+      const tail = Number(rawTail);
+      if (!Number.isInteger(tail) || tail < 1 || tail > 500)
+        throw httpError(
+          400,
+          'tail muss eine ganze Zahl zwischen 1 und 500 sein',
+        );
       return sendJson(res, 200, { lines: bot.logs.slice(-tail) });
     }
     if (action === 'panel') {

@@ -15,6 +15,8 @@
  */
 
 import { spawn } from 'node:child_process';
+import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import {
   createHash,
   randomBytes,
@@ -258,20 +260,15 @@ export const hubBaseUrl = () =>
   ).replace(/\/+$/, '');
 
 const discordConfig = (bot) => {
-  // OAuth credentials belong to the bot panel, not to the hub globally.
+  // OAuth credentials belong to the hub, not to the bot workspace.
+  // Trust boundary: bots/<id>/workspace/.env ist Bot-writable (untrusted)
+  // und darf die OAuth-App des Panels nicht bestimmen. Nur
+  // data/secrets/<bot-id>.env (0600, Hub-kontrolliert) zählt.
   try {
-    const localPaths = [
-      join(workspaceDir(bot), '.env'),
-      join(botDir(bot), '.env'),
-    ];
     const securePath = join(projectRoot(), 'data', 'secrets', `${bot.id}.env`);
-    // Die Datei des Hubs (0600, außerhalb des Bot-Workspace) hat Vorrang.
-    // Der Workspace selbst gehört dem Bot und ist in Containerbetrieb
-    // schreibbar – ein Bot darf die OAuth-App seines Panels nicht umschreiben.
-    const envPath = [securePath, ...localPaths].find((path) =>
-      existsSync(path),
-    );
-    const values = envPath ? parseDotenv(readFileSync(envPath, 'utf8')) : {};
+    const values = existsSync(securePath)
+      ? parseDotenv(readFileSync(securePath, 'utf8'))
+      : {};
     const oauthUrl = String(values.DISCORD_OAUTH_URL ?? '').trim();
     let oauthClientId = '';
     try {
@@ -456,7 +453,22 @@ export const panelPageOrigin = (bot) => {
   return discordOrigin();
 };
 
-const validRedirectUri = (value, botId) => {
+export const hubOrigin = () => {
+  const configured = String(process.env.BOT_HUB_URL ?? '')
+    .trim()
+    .replace(/\/+$/, '');
+  if (!configured) return null;
+  try {
+    const parsed = new URL(configured);
+    if (!['https:', 'http:'].includes(parsed.protocol)) return null;
+    if (parsed.username || parsed.password) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+};
+
+export const validRedirectUri = (value, botId) => {
   let redirect;
   try {
     redirect = new URL(value);
@@ -473,8 +485,36 @@ const validRedirectUri = (value, botId) => {
       `/api/bots/${encodeURIComponent(botId)}/panel/discord/callback`
   )
     return false;
+  // Userinfo-Angriffe (https://hub@evil/) sind oben bereits ausgeschlossen,
+  // Host-Lookalikes (hub.example.evil.example) werden unten durch den
+  // exakten Origin-Vergleich ausgeschlossen.
   if (redirect.protocol === 'http:' && !LOOPBACK.has(redirect.hostname))
     return false;
+  const hub = hubOrigin();
+  if (hub) {
+    // Autoritative Origin aus BOT_HUB_URL: scheme + hostname + kanonischer
+    // Port müssen übereinstimmen. http in Produktion ist verboten, außer
+    // explizit Loopback/Development.
+    const canonicalPort = (url) =>
+      url.port || (url.protocol === 'https:' ? '443' : '80');
+    if (
+      redirect.protocol !== hub.protocol ||
+      redirect.hostname.toLowerCase() !== hub.hostname.toLowerCase() ||
+      canonicalPort(redirect) !== canonicalPort(hub)
+    )
+      return false;
+    if (
+      process.env.NODE_ENV === 'production' &&
+      redirect.protocol === 'http:' &&
+      !LOOPBACK.has(redirect.hostname)
+    )
+      return false;
+  } else if (
+    process.env.NODE_ENV === 'production' &&
+    redirect.protocol === 'http:'
+  ) {
+    return false;
+  }
   return true;
 };
 
@@ -1313,6 +1353,7 @@ const isEqual = (a, b) => JSON.stringify(a) === JSON.stringify(b);
  * Live-Zustand für die Bot-Seite
  * ------------------------------------------------------------------ */
 export const pushState = (bot, state) => {
+  takeRuntimeRate(bot.id, 'state', MAX_STATE_UPDATES_PER_MINUTE);
   if (!state || typeof state !== 'object' || Array.isArray(state))
     throw httpError(400, 'state muss ein Objekt sein');
   let size = 0;
@@ -1332,6 +1373,7 @@ export const pushState = (bot, state) => {
 };
 
 export const notifyUser = (bot, message, kind = 'info') => {
+  takeRuntimeRate(bot.id, 'notify', MAX_NOTIFICATIONS_PER_MINUTE);
   const text = String(message ?? '').slice(0, 300);
   if (!text) throw httpError(400, 'message fehlt');
   broadcastEvent('toast', {
@@ -1358,7 +1400,37 @@ const pushToBot = (id, type, payload) => {
   }
 };
 
+const MAX_RUNTIME_SSE_PER_BOT = 4;
+const MAX_STATE_UPDATES_PER_MINUTE = 60;
+const MAX_NOTIFICATIONS_PER_MINUTE = 30;
+const runtimeBuckets = new Map();
+
+const takeRuntimeRate = (botId, kind, limit) => {
+  if (process.env.BOT_HUB_TEST_MODE === '1') return;
+  const key = `${botId}:${kind}`;
+  const now = Date.now();
+  const bucket = runtimeBuckets.get(key);
+  if (!bucket || bucket.resetAt <= now) {
+    runtimeBuckets.set(key, { count: 1, resetAt: now + 60_000 });
+    return;
+  }
+  bucket.count += 1;
+  if (bucket.count > limit) {
+    const error = httpError(429, 'Zu viele Anfragen – bitte kurz warten.');
+    error.retryAfter = Math.ceil((bucket.resetAt - now) / 1000);
+    throw error;
+  }
+};
+
 const openBotStream = (bot, req, res) => {
+  if (process.env.BOT_HUB_TEST_MODE !== '1') {
+    const current = botStreams.get(bot.id)?.size ?? 0;
+    if (current >= MAX_RUNTIME_SSE_PER_BOT) {
+      const error = httpError(429, 'Zu viele Ereignis-Streams für diesen Bot.');
+      error.retryAfter = 10;
+      throw error;
+    }
+  }
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
     'cache-control': 'no-store',
@@ -1440,11 +1512,41 @@ const resolveAll = async (hostname) => {
  * Adresse – und deshalb wird unten auch genau die Adresse gespeichert und
  * aufgerufen, die geprüft wurde.
  */
+const isMetadataAddress = (address) => {
+  const text = String(address ?? '').toLowerCase();
+  // Cloud-Metadaten + Link-Local dürfen auch via Allowlist nie erreicht werden:
+  // allowlist = welcher öffentliche Host erlaubt ist, nicht "darf überall hin".
+  if (text === '169.254.169.254' || text === '169.254.169.253') return true;
+  if (text.startsWith('169.254.')) return true;
+  if (text === '::ffff:169.254.169.254' || text === '::ffff:169.254.169.253')
+    return true;
+  return false;
+};
+
 const assertCallbackTarget = async (parsed) => {
   const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
   const port = parsed.port || (parsed.protocol === 'https:' ? '443' : '80');
   const allow = callbackAllowlist();
-  if (allow.has(hostname) || allow.has(`${hostname}:${port}`)) return;
+  const allowlisted = allow.has(hostname) || allow.has(`${hostname}:${port}`);
+  if (allowlisted) {
+    // Auch allowlistete Hosts müssen auflösbar sein und dürfen nie auf
+    // Cloud-Metadaten zeigen. Private Netze bleiben explizites Operator-
+    // Opt-in, Metadaten nie.
+    if (isIP(hostname)) {
+      if (isMetadataAddress(hostname))
+        throw httpError(
+          400,
+          'callback.url: Metadaten-Adresse ist nie erlaubt.',
+        );
+      return hostname;
+    }
+    const addresses = await resolveAll(hostname);
+    if (addresses.length === 0)
+      throw httpError(400, 'callback.url: Hostname lässt sich nicht auflösen');
+    if (addresses.some((address) => isMetadataAddress(address)))
+      throw httpError(400, 'callback.url: Metadaten-Adresse ist nie erlaubt.');
+    return addresses[0];
+  }
 
   if (isIP(hostname)) {
     if (!isLoopbackAddress(hostname))
@@ -1452,7 +1554,7 @@ const assertCallbackTarget = async (parsed) => {
         400,
         'callback.url darf nur auf den eigenen Rechner zeigen (Loopback). Für andere Ziele braucht es BOT_HUB_CALLBACK_ALLOW.',
       );
-    return;
+    return hostname;
   }
 
   const addresses = await resolveAll(hostname);
@@ -1465,7 +1567,68 @@ const assertCallbackTarget = async (parsed) => {
       400,
       'callback.url löst auf eine Adresse außerhalb des Loopback auf (SSRF-Schutz). Für andere Ziele braucht es BOT_HUB_CALLBACK_ALLOW.',
     );
+  return addresses[0];
 };
+
+// Connect to the address that passed policy checks while retaining the URL
+// hostname for Host and TLS certificate validation. This closes the DNS
+// check/connect gap that otherwise permits DNS rebinding.
+const requestCallback = (parsed, address, token, payload) =>
+  new Promise((resolve, reject) => {
+    let request;
+    const timeout = setTimeout(
+      () => request.destroy(new Error('Callback-Zeitüberschreitung.')),
+      CALLBACK_TIMEOUT,
+    );
+    timeout.unref();
+    request = (parsed.protocol === 'https:' ? httpsRequest : httpRequest)(
+      {
+        protocol: parsed.protocol,
+        hostname: parsed.hostname,
+        port: parsed.port || undefined,
+        method: 'POST',
+        path: `${parsed.pathname}${parsed.search}`,
+        headers: {
+          'content-type': 'application/json',
+          'x-bot-hub-token': token,
+          'content-length': Buffer.byteLength(payload),
+        },
+        ...(isIP(parsed.hostname.replace(/^\[|\]$/g, ''))
+          ? {}
+          : {
+              lookup: (_hostname, _options, callback) =>
+                callback(null, address, isIP(address)),
+            }),
+      },
+      (response) => {
+        const chunks = [];
+        let size = 0;
+        response.on('data', (chunk) => {
+          size += chunk.length;
+          if (size > MAX_OUTPUT) {
+            request.destroy(
+              new Error('Callback-Antwort überschreitet das Größenlimit.'),
+            );
+            return;
+          }
+          chunks.push(chunk);
+        });
+        response.on('end', () => {
+          clearTimeout(timeout);
+          resolve({
+            ok: response.statusCode >= 200 && response.statusCode < 300,
+            status: response.statusCode,
+            body: Buffer.concat(chunks).toString('utf8'),
+          });
+        });
+      },
+    );
+    request.on('error', (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    request.end(payload);
+  });
 
 /** Wie lange eine registrierte Callback-Adresse gilt. */
 const CALLBACK_TTL = 60 * 60 * 1000;
@@ -1579,20 +1742,9 @@ const callCallback = async (bot, hook, command, args) => {
     // Das Ziel wird erneut geprüft, nicht nur bei der Registrierung: zwischen
     // beiden Zeitpunkten kann sich ein DNS-Eintrag geändert haben.
     const parsed = new URL(hook.url);
-    await assertCallbackTarget(parsed);
-    const response = await fetch(parsed.toString(), {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-bot-hub-token': hook.token,
-      },
-      body: payload,
-      // Keine Redirects: sonst hebt ein Callback auf dem localhost die
-      // Beschränkung auf loopback auf und der Hub ruft beliebige Ziele auf.
-      redirect: 'manual',
-      signal: AbortSignal.timeout(CALLBACK_TIMEOUT),
-    });
-    const raw = await readLimited(response, MAX_OUTPUT);
+    const address = await assertCallbackTarget(parsed);
+    const response = await requestCallback(parsed, address, hook.token, payload);
+    const raw = response.body;
     let data = raw;
     try {
       data = JSON.parse(raw);
@@ -1731,11 +1883,27 @@ const runScript = async (bot, command, args) => {
 
     let out = '';
     let err = '';
+    let outputExceeded = false;
+    const stopForOutputLimit = () => {
+      if (outputExceeded) return;
+      outputExceeded = true;
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch {
+        child.kill('SIGKILL');
+      }
+    };
+    const appendOutput = (current, data) => {
+      const chunk = data.toString();
+      const remaining = MAX_OUTPUT - current.length;
+      if (chunk.length > remaining) stopForOutputLimit();
+      return current + chunk.slice(0, Math.max(0, remaining));
+    };
     child.stdout.on('data', (data) => {
-      out += data.toString();
+      out = appendOutput(out, data);
     });
     child.stderr.on('data', (data) => {
-      err += data.toString();
+      err = appendOutput(err, data);
     });
 
     const killer = setTimeout(() => {
@@ -1766,12 +1934,16 @@ const runScript = async (bot, command, args) => {
         /* Rohtext reicht */
       }
       resolveRun({
-        ok: code === 0,
+        ok: code === 0 && !outputExceeded,
         via: 'script',
         code: code ?? -1,
         output: output || errors,
         data,
-        error: code === 0 ? null : errors || `Exit-Code ${code}`,
+        error: outputExceeded
+          ? 'Skriptausgabe überschreitet das Größenlimit.'
+          : code === 0
+            ? null
+            : errors || `Exit-Code ${code}`,
       });
     });
   });
@@ -1848,6 +2020,68 @@ export const hubEnv = (bot, dir) => {
 /* ------------------------------------------------------------------ *
  * Öffentliche Form
  * ------------------------------------------------------------------ */
+const relativeManifestPath = (absolutePath) => {
+  if (!absolutePath) return '';
+  try {
+    const root = projectRoot();
+    const rel = relative(root, absolutePath);
+    if (!rel || rel.startsWith('..') || isAbsolute(rel)) return '';
+    return rel;
+  } catch {
+    return '';
+  }
+};
+
+const publicFields = (manifest) => {
+  const out = [];
+  for (const field of manifest?.fields ?? []) {
+    if (!field || typeof field !== 'object') continue;
+    const base = {
+      key: field.key,
+      type: field.type,
+      label: field.label,
+      description: field.description,
+      placeholder: field.placeholder,
+    };
+    if (field.type === 'select') base.options = field.options ?? [];
+    if (field.type === 'number') {
+      if (field.min !== undefined) base.min = field.min;
+      if (field.max !== undefined) base.max = field.max;
+      if (field.step !== undefined) base.step = field.step;
+    }
+    if (field.secret) {
+      // Secret-Felder verraten nie ihren Wert: kein default, kein value,
+      // keine alternativen Property-Namen. Das Frontend weiß nur, dass es
+      // ein Secret ist und ob es gesetzt ist (via `secrets` maskiert).
+      base.secret = true;
+      base.default = '';
+    } else {
+      base.default = field.default ?? '';
+    }
+    out.push(base);
+  }
+  return out;
+};
+
+const publicCommands = (manifest) =>
+  (manifest?.commands ?? []).map((command) => ({
+    id: command.id,
+    label: command.label,
+    description: command.description,
+    danger: Boolean(command.danger),
+  }));
+
+const publicDefaults = (bot) => {
+  const secretKeys = new Set(
+    (bot.panel?.manifest?.fields ?? [])
+      .filter((field) => field.secret)
+      .map((field) => field.key),
+  );
+  return Object.fromEntries(
+    Object.entries(defaultsOf(bot)).filter(([key]) => !secretKeys.has(key)),
+  );
+};
+
 export const publicPanel = (bot) => {
   const panel = bot.panel ?? emptyPanel();
   const manifest = panel.manifest;
@@ -1861,18 +2095,18 @@ export const publicPanel = (bot) => {
   return {
     available: Boolean(manifest),
     source: panel.source ?? null,
-    manifestPath: panel.path ?? '',
+    manifestPath: relativeManifestPath(panel.path ?? ''),
     title: manifest?.title ?? '',
     icon: manifest?.icon ?? '🧩',
     description: manifest?.description ?? '',
     entry: manifest?.entry ?? '',
     pages: manifest?.pages ?? [],
-    fields: manifest?.fields ?? [],
-    commands: manifest?.commands ?? [],
+    fields: publicFields(manifest),
+    commands: publicCommands(manifest),
     settings,
     secrets,
     secretKeys: Object.keys(panel.secretSettings ?? {}),
-    defaults: defaultsOf(bot),
+    defaults: publicDefaults(bot),
     state: panel.state ?? {},
     error: panel.error ?? '',
     online: Boolean(bot.child),
@@ -1886,17 +2120,22 @@ export const publicPanel = (bot) => {
  * Statische Dateien der Bot-Seite
  * ------------------------------------------------------------------ */
 const panelAssetOrigin = (req) => {
-  const protocol = String(req.headers['x-forwarded-proto'] ?? 'http')
-    .split(',')[0]
+  // Autoritativ ist BOT_HUB_URL (V19 #17): Forwarded-Headers werden nicht blind
+  // übernommen, sonst bestimmt ein Header die CSP-Origin. Wenn BOT_HUB_URL
+  // gesetzt ist, gilt dessen Origin; sonst Same-Host aus Host-Header.
+  const configured = String(process.env.BOT_HUB_URL ?? '')
     .trim()
-    .toLowerCase();
+    .replace(/\/+$/, '');
+  if (configured) {
+    try {
+      const parsed = new URL(configured);
+      if (['http:', 'https:'].includes(parsed.protocol)) return parsed.origin;
+    } catch {}
+  }
   const host = String(req.headers.host ?? '').trim();
-  if (
-    !['http', 'https'].includes(protocol) ||
-    !/^(?:[a-z0-9.-]+|\[[0-9a-f:]+\])(?::\d{1,5})?$/i.test(host)
-  )
-    return '';
-  return `${protocol}://${host}`;
+  if (!/^(?:[a-z0-9.-]+|\[[0-9a-f:]+\])(?::\d{1,5})?$/i.test(host)) return '';
+  // Ohne BOT_HUB_URL kein Forwarded-Proto-Vertrauen: http als sicherer Default.
+  return `http://${host}`;
 };
 
 const sendFile = (res, path, assetOrigin = '') => {
@@ -2325,7 +2564,7 @@ const sessionOf = (bot, runtime) => ({
   },
   baseUrl: hubBaseUrl(),
   panelUrl: `${hubBaseUrl()}/api/bots/${bot.id}/panel`,
-  manifestPath: bot.panel?.path ?? '',
+  manifestPath: relativeManifestPath(bot.panel?.path ?? ''),
   source: bot.panel?.source ?? null,
   settings: runtime ? effectiveSettings(bot) : publicSettings(bot),
   // Panel-Token nur für Panel-Scope, nie für Runtime-Bots
