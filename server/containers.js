@@ -309,8 +309,20 @@ export const stopContainer = async (bot) => {
 };
 
 export const removeContainer = async (bot) => {
+  // Idempotent und laufzeitbewusst: ohne Container-Runtime gibt es nichts zu
+  // entfernen (kein docker-Aufruf, kein ENOENT im Test-/Dev-Modus). Ein
+  // bereits verschwundener Container ist ebenfalls OK – nur echte
+  // Docker-Fehler werden gemeldet. Der Name stammt immer aus nameOf(bot),
+  // niemals aus Request-Parametern.
+  if (!containerRuntimeEnabled()) return;
   const name = nameOf(bot);
-  if (await exists(name)) await run(['rm', '--force', name]);
+  try {
+    if (await exists(name)) await run(['rm', '--force', name]);
+  } catch (error) {
+    if (/no such container|not found/i.test(String(error?.message ?? '')))
+      return;
+    throw error;
+  }
 };
 
 export const execArgs = (bot, projectRoot, dir, command, env = {}) => {

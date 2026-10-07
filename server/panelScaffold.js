@@ -16,6 +16,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readFileSync,
   realpathSync,
   writeFileSync,
 } from 'node:fs';
@@ -176,7 +177,10 @@ const INDEX_HTML = `<!doctype html>
 
       <section class="card">
         <div class="card__head"><h2>Aktionen</h2></div>
-        <div class="card__body"><div id="actions"></div></div>
+        <div class="card__body">
+          <p class="hint">Beispiel-Aktionen – sie antworten, sobald ein laufender Bot sie bedient. Ohne Bot meldet das Log verständlich, dass noch nichts hinterlegt ist.</p>
+          <div id="actions"></div>
+        </div>
       </section>
 
       <section class="card">
@@ -189,7 +193,12 @@ const INDEX_HTML = `<!doctype html>
 </html>
 `;
 
-const PANEL_JS = `// Beispiel-Webseite: läuft in Sandbox (Origin "null"), spricht per
+export const SCAFFOLD_VERSION = 2;
+export const SCAFFOLD_MARKER =
+  '// Bot-Hub Scaffold v2 – Beispielseite (wird nie überschrieben).';
+
+const PANEL_JS = `${SCAFFOLD_MARKER}
+// Beispiel-Webseite: läuft in Sandbox (Origin "null"), spricht per
 // bridge.js mit dem Hub – nicht per fetch. Discord-OAuth als Beispiel.
 void (async () => {
   const parts = location.pathname.split('/').filter(Boolean);
@@ -226,6 +235,10 @@ void (async () => {
 
   let hub = null;
   let payload = null;
+  // Geheimnisse: leer lassen heißt behalten (Schlüssel wird gar nicht erst
+  // gesendet). Nur der explizite Entfernen-Knopf markiert ein Secret zur
+  // Löschung – ein leeres Feld allein löscht nie.
+  const clearedSecrets = new Set();
   try {
     ({ hub } = await import(bridgeUrl.href));
   } catch (e) {
@@ -281,11 +294,23 @@ void (async () => {
       : [h('p', { class: 'empty', text: 'Noch keine Werte.' })];
     stats.replaceChildren(...nodes);
     const fields = $('fields');
+    clearedSecrets.clear();
     fields.replaceChildren(
       ...(data?.fields ?? []).map((f) => {
         if (f.secret) {
+          const isSet = Boolean(data?.secrets?.[f.key]);
+          const input = h('input', { type: 'password', name: f.key, 'data-secret': 'true',
+            placeholder: isSet ? '•••••••• – leer lassen, bleibt gespeichert' : 'noch nicht gesetzt' });
+          const drop = isSet ? h('button', { type: 'button', text: 'Entfernen',
+            title: 'Gespeicherten Wert beim Speichern löschen',
+            onclick: () => {
+              clearedSecrets.add(f.key);
+              input.value = '';
+              input.disabled = true;
+              input.placeholder = 'wird beim Speichern entfernt';
+            } }) : null;
           return h('label', { class: 'field' }, h('span', { text: f.label + ' (geheim)' }),
-            h('input', { type: 'password', name: f.key, placeholder: data?.secrets?.[f.key] ? '•••••••• – leer lassen' : 'noch nicht gesetzt' }));
+            input, drop);
         }
         return h('label', { class: 'field' }, h('span', { text: f.label || f.key }),
           h('input', { name: f.key, value: data?.settings?.[f.key] ?? f.default ?? '' }));
@@ -332,7 +357,17 @@ void (async () => {
   $('settings').addEventListener('submit', async (e) => {
     e.preventDefault();
     const values = {};
-    for (const input of e.target.querySelectorAll('[name]')) values[input.name] = input.value;
+    const secretKeys = new Set((payload?.fields ?? []).filter((f) => f.secret).map((f) => f.key));
+    for (const input of e.target.querySelectorAll('[name]')) {
+      if (secretKeys.has(input.name)) {
+        if (clearedSecrets.has(input.name)) values[input.name] = '';
+        else if (input.value.trim()) values[input.name] = input.value.trim();
+        // Leer und nicht zum Löschen markiert: Schlüssel weglassen, das
+        // gespeicherte Secret bleibt erhalten.
+        continue;
+      }
+      values[input.name] = input.value;
+    }
     try {
       const data = await hub.save(values);
       paint(data);
@@ -423,6 +458,46 @@ const adoptWorkspacePanel = (bot, projectRoot, base, rels) => {
  * Der Aufrufer entscheidet – melden statt abbrechen, damit ein fehlendes
  * Beispiel nie die Bot-Erstellung verhindert.
  */
+/**
+ * Erkennt ein altes Hub-generiertes panel.js (V1, syntaktisch kaputt durch den
+ * bedingten Spread `? ...entries.map`). Eigene Seiten enthalten dieses Muster
+ * nicht und werden niemals angefasst – im Zweifel gilt eine Datei als
+ * benutzerdefiniert und bleibt liegen.
+ */
+const isBrokenScaffoldV1 = (content) =>
+  typeof content === 'string' &&
+  !content.includes(SCAFFOLD_MARKER) &&
+  content.includes('? ...entries.map');
+
+/**
+ * Migriert alte Hub-Scaffolds (V1 → V2): nur Dateien, die eindeutig als
+ * kaputtes Hub-Generat erkennbar sind, werden durch die reparierte Version
+ * ersetzt. Benutzerdefinierte Panels und aktuelle V2-Dateien bleiben
+ * unangetastet. Gibt die migrierten Pfade zurück.
+ */
+export const migrateScaffold = (bot, projectRoot) => {
+  const migrated = [];
+  let base;
+  try {
+    base = scaffoldDir(bot, projectRoot);
+  } catch {
+    return { migrated };
+  }
+  const target = join(base, 'panel', 'panel.js');
+  try {
+    const rel = relative(base, target);
+    if (!rel || rel.startsWith('..') || isAbsolute(rel)) return { migrated };
+    if (!existsSync(target)) return { migrated };
+    const content = readFileSync(target, 'utf8');
+    if (!isBrokenScaffoldV1(content)) return { migrated };
+    writeFileSync(target, PANEL_JS, { mode: 0o600 });
+    migrated.push('panel/panel.js');
+  } catch {
+    /* Defekte Datei, die sich nicht lesen/schreiben lässt, bleibt liegen. */
+  }
+  return { migrated };
+};
+
 export const ensurePanelScaffold = (bot, projectRoot) => {
   const created = [];
   const skipped = [];

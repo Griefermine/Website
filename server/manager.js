@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import {
   existsSync,
+  lstatSync,
   chmodSync,
   cpSync,
   readFileSync,
@@ -27,6 +28,7 @@ import {
   cleanupTempEnvFiles,
   dotenvKey,
   readSecretValues,
+  removeSecretValues,
   storeSecretValues,
 } from './secrets.js';
 import {
@@ -50,6 +52,7 @@ import {
   panelPageOrigin,
   panelToken,
   publicPanel,
+  revokeBotSessions,
   revokeRuntimeToken,
   syncBotEnv,
 } from './panel.js';
@@ -59,6 +62,7 @@ import {
   currentUser,
   handleAuthRoutes,
   hasPermission,
+  purgeBotAccess,
   removeAccess,
   requiresAuthentication,
   secureCookies,
@@ -70,8 +74,10 @@ import {
   ensureContainer,
   execArgs,
   stopContainer,
+  removeContainer,
 } from './containers.js';
-import { ensurePanelScaffold } from './panelScaffold.js';
+import { database } from './database.js';
+import { ensurePanelScaffold, migrateScaffold } from './panelScaffold.js';
 
 const PROJECT_ROOT = resolve(process.env.BOT_DASHBOARD_ROOT || process.cwd());
 const DATA_FILE = join(PROJECT_ROOT, 'data', 'bots.json');
@@ -224,6 +230,18 @@ const bots = new Map();
 const listeners = new Set();
 const dirty = new Set();
 
+/**
+ * Bots im Löschvorgang: Während DELETE läuft, werden Start, Restart,
+ * Installation, Konfigurations- und Datei-/Panel-Schreibzugriffe mit 409
+ * abgewiesen, damit kein paralleler Request den Bot reaktiviert. Lesezugriffe
+ * bleiben erlaubt.
+ */
+const deletingBots = new Set();
+const assertNotDeleting = (id) => {
+  if (deletingBots.has(id))
+    throw httpError(409, 'Bot wird gerade gelöscht – bitte kurz warten');
+};
+
 let persistTimer = null;
 const schedulePersist = () => {
   if (persistTimer) return;
@@ -233,7 +251,7 @@ const schedulePersist = () => {
   }, 250);
 };
 
-const flush = () => {
+const flush = (strict = false) => {
   dirty.clear();
   try {
     mkdirSync(dirname(DATA_FILE), { recursive: true });
@@ -242,7 +260,10 @@ const flush = () => {
     });
     chmodSync(DATA_FILE, 0o600);
   } catch (error) {
+    // Der Timer darf nie abstürzen; ein irreversibler Delete muss einen
+    // Persistenzfehler dagegen als Teilfehler melden statt ihn zu schlucken.
     console.error('[hub] Speichern fehlgeschlagen:', error.message);
+    if (strict) throw error;
   }
 };
 
@@ -1466,12 +1487,20 @@ const load = () => {
       // Fehler werden geloggt, verhindern aber nie den Start (Verfügbarkeit
       // geht vor Beispielseite; der Bot selbst ist vollständig).
       try {
+        // Alte kaputte Hub-Scaffolds (V1) zuerst migrieren – nur eindeutig
+        // Hub-generierte Dateien, niemals eigene Seiten. Danach erzeugt das
+        // normale Scaffold Fehlendes; Uebernehmen spiegelt in den Workspace.
+        const { migrated } = migrateScaffold(bot, PROJECT_ROOT);
+        if (migrated.length)
+          console.log(
+            `[hub] Beispiel-Webseite für ${config.id} migriert: ${migrated.join(', ')}`,
+          );
         const { created, error } = ensurePanelScaffold(bot, PROJECT_ROOT);
         if (error)
           console.warn(
             `[hub] Beispiel-Webseite für ${config.id} unvollständig: ${error}`,
           );
-        else if (created.length) uebernehmen(bot);
+        else if (created.length || migrated.length) uebernehmen(bot);
       } catch (error) {
         console.warn(
           `[hub] Beispiel-Webseite für ${config.id} fehlgeschlagen: ${error?.message ?? error}`,
@@ -1533,6 +1562,121 @@ const normaliseConfig = (input, existing) => {
     env: input.env ?? existing?.env ?? {},
     secretEnv: secretValues(existing ?? {}, input.secretEnv),
   };
+};
+
+/**
+ * Zentraler Bot-Löschworkflow: genau eine Stelle kennt die Reihenfolge, kein
+ * duplizierter Cleanup anderswo.
+ *
+ * Phase A sperrt den Bot (deleting-Flag gegen Start/Restart/Schreib-Races),
+ * Phase B widerruft sofort alle Tokens/Sessions (gilt auch bei späterem
+ * Fehler), danach folgen C Runtime-Stopp, D DB, E Secrets, F Dateien,
+ * G Access-Bereinigung und H Persistenz. Jeder Schritt läuft einzeln in
+ * try/catch: Teilfehler werden gesammelt, der Cleanup läuft weiter, und erst
+ * am Ende entscheidet sich die Antwort – 200 nur bei vollständigem Erfolg,
+ * sonst 500 mit cleanupErrors und der Bot bleibt (erneut löschbar, alle
+ * Schritte sind idempotent) im Bestand.
+ */
+const deleteBotCompletely = async (bot, actor) => {
+  const id = bot.id;
+  const tag = `[hub] BOT_DELETE bot=${id} actor=${actor ?? '-'}`;
+  console.log(`${tag} STARTED`);
+  deletingBots.add(id);
+  const cleanupErrors = [];
+  const attempt = async (step, task) => {
+    try {
+      await task();
+    } catch (error) {
+      cleanupErrors.push({ step, error: error?.message ?? String(error) });
+    }
+  };
+  try {
+    await attempt('sessions', async () => revokeBotSessions(id));
+    await attempt('stop', async () => stopBot(id, { signal: 'SIGKILL' }));
+    if (containerRuntimeEnabled())
+      await attempt('container', async () => removeContainer(bot));
+    await attempt('database', async () => database().removeBot(id));
+    await attempt('secrets', async () => removeSecretValues(PROJECT_ROOT, id));
+    await attempt('files', async () => {
+      // Nur ein direktes Kind von bots/ darf entfernt werden; ein
+      // fehlerhafter gespeicherter Pfad darf niemals auf andere Hub-Dateien
+      // zeigen. lstat + rm entfernt einen möglichen Link selbst, nie dessen
+      // Ziel.
+      if (
+        !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(id) ||
+        id === '.' ||
+        id === '..'
+      )
+        throw new Error('Bot-Verzeichnis ist ungültig');
+      const botsPath = join(PROJECT_ROOT, 'bots');
+      if (!existsSync(botsPath)) return;
+      const projectRoot = realpathSync(PROJECT_ROOT);
+      const botsRoot = realpathSync(botsPath);
+      const relativeBotsRoot = relative(projectRoot, botsRoot);
+      if (
+        !relativeBotsRoot ||
+        relativeBotsRoot === '..' ||
+        relativeBotsRoot.startsWith(`..${sep}`) ||
+        isAbsolute(relativeBotsRoot)
+      )
+        throw new Error('Bot-Verzeichnis liegt außerhalb des Bot-Hubs');
+      const botDirectory = join(botsRoot, id);
+      const relativeBotDirectory = relative(botsRoot, botDirectory);
+      if (
+        !relativeBotDirectory ||
+        relativeBotDirectory === '..' ||
+        relativeBotDirectory.startsWith(`..${sep}`) ||
+        isAbsolute(relativeBotDirectory)
+      )
+        throw new Error('Bot-Verzeichnis ist ungültig');
+      try {
+        lstatSync(botDirectory);
+        rmSync(botDirectory, { recursive: true });
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+    });
+    await attempt('access', async () => purgeBotAccess(id));
+    if (cleanupErrors.length) {
+      // Teilfehler: Bot bleibt bewusst im Bestand (nicht als gelöscht
+      // markiert, keine Persistenz des Löschens), damit ein erneuter DELETE
+      // den idempotenten Cleanup wiederholen kann.
+      for (const { step, error } of cleanupErrors)
+        console.error(`${tag} FAILED step=${step}: ${error}`);
+      const failure = httpError(
+        500,
+        `Bot konnte nicht vollständig gelöscht werden (${cleanupErrors.map((entry) => entry.step).join(', ')}). Erneut versuchen – der Cleanup ist idempotent.`,
+      );
+      failure.cleanupErrors = cleanupErrors;
+      failure.deleted = false;
+      throw failure;
+    }
+    try {
+      bots.delete(id);
+      dirty.add(id);
+      flush(true);
+    } catch (error) {
+      // Persistenzfehlschlag: Bot zurück in den Bestand, damit ein erneuter
+      // DELETE den Cleanup wiederholen kann statt eine Karteileiche zu
+      // hinterlassen.
+      bots.set(id, bot);
+      console.error(`${tag} FAILED step=persist: ${error?.message ?? error}`);
+      const failure = httpError(
+        500,
+        'Bot konnte nicht vollständig gelöscht werden (persist). Erneut versuchen – der Cleanup ist idempotent.',
+      );
+      failure.cleanupErrors = [
+        { step: 'persist', error: error?.message ?? String(error) },
+      ];
+      failure.deleted = false;
+      throw failure;
+    }
+  } finally {
+    deletingBots.delete(id);
+  }
+  console.log(`${tag} COMPLETED`);
+  broadcast('deleted', { id });
+  return { deleted: true, id };
 };
 
 /**
@@ -1900,6 +2044,7 @@ const handleApi = async (req, res, url) => {
       return sendJson(res, 200, { bot: publicBot(bot) });
     if (!action && req.method === 'PATCH') {
       permission('bots.manage');
+      assertNotDeleting(id);
       const body = await readBody(req);
       const config = normaliseConfig(body, bot);
       if (!safeBotPath(bot, config.cwd))
@@ -1923,15 +2068,16 @@ const handleApi = async (req, res, url) => {
     }
     if (!action && req.method === 'DELETE') {
       permission('bots.delete');
-      stopBot(id, { signal: 'SIGKILL' });
-      bots.delete(id);
-      dirty.add(id);
-      schedulePersist();
-      broadcast('deleted', { id });
-      return sendJson(res, 200, { ok: true });
+      assertNotDeleting(id);
+      const result = await deleteBotCompletely(
+        bot,
+        currentUser(req)?.id ?? null,
+      );
+      return sendJson(res, 200, result);
     }
     if (action === 'start' && req.method === 'POST') {
       permission('bots.control');
+      assertNotDeleting(id);
       prepareStart(bot);
       setStatus(bot, 'checking', { pid: null, stoppedAt: Date.now() });
       startBot(id).catch((error) => {
@@ -1942,6 +2088,7 @@ const handleApi = async (req, res, url) => {
     }
     if (action === 'files') {
       permission('bots.manage');
+      if (req.method !== 'GET') assertNotDeleting(id);
       const handled = await handleFileRoutes(req, res, url, bot);
       if (handled !== false) return handled;
       throw httpError(404, 'Unbekannter Datei-Endpunkt');
@@ -1949,6 +2096,7 @@ const handleApi = async (req, res, url) => {
 
     if (action === 'install' && req.method === 'POST') {
       permission('bots.manage');
+      assertNotDeleting(id);
       const dir = safeBotPath(bot, bot.cwd);
       if (!dir)
         throw httpError(
@@ -1983,6 +2131,7 @@ const handleApi = async (req, res, url) => {
     }
     if (action === 'restart' && req.method === 'POST') {
       permission('bots.restart');
+      assertNotDeleting(id);
       stopBot(id, { signal: 'SIGTERM' });
       const target = bots.get(id);
       if (target) {
@@ -2009,6 +2158,9 @@ const handleApi = async (req, res, url) => {
       return sendJson(res, 200, { lines: bot.logs.slice(-tail) });
     }
     if (action === 'panel') {
+      // Lesende Panel-Zugriffe bleiben während eines Löschvorgangs erlaubt,
+      // alles Schreibende (Settings, Commands, State, Login/Logout) nicht.
+      if (req.method !== 'GET') assertNotDeleting(id);
       if (req.method === 'GET' && url.pathname.endsWith('/panel/open')) {
         permission('panel.read');
         ensurePanel(bot);
@@ -2219,7 +2371,12 @@ export const createServer = () => {
       if (status >= 500) console.error('[hub]', error);
       if (!res.headersSent) {
         if (error.retryAfter) res.setHeader('retry-after', error.retryAfter);
-        return sendJson(res, status, { error: error.message });
+        // Teilfehler (z. B. Bot-Delete) dürfen ihre Detailstruktur mitsenden;
+        // Geheimnisse stehen darin nie (nur Schritt + Fehlermeldung).
+        const body = { error: error.message };
+        if (error.cleanupErrors) body.cleanupErrors = error.cleanupErrors;
+        if (error.deleted !== undefined) body.deleted = error.deleted;
+        return sendJson(res, status, body);
       }
       return res.end();
     }

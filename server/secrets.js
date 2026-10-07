@@ -119,3 +119,13 @@ export const storeSecretValues = (
   }
   return fileOf(projectRoot, id);
 };
+
+/** Entfernt die Secret-Datei eines Bots, falls sie existiert. */
+export const removeSecretValues = (projectRoot, id) => {
+  const path = fileOf(projectRoot, id);
+  try {
+    unlinkSync(path);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+};

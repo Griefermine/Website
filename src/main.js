@@ -125,11 +125,8 @@ const wireControls = () => {
     if (action === 'delete') {
       if (
         !confirm(
-          // Der Startordner und der Workspace bleiben auf der Platte – wie
-          // bisher. Wer sie mitnimmt, nimmt hochgeladene Quelldateien mit,
-          // und das ist eine Entscheidung, die man nicht aus Versehen trifft.
-          `"${bot.name}" wirklich löschen? Konfiguration und Logs gehen verloren. ` +
-            'Die Dateien im Startordner bleiben liegen.',
+          `"${bot.name}" und alle zugehörigen Dateien sowie gespeicherten Bot-Daten wirklich löschen? ` +
+            'Diese Aktion kann nicht rückgängig gemacht werden.',
         )
       )
         return undefined;

@@ -365,12 +365,18 @@ export const updateAccess = (id, input, actorId) => {
     allowed.has(permission),
   );
   const requestedBots =
-    input.bots && typeof input.bots === 'object' ? input.bots : existing.bots ?? {};
+    input.bots && typeof input.bots === 'object'
+      ? input.bots
+      : (existing.bots ?? {});
   const botsClean = {};
   for (const [bid, cfg] of Object.entries(requestedBots)) {
     if (!/^[A-Za-z0-9._-]{1,64}$/.test(bid)) continue;
     const perms = Array.isArray(cfg?.permissions)
-      ? [...new Set(cfg.permissions.filter((p) => DEFAULT_PERMISSIONS.includes(p)))]
+      ? [
+          ...new Set(
+            cfg.permissions.filter((p) => DEFAULT_PERMISSIONS.includes(p)),
+          ),
+        ]
       : [];
     botsClean[bid] = { permissions: perms.filter((p) => allowed.has(p)) };
   }
@@ -397,6 +403,26 @@ export const removeAccess = (id, actorId) => {
     throw new Error('Der letzte Eigentümer kann nicht entfernt werden');
   delete access.users[id];
   saveAccess();
+};
+
+/**
+ * Entfernt beim Bot-Löschen alle Berechtigungseinträge dieser Bot-ID aus
+ * sämtlichen Benutzern. Nur die gelöschte ID wird angefasst, andere
+ * Bot-Rechte bleiben unverändert. Gibt die Zahl bereinigter Benutzer zurück.
+ */
+export const purgeBotAccess = (botId) => {
+  const id = String(botId ?? '');
+  if (!id) return 0;
+  let purged = 0;
+  for (const entry of Object.values(access.users)) {
+    if (entry?.bots && Object.hasOwn(entry.bots, id)) {
+      delete entry.bots[id];
+      entry.updatedAt = Date.now();
+      purged += 1;
+    }
+  }
+  if (purged) saveAccess();
+  return purged;
 };
 
 export const authSession = (req) => {

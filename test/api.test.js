@@ -4,8 +4,11 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { createServer } from 'node:http';
@@ -414,5 +417,36 @@ describe('Bot-Hub API', () => {
     assert.equal(status, 200);
     const { data } = await call(`/bots/${bot.id}`);
     assert.equal(data.error, 'Bot nicht gefunden');
+  });
+
+  it('verweigert das Löschen, wenn bots/ aus dem Projekt herauszeigt', async () => {
+    const bot = await createBot({
+      name: 'Nicht ausserhalb löschen',
+      language: 'custom',
+      command: 'echo x',
+    });
+    const botsPath = join(root, 'bots');
+    const savedBotsPath = join(root, 'bots-saved');
+    const externalRoot = mkdtempSync(join(tmpdir(), 'bot-hub-external-'));
+    const externalBotPath = join(externalRoot, bot.id);
+    mkdirSync(externalBotPath);
+    writeFileSync(join(externalBotPath, 'keep.txt'), 'outside');
+
+    renameSync(botsPath, savedBotsPath);
+    symlinkSync(externalRoot, botsPath, 'dir');
+    try {
+      const { status } = await call(`/bots/${bot.id}`, { method: 'DELETE' });
+      assert.equal(status, 500);
+      assert.equal(
+        readFileSync(join(externalBotPath, 'keep.txt'), 'utf8'),
+        'outside',
+      );
+      const { data } = await call(`/bots/${bot.id}`);
+      assert.equal(data.bot.id, bot.id);
+    } finally {
+      unlinkSync(botsPath);
+      renameSync(savedBotsPath, botsPath);
+      rmSync(externalRoot, { recursive: true, force: true });
+    }
   });
 });

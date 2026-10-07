@@ -168,6 +168,35 @@ export const revokeRuntimeToken = (id) => {
   botStreams.delete(id);
 };
 
+/**
+ * Widerruft beim Bot-Löschen sofort sämtlichen botgebundenen Sitzungszustand:
+ * Runtime-/Panel-Tokens, Panel-Sessions, Bootstrap-Tokens, Callback-Eintrag,
+ * Bot-Streams sowie alle Discord-OAuth-Zustände dieses Bots. Danach darf kein
+ * bereits ausgegebener Bot-Token mehr Zugriff erlauben – auch dann nicht, wenn
+ * ein späterer Cleanup-Schritt (Dateisystem/DB) noch fehlschlägt.
+ */
+export const revokeBotSessions = (id) => {
+  revokeRuntimeToken(id);
+  panelTokens.delete(id);
+  for (const [token, entry] of panelSessionTokens)
+    if (entry?.botId === id) panelSessionTokens.delete(token);
+  for (const [token, entry] of panelBootstrapTokens)
+    if (entry?.botId === id) panelBootstrapTokens.delete(token);
+  for (const [state, entry] of discordAuthStates)
+    if (entry?.botId === id) discordAuthStates.delete(state);
+  for (const [ticket, entry] of discordLoginTickets)
+    if (entry?.botId === id) discordLoginTickets.delete(ticket);
+  const deadSessions = new Set();
+  for (const [panelKey, sessionId] of discordPanelSessions)
+    if (panelKey === id || panelKey.startsWith(`${id}:`)) {
+      discordPanelSessions.delete(panelKey);
+      deadSessions.add(sessionId);
+    }
+  for (const [sessionId, session] of discordSessions)
+    if (session?.botId === id || deadSessions.has(sessionId))
+      discordSessions.delete(sessionId);
+};
+
 /** Token für die eingebettete Seite – darf lesen/speichern, aber nichts anmelden. */
 export const panelToken = (id) => {
   let token = panelTokens.get(id);
@@ -724,6 +753,7 @@ const panelDiscordAuth = async (bot, req, res, url, rest) => {
     }
     const sessionId = randomUUID();
     discordSessions.set(sessionId, {
+      botId: bot.id,
       user: {
         id: user.id,
         name: user.global_name ?? user.username,
@@ -801,6 +831,7 @@ const linkHubDiscordSession = async (
   const installedGuildIds = await botGuilds(bot);
   const sessionId = randomUUID();
   discordSessions.set(sessionId, {
+    botId: bot.id,
     user: {
       id: authSession.user.id,
       name: authSession.user.name,
@@ -1743,7 +1774,12 @@ const callCallback = async (bot, hook, command, args) => {
     // beiden Zeitpunkten kann sich ein DNS-Eintrag geändert haben.
     const parsed = new URL(hook.url);
     const address = await assertCallbackTarget(parsed);
-    const response = await requestCallback(parsed, address, hook.token, payload);
+    const response = await requestCallback(
+      parsed,
+      address,
+      hook.token,
+      payload,
+    );
     const raw = response.body;
     let data = raw;
     try {
