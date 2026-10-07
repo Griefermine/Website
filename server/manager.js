@@ -1275,7 +1275,8 @@ const spawnBot = (bot, dir, language) => {
 
     const crashed = code !== 0 && code !== null;
     const room = bot.autoRestart ? bot.maxRestarts : 0;
-    if (crashed && bot.restartCount < room) {
+    // Kein Auto-Restart während eines Löschvorgangs (siehe startBot).
+    if (crashed && bot.restartCount < room && !deletingBots.has(bot.id)) {
       const next = bot.restartCount + 1;
       setStatus(bot, 'restarting', {
         exitCode: code,
@@ -1285,6 +1286,7 @@ const spawnBot = (bot, dir, language) => {
       pushLine(bot.id, 'system', `Neustart ${next}/${room || '∞'} in 3s …`);
       bot.restartTimer = setTimeout(() => {
         bot.restartTimer = null;
+        if (!bots.has(bot.id) || deletingBots.has(bot.id)) return;
         startBot(bot.id, { manual: false }).catch((error) => {
           setStatus(bot, 'error', { exitCode: -1 });
           pushLine(
@@ -1368,6 +1370,10 @@ const uebernehmen = (bot) => {
 async function startBot(id, { manual = true } = {}) {
   const bot = bots.get(id);
   if (!bot) throw httpError(404, 'Bot nicht gefunden');
+  // Kein (Re-)Start während eines Löschvorgangs: sonst überlebt ein frisch
+  // gestarteter Prozess seinen Bot als Waise ohne Verzeichnis und Eintrag.
+  if (deletingBots.has(id))
+    throw httpError(409, 'Bot wird gerade gelöscht – bitte kurz warten');
   const dir = prepareStart(bot);
   uebernehmen(bot);
 
@@ -1579,6 +1585,14 @@ const normaliseConfig = (input, existing) => {
  */
 const deleteBotCompletely = async (bot, actor) => {
   const id = bot.id;
+  // Fail-fast vor jeder irreversiblen Aktion: eine ungültige ID darf nicht
+  // erst Tokens widerrufen und dann am Dateischritt scheitern.
+  if (
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(id) ||
+    id === '.' ||
+    id === '..'
+  )
+    throw httpError(500, 'Bot-Verzeichnis ist ungültig');
   const tag = `[hub] BOT_DELETE bot=${id} actor=${actor ?? '-'}`;
   console.log(`${tag} STARTED`);
   deletingBots.add(id);
@@ -1587,7 +1601,12 @@ const deleteBotCompletely = async (bot, actor) => {
     try {
       await task();
     } catch (error) {
-      cleanupErrors.push({ step, error: error?.message ?? String(error) });
+      // Antwortfähig machen: absolute Serverpfade gehören nicht in
+      // API-Antworten (nur Schritt + bereinigte Meldung).
+      const message = String(error?.message ?? error)
+        .split(PROJECT_ROOT)
+        .join('[hub]');
+      cleanupErrors.push({ step, error: message });
     }
   };
   try {
@@ -2139,7 +2158,8 @@ const handleApi = async (req, res, url) => {
           if (!target.child) {
             clearInterval(waitForExit);
             setTimeout(() => {
-              if (bots.has(id)) startBot(id).catch(() => {});
+              if (bots.has(id) && !deletingBots.has(id))
+                startBot(id).catch(() => {});
             }, 300);
           }
         }, 100);

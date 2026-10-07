@@ -194,8 +194,7 @@ const INDEX_HTML = `<!doctype html>
 `;
 
 export const SCAFFOLD_VERSION = 2;
-export const SCAFFOLD_MARKER =
-  '// Bot-Hub Scaffold v2 – Beispielseite (wird nie überschrieben).';
+export const SCAFFOLD_MARKER = `// Bot-Hub Scaffold v${SCAFFOLD_VERSION} – Beispielseite (wird nie überschrieben).`;
 
 const PANEL_JS = `${SCAFFOLD_MARKER}
 // Beispiel-Webseite: läuft in Sandbox (Origin "null"), spricht per
@@ -452,13 +451,6 @@ const adoptWorkspacePanel = (bot, projectRoot, base, rels) => {
 };
 
 /**
- * Scaffold anlegen, wo Dateien fehlen. Gibt zurück, was erstellt wurde.
- * Überschreibt nie – Beispiel bleibt Beispiel, eigene Seiten bleiben.
- * Fehler werden als `error` zurückgegeben (kein stilles Verschlucken):
- * Der Aufrufer entscheidet – melden statt abbrechen, damit ein fehlendes
- * Beispiel nie die Bot-Erstellung verhindert.
- */
-/**
  * Erkennt ein altes Hub-generiertes panel.js (V1, syntaktisch kaputt durch den
  * bedingten Spread `? ...entries.map`). Eigene Seiten enthalten dieses Muster
  * nicht und werden niemals angefasst – im Zweifel gilt eine Datei als
@@ -498,6 +490,13 @@ export const migrateScaffold = (bot, projectRoot) => {
   return { migrated };
 };
 
+/**
+ * Scaffold anlegen, wo Dateien fehlen. Gibt zurück, was erstellt wurde.
+ * Überschreibt nie – Beispiel bleibt Beispiel, eigene Seiten bleiben.
+ * Fehler werden als `error` zurückgegeben (kein stilles Verschlucken):
+ * Der Aufrufer entscheidet – melden statt abbrechen, damit ein fehlendes
+ * Beispiel nie die Bot-Erstellung verhindert.
+ */
 export const ensurePanelScaffold = (bot, projectRoot) => {
   const created = [];
   const skipped = [];

@@ -130,8 +130,8 @@ describe('Bot-Delete entfernt wirklich alles', async () => {
       body: { url: 'http://127.0.0.1:9/hook', token: 'cb-secret' },
     });
     assert.equal(cb.status, 200);
-    // Panel-Bootstrap-Token ausstellen.
-    bot.bootstrap = panel.issuePanelBootstrapToken(bot.id);
+    // Panel-Bootstrap-Token ausstellen (Widerruf separat im Unit-Teil geprüft).
+    panel.issuePanelBootstrapToken(bot.id);
     // Access-Rechte für zwei Benutzer auf zwei Bots vorbereiten.
     const auth = await import('../server/auth.js');
     auth.ensureAccessUser({ id: 'owner-1', name: 'O', username: 'o' });
