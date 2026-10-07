@@ -182,8 +182,11 @@ export const currentUser = (req) => session(req)?.user ?? null;
 // Discord-Access-Tokens bleiben dabei absichtlich außerhalb dieses Moduls.
 export const currentAuthSession = (req) => session(req);
 
-const saveAccess = () => {
-  if (!accessFile) return;
+const saveAccess = (strict = false) => {
+  if (!accessFile) {
+    if (strict) throw new Error('Zugriffsdatei ist nicht konfiguriert');
+    return;
+  }
   try {
     mkdirSync(dirname(accessFile), { recursive: true });
     writeFileSync(accessFile, `${JSON.stringify(access, null, 2)}\n`, {
@@ -195,6 +198,9 @@ const saveAccess = () => {
       '[hub] Zugriffsrechte konnten nicht gespeichert werden:',
       error.message,
     );
+    // Irreversible Schritte (Bot-Delete) dürfen Schreibfehler nicht
+    // verschlucken, sondern melden sie als Teilfehler.
+    if (strict) throw error;
   }
 };
 
@@ -421,7 +427,11 @@ export const purgeBotAccess = (botId) => {
       purged += 1;
     }
   }
-  if (purged) saveAccess();
+  // Immer persistieren (strict), sobald konfiguriert: War ein früherer
+  // Versuch an einem Schreibfehler gescheitert, ist der Speicher bereits
+  // bereinigt, aber die Datei noch nicht – erst das erneute Schreiben stellt
+  // Konvergenz her.
+  if (purged || accessFile) saveAccess(true);
   return purged;
 };
 

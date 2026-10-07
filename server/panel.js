@@ -2341,6 +2341,10 @@ const view = (panel) => {
     secrets: panel.secrets,
     state: panel.state,
     online: panel.online,
+    // Ob ein laufender Bot auf Aktionen hört (Callback registriert): Die
+    // Beispielseite deaktiviert Demo-Buttons sichtbar, solange kein Bot
+    // antworten kann – statt erst beim Klick mit 501 zu scheitern.
+    callback: Boolean(panel.callback),
     // Nur die sichtbaren Angaben – der Pfad des Skripts bleibt im Hub.
     commands: (panel.commands ?? []).map(
       ({ id, label, description, danger }) => ({ id, label, description, danger }),

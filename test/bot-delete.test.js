@@ -179,6 +179,8 @@ describe('Bot-Delete entfernt wirklich alles', async () => {
     });
     assert.equal(status, 200);
     assert.equal(data.deleted, true);
+    assert.equal(data.botId, bot.id);
+    assert.equal(data.status, 'deleted');
     // Bot-Datensatz weg, sofort persistiert (ohne Timer zu warten).
     assert.equal((await call(`/bots/${bot.id}`)).status, 404);
     const persisted = JSON.parse(
@@ -265,6 +267,8 @@ describe('Bot-Delete entfernt wirklich alles', async () => {
       });
       assert.equal(status, 500);
       assert.equal(data.deleted, false);
+      assert.equal(data.botId, victim.id);
+      assert.equal(data.status, 'cleanup_failed');
       assert.ok(
         Array.isArray(data.cleanupErrors) && data.cleanupErrors.length > 0,
       );
@@ -274,6 +278,30 @@ describe('Bot-Delete entfernt wirklich alles', async () => {
         'outside',
       );
       assert.equal((await call(`/bots/${victim.id}`)).status, 200);
+      // cleanup_failed sperrt: Start/Patch/Schreiben → 409, Lesen bleibt offen.
+      assert.equal(
+        (await call(`/bots/${victim.id}/start`, { method: 'POST' })).status,
+        409,
+      );
+      assert.equal(
+        (
+          await call(`/bots/${victim.id}`, {
+            method: 'PATCH',
+            body: { name: 'X', language: 'custom' },
+          })
+        ).status,
+        409,
+      );
+      assert.equal(
+        (
+          await call(`/bots/${victim.id}/files/x.txt`, {
+            method: 'PUT',
+            body: { inhalt: 'x' },
+          })
+        ).status,
+        409,
+      );
+      assert.equal((await call(`/bots/${victim.id}/panel`)).status, 200);
     } finally {
       unlinkSync(botsPath);
       renameSync(savedBotsPath, botsPath);
@@ -313,6 +341,299 @@ describe('Bot-Delete entfernt wirklich alles', async () => {
     state = await call(`/bots/${keeper.id}/panel`);
     assert.equal(state.data.panel.secrets.api_key, '');
     await call(`/bots/${keeper.id}`, { method: 'DELETE' });
+  });
+
+  it('Races mit Restart, Patch und Datei-Write enden gelöscht, ohne 500', async () => {
+    for (const [label, attempt] of [
+      ['restart', (id) => call(`/bots/${id}/restart`, { method: 'POST' })],
+      [
+        'patch',
+        (id) =>
+          call(`/bots/${id}`, {
+            method: 'PATCH',
+            body: { name: 'Race', language: 'custom' },
+          }),
+      ],
+      [
+        'file-write',
+        (id) =>
+          call(`/bots/${id}/files/race.txt`, {
+            method: 'PUT',
+            body: { inhalt: 'race' },
+          }),
+      ],
+    ]) {
+      const target = await createBot({
+        name: `Race-${label}`,
+        language: 'custom',
+        cwd: 'worker',
+        entrypoint: 'bot.sh',
+        command: 'sh {entrypoint}',
+      });
+      const results = await Promise.allSettled([
+        call(`/bots/${target.id}`, { method: 'DELETE' }),
+        attempt(target.id),
+      ]);
+      for (const result of results) {
+        if (result.status === 'fulfilled')
+          assert.ok(
+            [200, 202, 400, 404, 409].includes(result.value.status),
+            `${label}: unerwartet ${result.value.status}`,
+          );
+        else assert.fail(`${label}: Request warf ${result.reason}`);
+      }
+      assert.equal((await call(`/bots/${target.id}`)).status, 404, label);
+    }
+  });
+
+  it('Delete während aktiver Auto-Restart-Schleife hinterlässt keinen Prozess', async () => {
+    writeFileSync(join(root, 'worker', 'crash.sh'), 'exit 1\n');
+    const crasher = await createBot({
+      name: 'Absturz-Bot',
+      language: 'custom',
+      cwd: 'worker',
+      entrypoint: 'crash.sh',
+      command: 'sh {entrypoint}',
+      autoRestart: true,
+      maxRestarts: 50,
+    });
+    assert.equal(
+      (await call(`/bots/${crasher.id}/start`, { method: 'POST' })).status,
+      202,
+    );
+    // Auf die Crash-Schleife warten: Status wird restarting.
+    let restarting = false;
+    for (let i = 0; i < 100; i += 1) {
+      const { data } = await call(`/bots/${crasher.id}`);
+      if (data.bot?.status === 'restarting') {
+        restarting = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.ok(restarting, 'Bot sollte in der Restart-Schleife sein');
+    const del = await call(`/bots/${crasher.id}`, { method: 'DELETE' });
+    assert.equal(del.status, 200);
+    // Kein Orphan: Bot bleibt weg, auch nach der Restart-Verzögerung.
+    await new Promise((resolve) => setTimeout(resolve, 4000));
+    assert.equal((await call(`/bots/${crasher.id}`)).status, 404);
+  });
+
+  it('DB-Fehler führt zu cleanup_failed und ist wiederholbar', async () => {
+    const { database } = await import('../server/database.js');
+    const store = database();
+    const failing = await createBot({
+      name: 'DB-Fehler-Bot',
+      language: 'custom',
+      cwd: 'worker',
+      entrypoint: 'bot.sh',
+      command: 'sh {entrypoint}',
+    });
+    const original = store.removeBot;
+    store.removeBot = async () => {
+      throw new Error('simulierter DB-Ausfall');
+    };
+    try {
+      const { status, data } = await call(`/bots/${failing.id}`, {
+        method: 'DELETE',
+      });
+      assert.equal(status, 500);
+      assert.equal(data.deleted, false);
+      assert.equal(data.status, 'cleanup_failed');
+      assert.ok(data.cleanupErrors.some((entry) => entry.step === 'database'));
+      assert.equal(
+        (await call(`/bots/${failing.id}/start`, { method: 'POST' })).status,
+        409,
+      );
+    } finally {
+      store.removeBot = original;
+    }
+    const retry = await call(`/bots/${failing.id}`, { method: 'DELETE' });
+    assert.equal(retry.status, 200);
+    assert.equal((await call(`/bots/${failing.id}`)).status, 404);
+  });
+
+  it('Secret-Fehler führt zu cleanup_failed und ist wiederholbar', async () => {
+    const failing = await createBot({
+      name: 'Secret-Fehler-Bot',
+      language: 'custom',
+      cwd: 'worker',
+      entrypoint: 'bot.sh',
+      command: 'sh {entrypoint}',
+    });
+    const secretsPath = join(root, 'data', 'secrets');
+    const savedSecretsPath = join(root, 'data', 'secrets-saved');
+    renameSync(secretsPath, savedSecretsPath);
+    writeFileSync(secretsPath, 'kein-verzeichnis');
+    try {
+      const { status, data } = await call(`/bots/${failing.id}`, {
+        method: 'DELETE',
+      });
+      assert.equal(status, 500);
+      assert.equal(data.status, 'cleanup_failed');
+      assert.ok(data.cleanupErrors.some((entry) => entry.step === 'secrets'));
+    } finally {
+      unlinkSync(secretsPath);
+      renameSync(savedSecretsPath, secretsPath);
+    }
+    const retry = await call(`/bots/${failing.id}`, { method: 'DELETE' });
+    assert.equal(retry.status, 200);
+    assert.equal((await call(`/bots/${failing.id}`)).status, 404);
+  });
+
+  it('Access-Fehler führt zu cleanup_failed und ist wiederholbar', async () => {
+    const failing = await createBot({
+      name: 'Access-Fehler-Bot',
+      language: 'custom',
+      cwd: 'worker',
+      entrypoint: 'bot.sh',
+      command: 'sh {entrypoint}',
+    });
+    const auth = await import('../server/auth.js');
+    auth.ensureAccessUser({ id: 'user-c', name: 'C', username: 'c' });
+    auth.updateAccess(
+      'user-c',
+      {
+        role: 'admin',
+        permissions: ['bots.read'],
+        bots: { [failing.id]: { permissions: ['bots.read'] } },
+      },
+      'owner-1',
+    );
+    const accessPath = join(root, 'data', 'access.json');
+    const savedAccessPath = join(root, 'data', 'access.json.saved');
+    renameSync(accessPath, savedAccessPath);
+    mkdirSync(accessPath);
+    try {
+      const { status, data } = await call(`/bots/${failing.id}`, {
+        method: 'DELETE',
+      });
+      assert.equal(status, 500);
+      assert.equal(data.status, 'cleanup_failed');
+      assert.ok(data.cleanupErrors.some((entry) => entry.step === 'access'));
+    } finally {
+      rmSync(accessPath, { recursive: true, force: true });
+      renameSync(savedAccessPath, accessPath);
+    }
+    const retry = await call(`/bots/${failing.id}`, { method: 'DELETE' });
+    assert.equal(retry.status, 200);
+    const access = JSON.parse(readFileSync(accessPath, 'utf8'));
+    assert.ok(!JSON.stringify(access.users['user-c']).includes(failing.id));
+  });
+
+  it('bots.json-Fehler meldet cleanup_failed, Retry nach Wiederherstellung klappt', async () => {
+    const failing = await createBot({
+      name: 'Persist-Fehler-Bot',
+      language: 'custom',
+      cwd: 'worker',
+      entrypoint: 'bot.sh',
+      command: 'sh {entrypoint}',
+    });
+    const botsFile = join(root, 'data', 'bots.json');
+    const savedBotsFile = join(root, 'data', 'bots.json.saved');
+    renameSync(botsFile, savedBotsFile);
+    mkdirSync(botsFile);
+    let first;
+    try {
+      first = await call(`/bots/${failing.id}`, { method: 'DELETE' });
+      assert.equal(first.status, 500);
+      assert.equal(first.data.status, 'cleanup_failed');
+      assert.equal(first.data.cleanupErrors[0].step, 'persist-state');
+      // Noch nichts Destruktives passiert: Bot bleibt normal nutzbar.
+      assert.equal((await call(`/bots/${failing.id}`)).status, 200);
+      assert.equal(
+        (await call(`/bots/${failing.id}/start`, { method: 'POST' })).status,
+        202,
+      );
+      await call(`/bots/${failing.id}/stop`, { method: 'POST' });
+    } finally {
+      rmSync(botsFile, { recursive: true, force: true });
+      renameSync(savedBotsFile, botsFile);
+    }
+    const retry = await call(`/bots/${failing.id}`, { method: 'DELETE' });
+    assert.equal(retry.status, 200);
+    assert.equal((await call(`/bots/${failing.id}`)).status, 404);
+  });
+});
+
+describe('Delete-Recovery nach Hub-Neustart', () => {
+  it('cleanup_failed wird beim Start vollendet, Bot startet nie', async () => {
+    const { spawn } = await import('node:child_process');
+    const root = mkdtempSync(join(tmpdir(), 'bot-hub-recovery-'));
+    mkdirSync(join(root, 'data'), { recursive: true });
+    const botId = 'deadbeef-dead-beef-dead-beefdeadbeef';
+    mkdirSync(join(root, 'dist'), { recursive: true });
+    writeFileSync(join(root, 'dist', 'index.html'), '<!doctype html>');
+    // Abgebrochener Delete-Zustand: Eintrag + Reste auf der Platte.
+    writeFileSync(
+      join(root, 'data', 'bots.json'),
+      JSON.stringify([
+        {
+          id: botId,
+          name: 'Recovery-Bot',
+          language: 'custom',
+          entrypoint: 'bot.sh',
+          command: 'sh {entrypoint}',
+          deleteState: 'cleanup_failed',
+        },
+      ]),
+    );
+    mkdirSync(join(root, 'bots', botId, 'workspace'), { recursive: true });
+    writeFileSync(join(root, 'bots', botId, 'workspace', 'rest.txt'), 'rest');
+    mkdirSync(join(root, 'data', 'secrets'), { recursive: true });
+    writeFileSync(join(root, 'data', 'secrets', `${botId}.env`), 'X=y\n');
+    const child = spawn(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `
+        process.env.NODE_ENV = 'test';
+        process.env.BOT_HUB_TEST_MODE = '1';
+        process.env.BOT_DASHBOARD_ROOT = ${JSON.stringify(root)};
+        const { createServer } = await import('node:http');
+        const { createServer: createApp } = await import(${JSON.stringify(join(process.cwd(), 'server', 'manager.js'))});
+        const server = createServer(createApp());
+        await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+        const base = 'http://127.0.0.1:' + server.address().port;
+        let gone = false;
+        for (let i = 0; i < 100; i += 1) {
+          const res = await fetch(base + '/api/bots/${botId}');
+          if (res.status === 404) { gone = true; break; }
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        const list = await (await fetch(base + '/api/bots')).json();
+        process.stdout.write(JSON.stringify({ gone, count: list.bots?.length ?? -1 }));
+        server.closeAllConnections?.();
+        server.close();
+        process.exit(0);
+        `,
+      ],
+      {
+        cwd: join(process.cwd()),
+        env: {
+          PATH: process.env.PATH,
+          HOME: process.env.HOME,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+    let out = '';
+    child.stdout.on('data', (data) => (out += data));
+    let err = '';
+    child.stderr.on('data', (data) => (err += data));
+    const code = await new Promise((resolve) => {
+      child.once('exit', resolve);
+      setTimeout(() => child.kill('SIGKILL'), 30_000).unref();
+    });
+    assert.equal(code, 0, `Kindprozess starb: ${err.slice(-500)}`);
+    const jsonLine = out.split('\n').find((line) => line.startsWith('{'));
+    const result = JSON.parse(jsonLine);
+    assert.equal(result.gone, true);
+    assert.equal(result.count, 0);
+    assert.ok(!existsSync(join(root, 'bots', botId)));
+    assert.ok(!existsSync(join(root, 'data', 'secrets', `${botId}.env`)));
+    rmSync(root, { recursive: true, force: true });
   });
 });
 

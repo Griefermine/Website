@@ -304,6 +304,20 @@ describe('Panel-Scaffold für jeden Bot', async () => {
     }
   });
 
+  it('Demo-Buttons sind ohne laufenden Bot sichtbar deaktiviert', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bot-hub-scaffold-disabled-'));
+    const bot = { id: 'disabled-bot', name: 'Disabled', cwd: '.' };
+    ensurePanelScaffold(bot, root);
+    const { startFolderPath } = await import('../server/botFiles.js');
+    const js = readFileSync(
+      join(startFolderPath(bot, root), 'panel', 'panel.js'),
+      'utf8',
+    );
+    // Sichtbar deaktiviert statt erst beim Klick zu scheitern.
+    assert.ok(js.includes('disabled'));
+    assert.ok(js.includes('braucht einen laufenden Bot'));
+  });
+
   it('leere Secret-Felder werden nicht gesendet, Löschen braucht den Knopf', async () => {
     const root = mkdtempSync(join(tmpdir(), 'bot-hub-scaffold-secret-'));
     const bot = { id: 'secret-bot', name: 'Secret', cwd: '.' };

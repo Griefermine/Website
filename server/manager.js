@@ -1,17 +1,22 @@
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import {
+  closeSync,
   existsSync,
+  fsyncSync,
   lstatSync,
   chmodSync,
   cpSync,
+  openSync,
   readFileSync,
+  renameSync,
   writeFileSync,
   mkdirSync,
   rmSync,
   readdirSync,
   statSync,
   realpathSync,
+  unlinkSync,
 } from 'node:fs';
 import {
   dirname,
@@ -237,8 +242,34 @@ const dirty = new Set();
  * bleiben erlaubt.
  */
 const deletingBots = new Set();
-const assertNotDeleting = (id) => {
-  if (deletingBots.has(id))
+/**
+ * Sperrprüfung für den Delete-Lifecycle: In-Flight-Löschungen (Speicher) und
+ * persistente Zustände (`deleting`/`cleanup_failed`, über Neustarts hinweg)
+ * blockieren Start, Restart, Installation sowie Konfigurations-, Datei- und
+ * Panel-Schreibzugriffe mit 409. Lesezugriffe und ein erneuter DELETE bleiben
+ * erlaubt, damit der Cleanup wiederholbar ist.
+ */
+const isDeleteLocked = (bot) =>
+  Boolean(
+    bot &&
+    (deletingBots.has(bot.id) ||
+      bot.deleteState === 'deleting' ||
+      bot.deleteState === 'cleanup_failed'),
+  );
+const assertNotDeleting = (bot) => {
+  if (isDeleteLocked(bot))
+    throw httpError(
+      409,
+      'Bot wird gerade gelöscht oder Cleanup steht aus – erst Cleanup abschließen',
+    );
+};
+/**
+ * Lock nur für In-Flight-Löschungen: Ein erneuter DELETE auf einem Bot in
+ * `cleanup_failed` muss den Cleanup wiederholen dürfen (Retry), nur eine
+ * gerade laufende Löschung desselben Bots wird mit 409 abgewiesen.
+ */
+const assertNoDeleteInFlight = (bot) => {
+  if (bot && deletingBots.has(bot.id))
     throw httpError(409, 'Bot wird gerade gelöscht – bitte kurz warten');
 };
 
@@ -253,13 +284,28 @@ const schedulePersist = () => {
 
 const flush = (strict = false) => {
   dirty.clear();
+  // Atomar: tmp schreiben + fsync + rename. Ein Absturz hinterlässt nie eine
+  // halb geschriebene bots.json, sondern höchstens eine tmp-Leiche.
+  const tmp = `${DATA_FILE}.${process.pid}.tmp`;
   try {
     mkdirSync(dirname(DATA_FILE), { recursive: true });
-    writeFileSync(DATA_FILE, `${JSON.stringify(toFile(), null, 2)}\n`, {
+    writeFileSync(tmp, `${JSON.stringify(toFile(), null, 2)}\n`, {
       mode: 0o600,
     });
-    chmodSync(DATA_FILE, 0o600);
+    const fd = openSync(tmp, 'r');
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, DATA_FILE);
   } catch (error) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* tmp-Leiche ist harmlos, der Fehler zählt */
+    }
     // Der Timer darf nie abstürzen; ein irreversibler Delete muss einen
     // Persistenzfehler dagegen als Teilfehler melden statt ihn zu schlucken.
     console.error('[hub] Speichern fehlgeschlagen:', error.message);
@@ -734,6 +780,12 @@ const hydrate = (config) => {
     pid: null,
     exitCode: config.exitCode ?? null,
     restartCount: config.restartCount ?? 0,
+    // Persistenter Delete-Lifecycle (V23): 'active' normal, 'deleting' und
+    // 'cleanup_failed' sperren Start/Restart/Schreibzugriffe – auch über
+    // Hub-Neustarts hinweg, bis Recovery den Cleanup vollendet.
+    deleteState: ['deleting', 'cleanup_failed'].includes(config.deleteState)
+      ? config.deleteState
+      : 'active',
     startedAt: null,
     stoppedAt: null,
     depsStatus: 'unknown',
@@ -1276,7 +1328,7 @@ const spawnBot = (bot, dir, language) => {
     const crashed = code !== 0 && code !== null;
     const room = bot.autoRestart ? bot.maxRestarts : 0;
     // Kein Auto-Restart während eines Löschvorgangs (siehe startBot).
-    if (crashed && bot.restartCount < room && !deletingBots.has(bot.id)) {
+    if (crashed && bot.restartCount < room && !isDeleteLocked(bot)) {
       const next = bot.restartCount + 1;
       setStatus(bot, 'restarting', {
         exitCode: code,
@@ -1372,7 +1424,7 @@ async function startBot(id, { manual = true } = {}) {
   if (!bot) throw httpError(404, 'Bot nicht gefunden');
   // Kein (Re-)Start während eines Löschvorgangs: sonst überlebt ein frisch
   // gestarteter Prozess seinen Bot als Waise ohne Verzeichnis und Eintrag.
-  if (deletingBots.has(id))
+  if (isDeleteLocked(bot))
     throw httpError(409, 'Bot wird gerade gelöscht – bitte kurz warten');
   const dir = prepareStart(bot);
   uebernehmen(bot);
@@ -1522,6 +1574,41 @@ const load = () => {
   } catch (error) {
     console.error('[hub] bots.json unlesbar:', error.message);
   }
+  // Recovery unvollständiger Löschungen: Bots in `deleting`/`cleanup_failed`
+  // werden NICHT gestartet, sondern der Cleanup wird erneut versucht. Erfolg
+  // entfernt sie endgültig, Fehler belassen `cleanup_failed`. Läuft
+  // nebenläufig, damit ein hängender Schritt den Hub-Start nicht blockiert.
+  recoverIncompleteDeletes().catch((error) =>
+    console.error(
+      '[hub] Delete-Recovery fehlgeschlagen:',
+      error?.message ?? error,
+    ),
+  );
+};
+
+/**
+ * Startup-Recovery für abgebrochene Löschungen (P0 #10): Bots, die beim
+ * letzten Lauf in `deleting` oder `cleanup_failed` stehen geblieben sind,
+ * werden nie gestartet – stattdessen läuft derselbe idempotente Workflow wie
+ * bei DELETE. Erfolg → endgültig entfernt; Fehler → `cleanup_failed` bleibt.
+ */
+const recoverIncompleteDeletes = async () => {
+  for (const bot of [...bots.values()]) {
+    if (bot.deleteState !== 'deleting' && bot.deleteState !== 'cleanup_failed')
+      continue;
+    // Absturz mitten im Delete wird wie cleanup_failed behandelt.
+    if (bot.deleteState === 'deleting') bot.deleteState = 'cleanup_failed';
+    console.log(
+      `${auditTag(bot.id, 'recovery')} RECOVERY-STARTED state=${bot.deleteState}`,
+    );
+    try {
+      await deleteBotCompletely(bot, 'recovery');
+    } catch (error) {
+      console.error(
+        `${auditTag(bot.id, 'recovery')} RECOVERY-FAILED: ${error?.message ?? error}`,
+      );
+    }
+  }
 };
 
 /* ------------------------------- HTTP ------------------------------- */
@@ -1574,15 +1661,19 @@ const normaliseConfig = (input, existing) => {
  * Zentraler Bot-Löschworkflow: genau eine Stelle kennt die Reihenfolge, kein
  * duplizierter Cleanup anderswo.
  *
- * Phase A sperrt den Bot (deleting-Flag gegen Start/Restart/Schreib-Races),
+ * Persistenter Lifecycle: `deleting` wird VOR dem ersten irreversiblen
+ * Schritt gesetzt und sofort persistiert (atomar), `cleanup_failed` bei
+ * Teilfehlern ebenfalls. Beide Zustände sperren Start/Restart/Schreibzugriffe
+ * – auch über Hub-Neustarts hinweg, bis Recovery den Cleanup vollendet.
  * Phase B widerruft sofort alle Tokens/Sessions (gilt auch bei späterem
  * Fehler), danach folgen C Runtime-Stopp, D DB, E Secrets, F Dateien,
- * G Access-Bereinigung und H Persistenz. Jeder Schritt läuft einzeln in
- * try/catch: Teilfehler werden gesammelt, der Cleanup läuft weiter, und erst
- * am Ende entscheidet sich die Antwort – 200 nur bei vollständigem Erfolg,
- * sonst 500 mit cleanupErrors und der Bot bleibt (erneut löschbar, alle
- * Schritte sind idempotent) im Bestand.
+ * G Access-Bereinigung und H finale Persistenz. Antwort 200 nur bei
+ * vollständigem Erfolg, sonst 500 mit cleanupErrors – der Bot bleibt
+ * gesperrt und erneut löschbar, alle Schritte sind idempotent.
  */
+const auditTag = (id, actor) =>
+  `[hub] BOT_DELETE bot=${id} actor=${actor ?? '-'} ts=${new Date().toISOString()}`;
+
 const deleteBotCompletely = async (bot, actor) => {
   const id = bot.id;
   // Fail-fast vor jeder irreversiblen Aktion: eine ungültige ID darf nicht
@@ -1593,9 +1684,50 @@ const deleteBotCompletely = async (bot, actor) => {
     id === '..'
   )
     throw httpError(500, 'Bot-Verzeichnis ist ungültig');
-  const tag = `[hub] BOT_DELETE bot=${id} actor=${actor ?? '-'}`;
+  const tag = auditTag(id, actor);
   console.log(`${tag} STARTED`);
   deletingBots.add(id);
+  const fail = (steps) => {
+    const failure = httpError(
+      500,
+      `Bot konnte nicht vollständig gelöscht werden (${steps.map((entry) => entry.step).join(', ')}). Erneut versuchen – der Cleanup ist idempotent.`,
+    );
+    failure.cleanupErrors = steps;
+    failure.deleted = false;
+    failure.botId = id;
+    failure.deleteStatus = 'cleanup_failed';
+    return failure;
+  };
+  const markFailed = (steps) => {
+    // Persistenter cleanup_failed-State: Bot bleibt gesperrt, bis ein
+    // erneuter DELETE (oder Recovery nach Neustart) ihn vollendet.
+    bot.deleteState = 'cleanup_failed';
+    try {
+      dirty.add(id);
+      flush(true);
+    } catch (error) {
+      console.error(
+        `${tag} FAILED step=persist-state: ${error?.message ?? error}`,
+      );
+    }
+  };
+  // Lifecycle zuerst persistieren: Stürzt der Hub danach ab, findet Recovery
+  // den Bot als `deleting` und vollendet den Cleanup nach dem Neustart.
+  const previousState = bot.deleteState ?? 'active';
+  bot.deleteState = 'deleting';
+  try {
+    dirty.add(id);
+    flush(true);
+  } catch (error) {
+    bot.deleteState = previousState;
+    deletingBots.delete(id);
+    console.error(
+      `${tag} FAILED step=persist-state: ${error?.message ?? error}`,
+    );
+    throw fail([
+      { step: 'persist-state', error: error?.message ?? String(error) },
+    ]);
+  }
   const cleanupErrors = [];
   const attempt = async (step, task) => {
     try {
@@ -1657,45 +1789,36 @@ const deleteBotCompletely = async (bot, actor) => {
     });
     await attempt('access', async () => purgeBotAccess(id));
     if (cleanupErrors.length) {
-      // Teilfehler: Bot bleibt bewusst im Bestand (nicht als gelöscht
-      // markiert, keine Persistenz des Löschens), damit ein erneuter DELETE
-      // den idempotenten Cleanup wiederholen kann.
+      // Teilfehler: Bot bleibt gesperrt im Bestand (persistent
+      // cleanup_failed, nie zurück in einen normalen Zustand), damit ein
+      // erneuter DELETE – oder Recovery nach Neustart – den idempotenten
+      // Cleanup wiederholen kann.
       for (const { step, error } of cleanupErrors)
         console.error(`${tag} FAILED step=${step}: ${error}`);
-      const failure = httpError(
-        500,
-        `Bot konnte nicht vollständig gelöscht werden (${cleanupErrors.map((entry) => entry.step).join(', ')}). Erneut versuchen – der Cleanup ist idempotent.`,
-      );
-      failure.cleanupErrors = cleanupErrors;
-      failure.deleted = false;
-      throw failure;
+      markFailed(cleanupErrors);
+      throw fail(cleanupErrors);
     }
     try {
       bots.delete(id);
       dirty.add(id);
       flush(true);
     } catch (error) {
-      // Persistenzfehlschlag: Bot zurück in den Bestand, damit ein erneuter
-      // DELETE den Cleanup wiederholen kann statt eine Karteileiche zu
-      // hinterlassen.
+      // Persistenzfehlschlag: Bot zurück in den Bestand und sperren, damit
+      // kein scheinbar normaler Bot mit gelöschten Dateien/DB zurückbleibt.
       bots.set(id, bot);
       console.error(`${tag} FAILED step=persist: ${error?.message ?? error}`);
-      const failure = httpError(
-        500,
-        'Bot konnte nicht vollständig gelöscht werden (persist). Erneut versuchen – der Cleanup ist idempotent.',
-      );
-      failure.cleanupErrors = [
+      const steps = [
         { step: 'persist', error: error?.message ?? String(error) },
       ];
-      failure.deleted = false;
-      throw failure;
+      markFailed(steps);
+      throw fail(steps);
     }
   } finally {
     deletingBots.delete(id);
   }
   console.log(`${tag} COMPLETED`);
   broadcast('deleted', { id });
-  return { deleted: true, id };
+  return { deleted: true, botId: id, status: 'deleted' };
 };
 
 /**
@@ -2063,7 +2186,7 @@ const handleApi = async (req, res, url) => {
       return sendJson(res, 200, { bot: publicBot(bot) });
     if (!action && req.method === 'PATCH') {
       permission('bots.manage');
-      assertNotDeleting(id);
+      assertNotDeleting(bot);
       const body = await readBody(req);
       const config = normaliseConfig(body, bot);
       if (!safeBotPath(bot, config.cwd))
@@ -2087,7 +2210,7 @@ const handleApi = async (req, res, url) => {
     }
     if (!action && req.method === 'DELETE') {
       permission('bots.delete');
-      assertNotDeleting(id);
+      assertNoDeleteInFlight(bot);
       const result = await deleteBotCompletely(
         bot,
         currentUser(req)?.id ?? null,
@@ -2096,7 +2219,7 @@ const handleApi = async (req, res, url) => {
     }
     if (action === 'start' && req.method === 'POST') {
       permission('bots.control');
-      assertNotDeleting(id);
+      assertNotDeleting(bot);
       prepareStart(bot);
       setStatus(bot, 'checking', { pid: null, stoppedAt: Date.now() });
       startBot(id).catch((error) => {
@@ -2107,7 +2230,7 @@ const handleApi = async (req, res, url) => {
     }
     if (action === 'files') {
       permission('bots.manage');
-      if (req.method !== 'GET') assertNotDeleting(id);
+      if (req.method !== 'GET') assertNotDeleting(bot);
       const handled = await handleFileRoutes(req, res, url, bot);
       if (handled !== false) return handled;
       throw httpError(404, 'Unbekannter Datei-Endpunkt');
@@ -2115,7 +2238,7 @@ const handleApi = async (req, res, url) => {
 
     if (action === 'install' && req.method === 'POST') {
       permission('bots.manage');
-      assertNotDeleting(id);
+      assertNotDeleting(bot);
       const dir = safeBotPath(bot, bot.cwd);
       if (!dir)
         throw httpError(
@@ -2150,7 +2273,7 @@ const handleApi = async (req, res, url) => {
     }
     if (action === 'restart' && req.method === 'POST') {
       permission('bots.restart');
-      assertNotDeleting(id);
+      assertNotDeleting(bot);
       stopBot(id, { signal: 'SIGTERM' });
       const target = bots.get(id);
       if (target) {
@@ -2180,7 +2303,7 @@ const handleApi = async (req, res, url) => {
     if (action === 'panel') {
       // Lesende Panel-Zugriffe bleiben während eines Löschvorgangs erlaubt,
       // alles Schreibende (Settings, Commands, State, Login/Logout) nicht.
-      if (req.method !== 'GET') assertNotDeleting(id);
+      if (req.method !== 'GET') assertNotDeleting(bot);
       if (req.method === 'GET' && url.pathname.endsWith('/panel/open')) {
         permission('panel.read');
         ensurePanel(bot);
@@ -2396,6 +2519,8 @@ export const createServer = () => {
         const body = { error: error.message };
         if (error.cleanupErrors) body.cleanupErrors = error.cleanupErrors;
         if (error.deleted !== undefined) body.deleted = error.deleted;
+        if (error.botId !== undefined) body.botId = error.botId;
+        if (error.deleteStatus !== undefined) body.status = error.deleteStatus;
         return sendJson(res, status, body);
       }
       return res.end();

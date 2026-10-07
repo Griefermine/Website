@@ -1002,8 +1002,8 @@ zeigen, die nach einem Fehler aussieht.
 if (action === 'delete') {
   if (
     !confirm(
-      `"${bot.name}" wirklich löschen? Konfiguration und Logs gehen verloren. ` +
-        'Die Dateien im Startordner bleiben liegen.',
+      `"${bot.name}" und alle zugehörigen Dateien sowie gespeicherten Bot-Daten wirklich löschen? ` +
+        'Diese Aktion kann nicht rückgängig gemacht werden.',
     )
   )
     return undefined;
@@ -1021,15 +1021,27 @@ if (action === 'delete') {
 Vor dem Löschen wird gefragt:
 
 ```text
-"Mein Bot" wirklich löschen?
-Konfiguration und Logs gehen verloren.
-Die Dateien im Startordner bleiben liegen.
+"Mein Bot" und alle zugehörigen Dateien sowie gespeicherten Bot-Daten wirklich löschen?
+Diese Aktion kann nicht rückgängig gemacht werden.
 ```
 
-Der letzte Satz steht da, weil es wahr ist: Ein Löschen im Panel entfernt nur
-den Bot aus dem Hub. Startordner und Workspace bleiben als Ordner auf der
-Platte stehen, damit niemand hochgeladene Quelldateien aus Versehen verliert.
-Wer sie auch weghaben will, entfernt `bots/<id>` von Hand.
+Ein Löschen entfernt vollständig und unwiderruflich:
+
+```text
+Bot-Datensatz und bots.json-Eintrag
+bots/<id>/ (Startordner und Workspace, inkl. node_modules und Panel-Seiten)
+data/secrets/<id>.env
+Bot-Datenbankdaten und Quota-Zähler
+Bot-Container (wenn die Container-Runtime aktiv ist)
+Runtime-/Panel-Tokens und Sitzungen (sofort ungültig)
+botbezogene Discord-OAuth-Zustände
+Per-Bot-Rechte aller Benutzer für diese Bot-ID
+```
+
+Läuft gerade ein Löschvorgang oder ist ein Cleanup fehlgeschlagen
+(`cleanup_failed`), sind Start, Restart und Schreibzugriffe gesperrt (409),
+bis ein erneuter Delete den idempotenten Cleanup vollendet – auch über
+Hub-Neustarts hinweg (Startup-Recovery).
 
 Wenn der Benutzer abbricht, wird nichts weiter ausgeführt:
 

@@ -71,9 +71,12 @@ Benennung erraten.
   im Workspace) bleibt, wie er ist; der Startordner wird beim nächsten Hub-Start
   daneben angelegt und von da an gespiegelt. Der Einstiegspunkt eines solchen
   Bots muss dort liegen, wo sein bisheriges Feld es hinlegt.
-- **Ein Löschen im Panel löscht keine Dateien.** Wie bisher bleiben Workspace
-  und Container stehen; der Startordner kommt hinzu. Wer einen Bot endgültig
-  weghaben will, entfernt `bots/<id>` von Hand.
+- **Ein Löschen entfernt alles.** Bots werden samt Startordner, Workspace
+  (inkl. Container), Secrets, Datenbankdaten, Tokens, Sitzungen und
+  Per-Bot-Rechten vollständig gelöscht. Wer einen Bot endgültig
+  weghaben will, löscht ihn im Panel – `bots/<id>` von Hand zu entfernen
+  ist nicht mehr nötig und umgeht den sicheren Cleanup (Token-Widerruf,
+  Quota-Bereinigung).
 
 Der Container läuft mit derselben UID/GID wie der Bot-Hub-Prozess. Dadurch
 bleiben die restriktiven Host-Dateirechte wirksam, ohne dass der Container für

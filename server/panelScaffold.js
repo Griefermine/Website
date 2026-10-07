@@ -316,10 +316,15 @@ void (async () => {
       }),
     );
     const actions = $('actions');
+    // Ohne laufenden Bot (und ohne Callback) kann keine Aktion antworten:
+    // Buttons sichtbar deaktivieren statt erst beim Klick zu scheitern.
+    const reachable = Boolean(data?.online || data?.callback);
     actions.replaceChildren(
       ...(data?.commands ?? []).map((c) =>
         h('button', {
           type: 'button', text: c.label,
+          disabled: reachable ? null : true,
+          title: reachable ? null : 'Beispiel-Aktion – braucht einen laufenden Bot',
           onclick: async () => {
             try {
               const r = await hub.command(c.id, {});
