@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>Bot · Webseite</title>
+    <link rel="stylesheet" href="panel.css" />
+  </head>
+  <body>
+    <main class="wrap">
+      <header class="card hero">
+        <div class="hero__avatar" id="avatar">🤖</div>
+        <div>
+          <div class="eyebrow">Bot-Hub · Beispiel-Webseite</div>
+          <h1 id="title">Bot</h1>
+          <p class="sub" id="sub">Verbinde …</p>
+          <span class="pill" id="conn"><span class="dot"></span>verbinde …</span>
+        </div>
+      </header>
+
+      <section class="card" id="discord-section">
+        <div class="card__head">
+          <h2>Discord-Login (Beispiel)</h2>
+          <span class="spacer"></span>
+          <span class="pill" id="discord-status">nicht angemeldet</span>
+        </div>
+        <div class="card__body">
+          <p class="hint" id="discord-hint">
+            So bindest du Discord-OAuth ein: Hub fragt <code>discord/config</code>,
+            Browser öffnet die Login-Adresse als Navigation, Callback landet im
+            Hub. Richte dafür <code>DISCORD_CLIENT_ID</code> /
+            <code>DISCORD_CLIENT_SECRET</code> in
+            <code>data/secrets/&lt;bot-id&gt;.env</code> ein (Hub-seitig, nie im
+            Workspace).
+          </p>
+          <div id="discord-login-row">
+            <button class="btn--primary" id="discord-login" type="button">
+              Mit Discord anmelden
+            </button>
+          </div>
+          <div id="discord-user-row" hidden></div>
+          <div class="guild-list" id="guild-list" hidden></div>
+          <p class="empty" id="guilds-empty" hidden>Keine berechtigten Server.</p>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card__head"><h2>Live-Werte</h2></div>
+        <div class="card__body"><div id="stats"><p class="empty">Noch keine Werte.</p></div></div>
+      </section>
+
+      <section class="card">
+        <div class="card__head"><h2>Einstellungen</h2></div>
+        <div class="card__body">
+          <form id="settings"><div id="fields"></div></form>
+          <div class="row">
+            <button class="btn--primary" id="save" type="submit" form="settings">Speichern</button>
+            <span class="status" id="save-status"></span>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card__head"><h2>Aktionen</h2></div>
+        <div class="card__body"><div id="actions"></div></div>
+      </section>
+
+      <section class="card">
+        <div class="card__head"><h2>Log</h2></div>
+        <div class="card__body"><ul class="log" id="log"></ul></div>
+      </section>
+    </main>
+    <script src="panel.js"></script>
+  </body>
+</html>

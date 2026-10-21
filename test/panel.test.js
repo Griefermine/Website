@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -147,7 +147,7 @@ before(async () => {
   mkdirSync(join(root, 'fremd'));
   writeFileSync(
     join(root, 'worker', 'bot.sh'),
-    'echo "hub=$BOT_HUB_URL"\necho "token=$BOT_HUB_TOKEN"\necho "settings=$BOT_HUB_SETTINGS"\necho "setting=$BOT_HUB_SETTING_LOG_CHANNEL"\nsleep 30\n',
+    'echo "hub=$BOT_HUB_URL"\necho "token=$BOT_HUB_TOKEN"\nprintf "%s" "$BOT_HUB_TOKEN" > runtime-token.txt\necho "settings=$BOT_HUB_SETTINGS"\necho "setting=$BOT_HUB_SETTING_LOG_CHANNEL"\nsleep 30\n',
   );
   writeFileSync(join(root, 'worker', 'bot-hub.json'), JSON.stringify(MANIFEST));
   writeFileSync(
@@ -174,12 +174,12 @@ before(async () => {
   writeFileSync(join(root, 'worker', 'report.sh'), 'echo "bericht $1"\n');
   writeFileSync(
     join(root, 'nackt', 'bot.sh'),
-    'echo "token=$BOT_HUB_TOKEN"\nsleep 30\n',
+    'echo "token=$BOT_HUB_TOKEN"\nprintf "%s" "$BOT_HUB_TOKEN" > runtime-token.txt\nsleep 30\n',
   );
   for (const ordner of ['callback', 'fremd'])
     writeFileSync(
       join(root, ordner, 'bot.sh'),
-      'echo "token=$BOT_HUB_TOKEN"\nsleep 30\n',
+      'echo "token=$BOT_HUB_TOKEN"\nprintf "%s" "$BOT_HUB_TOKEN" > runtime-token.txt\nsleep 30\n',
     );
 
   process.env.BOT_DASHBOARD_ROOT = root;
@@ -530,10 +530,7 @@ describe('Bot-Seite aus dem laufenden Prozess', () => {
     await waitFor(bot.id, ['running', 'error']);
     await new Promise((resolve) => setTimeout(resolve, 400));
 
-    const line = (await logText(bot.id)).find((item) =>
-      item.startsWith('token='),
-    );
-    token = line.slice('token='.length);
+    token = readFileSync(join(root, 'nackt', 'runtime-token.txt'), 'utf8');
     assert.equal(token.length, 48);
 
     const asBot = callWithToken(token);
@@ -1036,10 +1033,11 @@ describe('Callback-Adresse', () => {
     await call(`/bots/${bot.id}/start`, { method: 'POST' });
     await waitFor(bot.id, ['running', 'error']);
     await new Promise((resolve) => setTimeout(resolve, 400));
-    const line = (await logText(bot.id)).find((item) =>
-      item.startsWith('token='),
+    const token = readFileSync(
+      join(root, 'callback', 'runtime-token.txt'),
+      'utf8',
     );
-    asBot = callWithToken(line.slice('token='.length));
+    asBot = callWithToken(token);
   });
 
   const setzen = (url, token = 'callback-token') =>
@@ -1201,10 +1199,11 @@ describe('Callback-Adresse', () => {
     await call(`/bots/${fremder.id}/start`, { method: 'POST' });
     await waitFor(fremder.id, ['running', 'error']);
     await new Promise((resolve) => setTimeout(resolve, 400));
-    const line = (await logText(fremder.id)).find((item) =>
-      item.startsWith('token='),
+    const token = readFileSync(
+      join(root, 'fremd', 'runtime-token.txt'),
+      'utf8',
     );
-    const alsFremder = callWithToken(line.slice('token='.length));
+    const alsFremder = callWithToken(token);
 
     // Der Token gehört zum anderen Bot – er darf dessen Callback nicht setzen.
     const { data } = await alsFremder('/hub/session');

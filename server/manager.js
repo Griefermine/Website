@@ -108,6 +108,47 @@ const uploadBytes = new Map();
 const concurrentUploads = new Map();
 let activeUploadCount = 0;
 const rateBuckets = new Map();
+const trustedProxyAddresses = () =>
+  new Set(
+    String(process.env.BOT_HUB_TRUSTED_PROXIES ?? '')
+      .split(',')
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean),
+  );
+const clientAddress = (req) => {
+  const remote = String(req.socket.remoteAddress ?? '').toLowerCase();
+  if (!trustedProxyAddresses().has(remote)) return remote;
+  const forwarded = String(req.headers['x-forwarded-for'] ?? '')
+    .split(',')
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+  // Walk from the directly connected proxy toward the client. Ignore only
+  // explicitly trusted proxy hops; never accept a client-supplied leftmost
+  // address when an untrusted hop appears before it.
+  let candidate = remote;
+  const trusted = trustedProxyAddresses();
+  for (let index = forwarded.length - 1; index >= 0; index -= 1) {
+    candidate = forwarded[index];
+    if (!trusted.has(candidate)) return candidate;
+  }
+  return candidate;
+};
+const takeRateBucket = (key, limit, now) => {
+  let bucket = rateBuckets.get(key);
+  if (!bucket || bucket.expiresAt <= now) {
+    if (!bucket && rateBuckets.size >= MAX_RATE_BUCKETS)
+      return httpError(429, 'Zu viele Anfragen');
+    bucket = { count: 0, expiresAt: now + 60_000 };
+    rateBuckets.set(key, bucket);
+  }
+  bucket.count += 1;
+  if (bucket.count > limit) {
+    const error = httpError(429, 'Zu viele Anfragen');
+    error.retryAfter = Math.max(1, Math.ceil((bucket.expiresAt - now) / 1000));
+    return error;
+  }
+  return null;
+};
 const rateLimit = (req, url) => {
   if (process.env.BOT_HUB_TEST_MODE === '1') return null;
   const path = url.pathname;
@@ -116,6 +157,9 @@ const rateLimit = (req, url) => {
   if (/^\/api\/auth\/discord\/(?:login|callback)$/.test(path)) {
     limit = 30;
     rateClass = 'auth';
+  } else if (/\/panel\/discord\/(?:login|callback)(?:\/|$)/.test(path)) {
+    limit = 10;
+    rateClass = 'panel-oauth';
   } else if (
     /\/panel\/commands(?:\/|$)/.test(path) ||
     /\/(?:start|restart|install)(?:\/|$)/.test(path)
@@ -128,34 +172,42 @@ const rateLimit = (req, url) => {
   } else if (/\/files(?:\/|$)/.test(path)) {
     limit = MAX_UPLOADS_PER_MINUTE;
     rateClass = 'files';
-  } else return null;
-  const now = Date.now();
-  const trustedProxies = new Set(
-    String(process.env.BOT_HUB_TRUSTED_PROXIES ?? '')
-      .split(',')
-      .map((value) => value.trim())
-      .filter(Boolean),
-  );
-  const remoteAddress = String(req.socket.remoteAddress ?? '');
-  const forwarded =
-    trustedProxies.has(remoteAddress) && req.headers['x-forwarded-for'];
-  const ip = String(forwarded || remoteAddress)
-    .split(',')
-    .pop()
-    .trim();
-  const key = `${ip}:${rateClass}`;
-  const bucket = rateBuckets.get(key);
-  if (!bucket || bucket.expiresAt <= now) {
-    if (!bucket && rateBuckets.size >= MAX_RATE_BUCKETS)
-      return httpError(429, 'Zu viele Anfragen');
-    rateBuckets.set(key, { count: 1, expiresAt: now + 60_000 });
-    return null;
   }
-  bucket.count += 1;
-  if (bucket.count > limit) {
-    const error = httpError(429, 'Zu viele Anfragen');
-    error.retryAfter = Math.ceil((bucket.expiresAt - now) / 1000);
-    return error;
+  const now = Date.now();
+  const ip = clientAddress(req);
+  const userId = currentUser(req)?.id;
+  const identity = userId ? `user:${userId}` : `ip:${ip}`;
+  if (limit) {
+    const baseLimit = takeRateBucket(`${ip}:${rateClass}:ip`, limit, now);
+    if (baseLimit) return baseLimit;
+    const userLimit = userId
+      ? takeRateBucket(`${identity}:${rateClass}`, limit, now)
+      : null;
+    if (userLimit) return userLimit;
+  }
+
+  let mutationLimit = 0;
+  let mutationClass = '';
+  if (req.method === 'POST' && url.pathname === '/api/bots') {
+    mutationLimit = 10;
+    mutationClass = 'bot-create';
+  } else if (/^\/api\/bots\/[^/]+$/.test(url.pathname)) {
+    if (req.method === 'DELETE') {
+      mutationLimit = 20;
+      mutationClass = 'bot-delete';
+    } else if (req.method === 'PATCH') {
+      mutationLimit = 60;
+      mutationClass = 'bot-update';
+    }
+  } else if (/^\/api\/access(?:\/|$)/.test(url.pathname) && req.method !== 'GET') {
+    mutationLimit = 30;
+    mutationClass = 'access-change';
+  }
+  if (mutationLimit) {
+    const key = `${identity}:${mutationClass}`;
+    const byIdentity = takeRateBucket(key, mutationLimit, now);
+    if (byIdentity) return byIdentity;
+    return takeRateBucket(`${ip}:${mutationClass}:ip`, mutationLimit, now);
   }
   return null;
 };
@@ -204,11 +256,23 @@ const takeUploadSlot = (req, url) => {
 };
 
 const releaseUploadSlot = (key) => {
-  if (!key) return;
-  const cur = concurrentUploads.get(key) ?? 1;
+  if (!key || !concurrentUploads.has(key)) return;
+  const cur = concurrentUploads.get(key);
   activeUploadCount = Math.max(0, activeUploadCount - 1);
   if (cur <= 1) concurrentUploads.delete(key);
   else concurrentUploads.set(key, cur - 1);
+};
+
+const clearBotUploadState = (botId) => {
+  const marker = `:${botId}:`;
+  for (const [key, count] of concurrentUploads) {
+    if (key.includes(marker)) {
+      activeUploadCount = Math.max(0, activeUploadCount - count);
+      concurrentUploads.delete(key);
+    }
+  }
+  for (const key of uploadBytes.keys())
+    if (key.includes(marker)) uploadBytes.delete(key);
 };
 
 const takeUploadBytes = (req, url, incomingBytes) => {
@@ -256,12 +320,13 @@ const isDeleteLocked = (bot) =>
       bot.deleteState === 'deleting' ||
       bot.deleteState === 'cleanup_failed'),
   );
+const lifecycleConflict = () =>
+  Object.assign(
+    httpError(409, 'Bot wird gerade gelöscht oder Cleanup steht aus'),
+    { code: 'BOT_LIFECYCLE_CONFLICT' },
+  );
 const assertNotDeleting = (bot) => {
-  if (isDeleteLocked(bot))
-    throw httpError(
-      409,
-      'Bot wird gerade gelöscht oder Cleanup steht aus – erst Cleanup abschließen',
-    );
+  if (isDeleteLocked(bot)) throw lifecycleConflict();
 };
 /**
  * Lock nur für In-Flight-Löschungen: Ein erneuter DELETE auf einem Bot in
@@ -269,8 +334,28 @@ const assertNotDeleting = (bot) => {
  * gerade laufende Löschung desselben Bots wird mit 409 abgewiesen.
  */
 const assertNoDeleteInFlight = (bot) => {
-  if (bot && deletingBots.has(bot.id))
-    throw httpError(409, 'Bot wird gerade gelöscht – bitte kurz warten');
+  if (bot && deletingBots.has(bot.id)) throw lifecycleConflict();
+};
+
+// Serialisiert die kurzen synchronen Mutationsschritte pro Bot. Request-Bodies
+// werden vor dem Aufruf gelesen; so kann ein langsamer Upload DELETE nicht
+// hinter einer gehaltenen Sperre festhalten. Die Mutation prüft den aktuellen
+// Lifecycle-Zustand erneut, nachdem sie die Sperre erhalten hat.
+const lifecycleQueues = new Map();
+const withBotLifecycleLock = async (botId, operation) => {
+  const previous = lifecycleQueues.get(botId) ?? Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => {
+    release = resolve;
+  });
+  lifecycleQueues.set(botId, current);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (lifecycleQueues.get(botId) === current) lifecycleQueues.delete(botId);
+  }
 };
 
 let persistTimer = null;
@@ -283,7 +368,7 @@ const schedulePersist = () => {
 };
 
 const flush = (strict = false) => {
-  dirty.clear();
+  if (!dirty.size) return;
   // Atomar: tmp schreiben + fsync + rename. Ein Absturz hinterlässt nie eine
   // halb geschriebene bots.json, sondern höchstens eine tmp-Leiche.
   const tmp = `${DATA_FILE}.${process.pid}.tmp`;
@@ -300,6 +385,7 @@ const flush = (strict = false) => {
     }
     chmodSync(tmp, 0o600);
     renameSync(tmp, DATA_FILE);
+    dirty.clear();
   } catch (error) {
     try {
       unlinkSync(tmp);
@@ -663,6 +749,16 @@ const pushLine = (botId, stream, line) => {
   if (bot.logs.length > MAX_LOG_LINES)
     bot.logs.splice(0, bot.logs.length - MAX_LOG_LINES);
   broadcast('log', chunk);
+};
+
+const redactLogSecrets = (value) => {
+  let text = String(value ?? '');
+  text = text.replace(/\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, '$1[REDACTED]');
+  text = text.replace(
+    /\b((?:DISCORD_BOT_TOKEN|DISCORD_CLIENT_SECRET|BOT_HUB_TOKEN|PANEL_TOKEN|RUNTIME_TOKEN|CALLBACK_TOKEN|(?:access|refresh|session|oauth|pkce)[_-]?(?:token|secret|code|verifier)|token|secret|password|authorization)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+    '$1[REDACTED]',
+  );
+  return text;
 };
 
 const pushOutput = (botId, stream, buffer) => {
@@ -1338,8 +1434,11 @@ const spawnBot = (bot, dir, language) => {
       pushLine(bot.id, 'system', `Neustart ${next}/${room || '∞'} in 3s …`);
       bot.restartTimer = setTimeout(() => {
         bot.restartTimer = null;
-        if (!bots.has(bot.id) || deletingBots.has(bot.id)) return;
-        startBot(bot.id, { manual: false }).catch((error) => {
+        if (!bots.has(bot.id) || isDeleteLocked(bot)) return;
+        withBotLifecycleLock(bot.id, async () => {
+          if (bots.get(bot.id) !== bot || isDeleteLocked(bot)) return;
+          await startBot(bot.id, { manual: false });
+        }).catch((error) => {
           setStatus(bot, 'error', { exitCode: -1 });
           pushLine(
             bot.id,
@@ -1424,8 +1523,7 @@ async function startBot(id, { manual = true } = {}) {
   if (!bot) throw httpError(404, 'Bot nicht gefunden');
   // Kein (Re-)Start während eines Löschvorgangs: sonst überlebt ein frisch
   // gestarteter Prozess seinen Bot als Waise ohne Verzeichnis und Eintrag.
-  if (isDeleteLocked(bot))
-    throw httpError(409, 'Bot wird gerade gelöscht – bitte kurz warten');
+  if (isDeleteLocked(bot)) throw lifecycleConflict();
   const dir = prepareStart(bot);
   uebernehmen(bot);
 
@@ -1449,10 +1547,12 @@ async function startBot(id, { manual = true } = {}) {
       );
       return publicBot(bot);
     }
+    if (bots.get(id) !== bot || isDeleteLocked(bot)) throw lifecycleConflict();
   }
 
   if (language.check) {
     const state = await checkDependencies(bot, dir);
+    if (bots.get(id) !== bot || isDeleteLocked(bot)) throw lifecycleConflict();
     if (!state.ok) {
       if (!bot.autoInstall) {
         pushLine(
@@ -1465,6 +1565,8 @@ async function startBot(id, { manual = true } = {}) {
         return publicBot(bot);
       }
       const installed = await installDependencies(bot, dir, { state });
+      if (bots.get(id) !== bot || isDeleteLocked(bot))
+        throw lifecycleConflict();
       if (!installed.ok) {
         if (containerRuntimeEnabled()) stopContainer(bot).catch(() => {});
         return publicBot(bot);
@@ -1474,6 +1576,7 @@ async function startBot(id, { manual = true } = {}) {
     }
   }
 
+  if (bots.get(id) !== bot || isDeleteLocked(bot)) throw lifecycleConflict();
   return spawnBot(bot, dir, language);
 }
 
@@ -1742,7 +1845,10 @@ const deleteBotCompletely = async (bot, actor) => {
     }
   };
   try {
-    await attempt('sessions', async () => revokeBotSessions(id));
+    await attempt('sessions', async () => {
+      revokeBotSessions(id);
+      clearBotUploadState(id);
+    });
     await attempt('stop', async () => stopBot(id, { signal: 'SIGKILL' }));
     if (containerRuntimeEnabled())
       await attempt('container', async () => removeContainer(bot));
@@ -1798,6 +1904,11 @@ const deleteBotCompletely = async (bot, actor) => {
       markFailed(cleanupErrors);
       throw fail(cleanupErrors);
     }
+    // Lesende Panel-Anfragen dürfen während des Deletes fertiglaufen und dabei
+    // Manifest-Caches neu befüllen. Deshalb nach den letzten Await-Punkten
+    // sämtliche Runtime-Zustände ein zweites Mal entfernen.
+    revokeBotSessions(id);
+    clearBotUploadState(id);
     try {
       bots.delete(id);
       dirty.add(id);
@@ -1885,16 +1996,23 @@ const handleFileRoutes = async (req, res, url, bot) => {
       const body = await readBody(req, MAX_FILE_BODY_BYTES);
       if (body.uebernehmen === true || body.ordner === undefined) {
         braucht('files.write');
-        return sendJson(res, 200, { files: uebernehmen(bot) });
+        const files = await withBotLifecycleLock(bot.id, async () => {
+          assertNotDeleting(bot);
+          return uebernehmen(bot);
+        });
+        return sendJson(res, 200, { files });
       }
       braucht('files.write');
-      const ok = await dateien.withBotLock(bot.id, async () => {
-        if (
-          typeof body.ordner !== 'string' ||
-          !dateien.makeDir(bot, PROJECT_ROOT, body.ordner)
-        )
-          return false;
-        return true;
+      const ok = await withBotLifecycleLock(bot.id, async () => {
+        assertNotDeleting(bot);
+        return dateien.withBotLock(bot.id, async () => {
+          if (
+            typeof body.ordner !== 'string' ||
+            !dateien.makeDir(bot, PROJECT_ROOT, body.ordner)
+          )
+            return false;
+          return true;
+        });
       });
       if (!ok) throw httpError(400, 'Dieser Ordner kann nicht angelegt werden');
       return auflisten({ status: 201, body: { angelegt: body.ordner } });
@@ -1920,11 +2038,14 @@ const handleFileRoutes = async (req, res, url, bot) => {
       if (typeof body.inhalt !== 'string')
         throw httpError(400, 'Nur Textdateien sind erlaubt');
       const incoming = Buffer.byteLength(body.inhalt, 'utf8');
-      const limited = takeUploadBytes(req, url, incoming);
-      if (limited) throw limited;
-      const geschrieben = await dateien.withBotLock(bot.id, async () =>
-        dateien.write(bot, PROJECT_ROOT, pfad, body.inhalt),
-      );
+      const geschrieben = await withBotLifecycleLock(bot.id, async () => {
+        assertNotDeleting(bot);
+        const limited = takeUploadBytes(req, url, incoming);
+        if (limited) throw limited;
+        return dateien.withBotLock(bot.id, async () =>
+          dateien.write(bot, PROJECT_ROOT, pfad, body.inhalt),
+        );
+      });
       if (!geschrieben)
         throw httpError(
           400,
@@ -1940,9 +2061,12 @@ const handleFileRoutes = async (req, res, url, bot) => {
   }
   if (req.method === 'DELETE') {
     braucht('files.delete');
-    const ergebnis = await dateien.withBotLock(bot.id, async () =>
-      dateien.remove(bot, PROJECT_ROOT, pfad),
-    );
+    const ergebnis = await withBotLifecycleLock(bot.id, async () => {
+      assertNotDeleting(bot);
+      return dateien.withBotLock(bot.id, async () =>
+        dateien.remove(bot, PROJECT_ROOT, pfad),
+      );
+    });
     if (!ergebnis) throw httpError(404, 'Datei oder Ordner nicht gefunden');
     if (ergebnis.ueberlimit)
       throw httpError(
@@ -2003,8 +2127,8 @@ const handleApi = async (req, res, url) => {
   if (requiresAuthentication(req, url) && !panelTokenAuth)
     throw httpError(401, 'Discord-Anmeldung erforderlich');
 
-  const permission = (name) => {
-    if (!hasPermission(req, name))
+  const permission = (name, botId = null) => {
+    if (!hasPermission(req, name, botId ? { botId } : {}))
       throw httpError(403, `Berechtigung fehlt: ${name}`);
   };
 
@@ -2033,11 +2157,7 @@ const handleApi = async (req, res, url) => {
     throw httpError(405, 'Methode nicht erlaubt');
   }
 
-  if (resource === 'health')
-    return sendJson(res, 200, {
-      ok: true,
-      bots: bots.size,
-    });
+  if (resource === 'health') return sendJson(res, 200, { ok: true });
 
   if (resource === 'languages') {
     permission('bots.read');
@@ -2106,17 +2226,28 @@ const handleApi = async (req, res, url) => {
   }
 
   if (resource === 'logs') {
-    permission('logs.read');
     const rawTail = url.searchParams.get('tail') ?? '200';
     const tail = Number(rawTail);
     if (!Number.isInteger(tail) || tail < 1 || tail > 500)
       throw httpError(400, 'tail muss eine ganze Zahl zwischen 1 und 500 sein');
     const scope = id ? bots.get(id) : null;
     if (id && !scope) throw httpError(404, 'Bot nicht gefunden');
+    if (scope) {
+      if (!hasPermission(req, 'logs.read', { botId: scope.id }))
+        throw httpError(403, 'Berechtigung fehlt: logs.read');
+    } else if (
+      !hasPermission(req, 'bots.manage') &&
+      !hasPermission(req, 'logs.read.global')
+    ) {
+      throw httpError(403, 'Globale Log-Berechtigung fehlt');
+    }
     const source = scope
       ? scope.logs
       : [...bots.values()].flatMap((b) => b.logs);
-    const lines = source.slice(-tail).sort((a, b) => a.ts - b.ts);
+    const lines = source
+      .slice(-tail)
+      .sort((a, b) => a.ts - b.ts)
+      .map((line) => ({ ...line, text: redactLogSecrets(line.text) }));
     return sendJson(res, 200, { lines });
   }
 
@@ -2186,7 +2317,6 @@ const handleApi = async (req, res, url) => {
       return sendJson(res, 200, { bot: publicBot(bot) });
     if (!action && req.method === 'PATCH') {
       permission('bots.manage');
-      assertNotDeleting(bot);
       const body = await readBody(req);
       const config = normaliseConfig(body, bot);
       if (!safeBotPath(bot, config.cwd))
@@ -2197,39 +2327,56 @@ const handleApi = async (req, res, url) => {
       // Vor der Konfiguration, nicht danach: der Startordner ist die Quelle,
       // und eine halb gespeicherte Konfiguration über halb kopierten Dateien
       // ist die unangenehmere Hälfte davon.
-      const uebernommen = uebernehmen(bot);
-      const nextBot = { ...bot, ...config };
-      syncBotEnv(nextBot);
-      Object.assign(bot, config, { updatedAt: Date.now() });
-      bot.restartCount = 0;
-      dirty.add(bot.id);
-      schedulePersist();
-      const updated = publicBot(bot);
-      broadcast('bot', updated);
-      return sendJson(res, 200, { bot: updated, files: uebernommen });
+      const result = await withBotLifecycleLock(bot.id, async () => {
+        assertNotDeleting(bot);
+        if (bots.get(bot.id) !== bot)
+          throw httpError(404, 'Bot nicht gefunden');
+        const uebernommen = uebernehmen(bot);
+        const nextBot = { ...bot, ...config };
+        syncBotEnv(nextBot);
+        Object.assign(bot, config, { updatedAt: Date.now() });
+        bot.restartCount = 0;
+        dirty.add(bot.id);
+        schedulePersist();
+        const updated = publicBot(bot);
+        broadcast('bot', updated);
+        return { bot: updated, files: uebernommen };
+      });
+      return sendJson(res, 200, result);
     }
     if (!action && req.method === 'DELETE') {
       permission('bots.delete');
-      assertNoDeleteInFlight(bot);
-      const result = await deleteBotCompletely(
-        bot,
-        currentUser(req)?.id ?? null,
-      );
+      const result = await withBotLifecycleLock(bot.id, async () => {
+        assertNoDeleteInFlight(bot);
+        if (bots.get(bot.id) !== bot)
+          throw httpError(404, 'Bot nicht gefunden');
+        return deleteBotCompletely(bot, currentUser(req)?.id ?? null);
+      });
       return sendJson(res, 200, result);
     }
     if (action === 'start' && req.method === 'POST') {
       permission('bots.control');
-      assertNotDeleting(bot);
-      prepareStart(bot);
-      setStatus(bot, 'checking', { pid: null, stoppedAt: Date.now() });
-      startBot(id).catch((error) => {
+      const started = await withBotLifecycleLock(id, async () => {
+        assertNotDeleting(bot);
+        if (bots.get(id) !== bot) throw httpError(404, 'Bot nicht gefunden');
+        prepareStart(bot);
+        setStatus(bot, 'checking', { pid: null, stoppedAt: Date.now() });
+        return publicBot(bot);
+      });
+      withBotLifecycleLock(id, async () => {
+        assertNotDeleting(bot);
+        if (bots.get(id) !== bot) return;
+        await startBot(id);
+      }).catch((error) => {
+        if (!bots.has(id) || isDeleteLocked(bot)) return;
         pushLine(id, 'system', `Start fehlgeschlagen: ${error.message}`);
         setStatus(bot, 'error', { exitCode: -1, pid: null });
       });
-      return sendJson(res, 202, { bot: publicBot(bot) });
+      return sendJson(res, 202, { bot: started });
     }
     if (action === 'files') {
-      permission('bots.manage');
+      // File APIs authorize against the requested bot and the operation's
+      // files.read/write/delete permission inside handleFileRoutes.
       if (req.method !== 'GET') assertNotDeleting(bot);
       const handled = await handleFileRoutes(req, res, url, bot);
       if (handled !== false) return handled;
@@ -2238,7 +2385,6 @@ const handleApi = async (req, res, url) => {
 
     if (action === 'install' && req.method === 'POST') {
       permission('bots.manage');
-      assertNotDeleting(bot);
       const dir = safeBotPath(bot, bot.cwd);
       if (!dir)
         throw httpError(
@@ -2254,43 +2400,65 @@ const handleApi = async (req, res, url) => {
           `Für ${language.label} ist keine automatische Installation hinterlegt`,
         );
       }
-      setStatus(bot, 'checking', { depsStatus: 'checking' });
-      installDependencies(bot, dir, { force: body.force === true }).catch(
-        (error) => {
+      withBotLifecycleLock(id, async () => {
+        assertNotDeleting(bot);
+        if (bots.get(id) !== bot) return;
+        if (bot.busy) throw httpError(409, 'Installation läuft bereits');
+        setStatus(bot, 'checking', { depsStatus: 'checking' });
+        try {
+          await installDependencies(bot, dir, { force: body.force === true });
+        } catch (error) {
           console.error('[hub] Installation fehlgeschlagen:', error);
-          setStatus(bot, 'error', { exitCode: -1 });
-        },
-      );
+          if (!isDeleteLocked(bot)) setStatus(bot, 'error', { exitCode: -1 });
+        }
+      }).catch((error) => {
+        if (error.status !== 409 && !isDeleteLocked(bot))
+          console.error('[hub] Installation fehlgeschlagen:', error);
+      });
       return sendJson(res, 202, { bot: publicBot(bot) });
     }
     if (action === 'stop' && req.method === 'POST') {
       permission('bots.control');
-      return sendJson(res, 200, { bot: stopBot(id) });
+      const stopped = await withBotLifecycleLock(id, async () => {
+        assertNotDeleting(bot);
+        return stopBot(id);
+      });
+      return sendJson(res, 200, { bot: stopped });
     }
     if (action === 'kill' && req.method === 'POST') {
       permission('bots.control');
-      return sendJson(res, 200, { bot: stopBot(id, { signal: 'SIGKILL' }) });
+      const stopped = await withBotLifecycleLock(id, async () => {
+        assertNotDeleting(bot);
+        return stopBot(id, { signal: 'SIGKILL' });
+      });
+      return sendJson(res, 200, { bot: stopped });
     }
     if (action === 'restart' && req.method === 'POST') {
       permission('bots.restart');
-      assertNotDeleting(bot);
-      stopBot(id, { signal: 'SIGTERM' });
-      const target = bots.get(id);
-      if (target) {
-        const waitForExit = setInterval(() => {
-          if (!target.child) {
-            clearInterval(waitForExit);
-            setTimeout(() => {
-              if (bots.has(id) && !deletingBots.has(id))
-                startBot(id).catch(() => {});
-            }, 300);
-          }
-        }, 100);
-      }
-      return sendJson(res, 200, { bot: publicBot(bots.get(id)) });
+      const restarted = await withBotLifecycleLock(id, async () => {
+        assertNotDeleting(bot);
+        stopBot(id, { signal: 'SIGTERM' });
+        const target = bots.get(id);
+        if (target) {
+          const waitForExit = setInterval(() => {
+            if (!target.child) {
+              clearInterval(waitForExit);
+              setTimeout(() => {
+                withBotLifecycleLock(id, async () => {
+                  if (bots.get(id) === target && !isDeleteLocked(target))
+                    await startBot(id);
+                }).catch(() => {});
+              }, 300);
+            }
+          }, 100);
+        }
+        return publicBot(bots.get(id));
+      });
+      return sendJson(res, 200, { bot: restarted });
     }
     if (action === 'logs' && req.method === 'GET') {
-      permission('logs.read');
+      if (!hasPermission(req, 'logs.read', { botId: bot.id }))
+        throw httpError(403, 'Berechtigung fehlt: logs.read');
       const rawTail = url.searchParams.get('tail') ?? '300';
       const tail = Number(rawTail);
       if (!Number.isInteger(tail) || tail < 1 || tail > 500)
@@ -2298,7 +2466,11 @@ const handleApi = async (req, res, url) => {
           400,
           'tail muss eine ganze Zahl zwischen 1 und 500 sein',
         );
-      return sendJson(res, 200, { lines: bot.logs.slice(-tail) });
+      return sendJson(res, 200, {
+        lines: bot.logs
+          .slice(-tail)
+          .map((line) => ({ ...line, text: redactLogSecrets(line.text) })),
+      });
     }
     if (action === 'panel') {
       // Lesende Panel-Zugriffe bleiben während eines Löschvorgangs erlaubt,
@@ -2483,6 +2655,8 @@ const applyCors = (req, res, url) => {
 export const createServer = () => {
   load();
   return async (req, res) => {
+    req.requestId = randomUUID();
+    res.setHeader('x-request-id', req.requestId);
     res.setHeader('x-content-type-options', 'nosniff');
     res.setHeader('referrer-policy', 'no-referrer');
     res.setHeader(
@@ -2511,16 +2685,30 @@ export const createServer = () => {
       return serveStatic(req, res, url);
     } catch (error) {
       const status = error.status ?? 500;
+      const internalError = status >= 500 && status !== 501;
       if (status >= 500) console.error('[hub]', error);
       if (!res.headersSent) {
         if (error.retryAfter) res.setHeader('retry-after', error.retryAfter);
-        // Teilfehler (z. B. Bot-Delete) dürfen ihre Detailstruktur mitsenden;
-        // Geheimnisse stehen darin nie (nur Schritt + Fehlermeldung).
-        const body = { error: error.message };
-        if (error.cleanupErrors) body.cleanupErrors = error.cleanupErrors;
+        const body = {
+          error: internalError ? 'Interner Serverfehler' : error.message,
+          code:
+            error.code ??
+            (status === 409
+              ? 'CONFLICT'
+              : status === 429
+                ? 'RATE_LIMITED'
+                : internalError
+                  ? 'INTERNAL_ERROR'
+                  : 'REQUEST_FAILED'),
+          requestId: req.requestId,
+        };
         if (error.deleted !== undefined) body.deleted = error.deleted;
         if (error.botId !== undefined) body.botId = error.botId;
         if (error.deleteStatus !== undefined) body.status = error.deleteStatus;
+        if (error.cleanupErrors)
+          body.cleanupErrors = error.cleanupErrors.map(({ step }) => ({
+            step,
+          }));
         return sendJson(res, status, body);
       }
       return res.end();
@@ -2536,6 +2724,12 @@ configurePanel({
     dirty.add(bot.id);
     schedulePersist();
   },
+  lifecycle: (bot, operation) =>
+    withBotLifecycleLock(bot.id, async () => {
+      assertNotDeleting(bot);
+      if (bots.get(bot.id) !== bot) throw httpError(404, 'Bot nicht gefunden');
+      return operation();
+    }),
 });
 
 configureAccess(ACCESS_FILE);

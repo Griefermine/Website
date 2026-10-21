@@ -94,11 +94,13 @@ const FIELD_TYPES = new Set([
 let envFor = (bot, dir) => ({ ...process.env });
 let broadcastEvent = () => {};
 let markDirty = () => {};
+let withLifecycle = async (_bot, operation) => operation();
 
-export const configurePanel = ({ env, broadcast, touch } = {}) => {
+export const configurePanel = ({ env, broadcast, touch, lifecycle } = {}) => {
   if (typeof env === 'function') envFor = env;
   if (typeof broadcast === 'function') broadcastEvent = broadcast;
   if (typeof touch === 'function') markDirty = touch;
+  if (typeof lifecycle === 'function') withLifecycle = lifecycle;
 };
 
 /* ------------------------------------------------------------------ *
@@ -195,6 +197,12 @@ export const revokeBotSessions = (id) => {
   for (const [sessionId, session] of discordSessions)
     if (session?.botId === id || deadSessions.has(sessionId))
       discordSessions.delete(sessionId);
+  for (const cacheKey of manifestCache.keys())
+    if (cacheKey.startsWith(`${id}:`)) manifestCache.delete(cacheKey);
+  for (const cacheKey of runtimeBuckets.keys())
+    if (cacheKey.startsWith(`${id}:`)) runtimeBuckets.delete(cacheKey);
+  for (const cacheKey of callbackCalls.keys())
+    if (cacheKey.startsWith(`${id}:`)) callbackCalls.delete(cacheKey);
 };
 
 /** Token für die eingebettete Seite – darf lesen/speichern, aber nichts anmelden. */
@@ -1131,7 +1139,8 @@ const readManifest = (bot) => {
   } catch {
     return null;
   }
-  const cached = manifestCache.get(path);
+  const cacheKey = `${bot.id}:${path}`;
+  const cached = manifestCache.get(cacheKey);
   if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size)
     return cached.value;
 
@@ -1156,7 +1165,11 @@ const readManifest = (bot) => {
   } catch (error) {
     value = { manifest: null, path, signature: '', error: error.message };
   }
-  manifestCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, value });
+  manifestCache.set(cacheKey, {
+    mtimeMs: stat.mtimeMs,
+    size: stat.size,
+    value,
+  });
   return value;
 };
 
@@ -2483,7 +2496,13 @@ export const handlePanelRoutes = async (
     }
   }
 
-  const authResult = await panelDiscordAuth(bot, req, res, url, rest);
+  const discordAuthMutation =
+    (req.method === 'GET' &&
+      (rest === 'discord/login' || rest === 'discord/callback')) ||
+    (req.method === 'POST' && rest === 'discord/logout');
+  const authResult = discordAuthMutation
+    ? await withLifecycle(bot, () => panelDiscordAuth(bot, req, res, url, rest))
+    : await panelDiscordAuth(bot, req, res, url, rest);
   if (authResult !== false) return authResult;
 
   if (
@@ -2519,29 +2538,35 @@ export const handlePanelRoutes = async (
   }
 
   if (req.method === 'POST' && rest === 'reload') {
-    const path = bot.panel?.path;
-    manifestCache.delete(path);
-    // Leere Signatur erzwingt das erneute Einlesen; gespeicherte Werte und
-    // Geheimnisse bleiben erhalten, applyPanel übernimmt nur passende Felder.
-    bot.panel = { ...(bot.panel ?? emptyPanel()), signature: '' };
-    ensurePanel(bot);
-    markDirty(bot);
-    broadcastEvent('panel', { id: bot.id, panel: publicPanel(bot) });
-    return sendJson(res, 200, { panel: publicPanel(bot) });
+    const panel = await withLifecycle(bot, async () => {
+      const path = bot.panel?.path;
+      manifestCache.delete(`${bot.id}:${path}`);
+      bot.panel = { ...(bot.panel ?? emptyPanel()), signature: '' };
+      ensurePanel(bot);
+      markDirty(bot);
+      broadcastEvent('panel', { id: bot.id, panel: publicPanel(bot) });
+      return publicPanel(bot);
+    });
+    return sendJson(res, 200, { panel });
   }
 
   if (req.method === 'DELETE' && !rest) {
-    callbacks.delete(bot.id);
-    bot.panel = emptyPanel();
-    markDirty(bot);
-    broadcastEvent('panel', { id: bot.id, panel: publicPanel(bot) });
-    return sendJson(res, 200, { panel: publicPanel(bot) });
+    const panel = await withLifecycle(bot, async () => {
+      callbacks.delete(bot.id);
+      bot.panel = emptyPanel();
+      markDirty(bot);
+      broadcastEvent('panel', { id: bot.id, panel: publicPanel(bot) });
+      return publicPanel(bot);
+    });
+    return sendJson(res, 200, { panel });
   }
 
   if (req.method === 'PUT' && rest === 'settings') {
     requirePanelDiscordLogin(bot, req);
     const body = await readBody(req);
-    const result = saveSettings(bot, body.values ?? {});
+    const result = await withLifecycle(bot, () =>
+      saveSettings(bot, body.values ?? {}),
+    );
     return sendJson(res, 200, { panel: publicPanel(bot), ...result });
   }
 
@@ -2551,7 +2576,10 @@ export const handlePanelRoutes = async (
   if (req.method === 'PUT' && rest === 'state') {
     requirePanelDiscordLogin(bot, req);
     const body = await readBody(req);
-    return sendJson(res, 200, { state: pushState(bot, body.state ?? {}) });
+    const state = await withLifecycle(bot, () =>
+      pushState(bot, body.state ?? {}),
+    );
+    return sendJson(res, 200, { state });
   }
 
   // Meldung aus der Bot-Seite. Sie laeuft ueber die Panel-API und nicht ueber
@@ -2560,14 +2588,19 @@ export const handlePanelRoutes = async (
   if (req.method === 'POST' && rest === 'notify') {
     requirePanelDiscordLogin(bot, req);
     const body = await readBody(req);
-    return sendJson(res, 200, notifyUser(bot, body.message, body.kind));
+    const result = await withLifecycle(bot, () =>
+      notifyUser(bot, body.message, body.kind),
+    );
+    return sendJson(res, 200, result);
   }
 
   if (req.method === 'POST' && rest.startsWith('commands/')) {
     requirePanelDiscordLogin(bot, req);
     const commandId = decodeURIComponent(rest.slice('commands/'.length));
     const body = await readBody(req);
-    const result = await runAction(bot, commandId, body.args ?? {});
+    const result = await withLifecycle(bot, () =>
+      runAction(bot, commandId, body.args ?? {}),
+    );
     return sendJson(res, 200, { result });
   }
 
@@ -2647,7 +2680,9 @@ export const handleHubRoutes = async (req, res, url, getBot) => {
         'Nur der laufende Prozess darf Werte überschreiben.',
       );
     const body = await readBody(req);
-    const result = saveSettings(bot, body.values ?? {});
+    const result = await withLifecycle(bot, () =>
+      saveSettings(bot, body.values ?? {}),
+    );
     return sendJson(res, 200, { panel: publicPanel(bot), ...result });
   }
 
@@ -2670,7 +2705,8 @@ export const handleHubRoutes = async (req, res, url, getBot) => {
         400,
         'panel braucht mindestens entry, settings, commands oder pages.',
       );
-    return sendJson(res, 200, { panel: registerPanel(bot, manifest) });
+    const panel = await withLifecycle(bot, () => registerPanel(bot, manifest));
+    return sendJson(res, 200, { panel });
   }
 
   if (req.method === 'POST' && rest === '/callback') {
@@ -2680,14 +2716,20 @@ export const handleHubRoutes = async (req, res, url, getBot) => {
         'Nur der laufende Prozess darf eine Callback-URL setzen.',
       );
     const body = await readBody(req);
-    if (body.url === null || body.url === '') callbacks.delete(bot.id);
-    else
+    if (body.url === null || body.url === '') {
+      await withLifecycle(bot, async () => {
+        callbacks.delete(bot.id);
+        broadcastEvent('panel', { id: bot.id, panel: publicPanel(bot) });
+      });
+    } else {
       return sendJson(
         res,
         200,
-        await registerCallback(bot, body.url, body.token),
+        await withLifecycle(bot, () =>
+          registerCallback(bot, body.url, body.token),
+        ),
       );
-    broadcastEvent('panel', { id: bot.id, panel: publicPanel(bot) });
+    }
     return sendJson(res, 200, { ok: true, url: null });
   }
 
@@ -2700,7 +2742,10 @@ export const handleHubRoutes = async (req, res, url, getBot) => {
         'Nur der laufende Prozess darf den Zustand des Bots aendern.',
       );
     const body = await readBody(req);
-    return sendJson(res, 200, { state: pushState(bot, body.state ?? body) });
+    const state = await withLifecycle(bot, () =>
+      pushState(bot, body.state ?? body),
+    );
+    return sendJson(res, 200, { state });
   }
 
   if (req.method === 'POST' && rest === '/notify') {
@@ -2712,7 +2757,10 @@ export const handleHubRoutes = async (req, res, url, getBot) => {
         'Nur der laufende Prozess darf Benachrichtigungen ausloesen.',
       );
     const body = await readBody(req);
-    return sendJson(res, 200, notifyUser(bot, body.message, body.kind));
+    const result = await withLifecycle(bot, () =>
+      notifyUser(bot, body.message, body.kind),
+    );
+    return sendJson(res, 200, result);
   }
 
   if (rest === '/db' || rest.startsWith('/db/'))
@@ -2791,14 +2839,18 @@ const handleStoreRoutes = async (req, res, url, bot, identity) => {
       const body = await readBody(req);
       if (!Object.prototype.hasOwnProperty.call(body, 'value'))
         throw httpError(400, 'PUT erwartet ein Feld "value".');
-      const result = await store.set(botId, collection, key, body.value);
+      const result = await withLifecycle(bot, () =>
+        store.set(botId, collection, key, body.value),
+      );
       return sendJson(res, 200, {
         entry: { collection, key, ...result },
       });
     }
     if (req.method === 'DELETE')
       return sendJson(res, 200, {
-        removed: await store.remove(botId, collection, key),
+        removed: await withLifecycle(bot, () =>
+          store.remove(botId, collection, key),
+        ),
       });
     throw httpError(405, 'Methode nicht erlaubt');
   }

@@ -1,10 +1,15 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import {
   chmodSync,
+  closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
   writeFileSync,
+  renameSync,
+  unlinkSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 
@@ -187,13 +192,26 @@ const saveAccess = (strict = false) => {
     if (strict) throw new Error('Zugriffsdatei ist nicht konfiguriert');
     return;
   }
+  const temporary = `${accessFile}.${process.pid}.tmp`;
   try {
     mkdirSync(dirname(accessFile), { recursive: true });
-    writeFileSync(accessFile, `${JSON.stringify(access, null, 2)}\n`, {
+    writeFileSync(temporary, `${JSON.stringify(access, null, 2)}\n`, {
       mode: 0o600,
     });
-    chmodSync(accessFile, 0o600);
+    chmodSync(temporary, 0o600);
+    const fd = openSync(temporary, 'r');
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporary, accessFile);
   } catch (error) {
+    try {
+      unlinkSync(temporary);
+    } catch {
+      /* A leftover temp file is harmless; report the original write error. */
+    }
     console.error(
       '[hub] Zugriffsrechte konnten nicht gespeichert werden:',
       error.message,
