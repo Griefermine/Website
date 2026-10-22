@@ -303,6 +303,95 @@ describe('Panel-Scaffold für jeden Bot', async () => {
       }
     }
   });
+
+  it('Demo-Buttons sind ohne laufenden Bot sichtbar deaktiviert', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bot-hub-scaffold-disabled-'));
+    const bot = { id: 'disabled-bot', name: 'Disabled', cwd: '.' };
+    ensurePanelScaffold(bot, root);
+    const { startFolderPath } = await import('../server/botFiles.js');
+    const js = readFileSync(
+      join(startFolderPath(bot, root), 'panel', 'panel.js'),
+      'utf8',
+    );
+    // Sichtbar deaktiviert statt erst beim Klick zu scheitern.
+    assert.ok(js.includes('disabled'));
+    assert.ok(js.includes('braucht einen laufenden Bot'));
+  });
+
+  it('leere Secret-Felder werden nicht gesendet, Löschen braucht den Knopf', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bot-hub-scaffold-secret-'));
+    const bot = { id: 'secret-bot', name: 'Secret', cwd: '.' };
+    ensurePanelScaffold(bot, root);
+    const { startFolderPath } = await import('../server/botFiles.js');
+    const js = readFileSync(
+      join(startFolderPath(bot, root), 'panel', 'panel.js'),
+      'utf8',
+    );
+    // Leeres Secret-Feld: Schlüssel wird weggelassen (bleibt gespeichert).
+    assert.ok(js.includes('clearedSecrets'));
+    assert.ok(
+      js.includes('bleibt gespeichert') || js.includes('bleibt erhalten'),
+    );
+    // Explizites Löschen nur über den Entfernen-Knopf.
+    assert.ok(js.includes('Entfernen'));
+    assert.ok(
+      js.includes("values[input.name] = ''") ||
+        js.includes('values[key] = ""') ||
+        js.includes('values[input.name] = ""'),
+    );
+  });
+
+  it('migriert kaputte V1-Scaffolds, fasst eigene Seiten nie an', async () => {
+    const { migrateScaffold } = await import('../server/panelScaffold.js');
+    const { startFolderPath } = await import('../server/botFiles.js');
+    // Kaputtes Hub-Generat: V1-Fingerabdruck ohne V2-Marker.
+    const brokenRoot = mkdtempSync(join(tmpdir(), 'bot-hub-scaffold-v1-'));
+    const brokenBot = { id: 'v1-bot', name: 'V1', cwd: '.' };
+    ensurePanelScaffold(brokenBot, brokenRoot);
+    const brokenTarget = join(
+      startFolderPath(brokenBot, brokenRoot),
+      'panel',
+      'panel.js',
+    );
+    const v1 = readFileSync(brokenTarget, 'utf8')
+      .split('\n')
+      .filter((line) => !line.includes('Scaffold v2'))
+      .join('\n')
+      .replace(
+        'stats.replaceChildren(...nodes);',
+        'stats.replaceChildren(\n  entries.length\n    ? ...entries.map(([k]) => k)\n    : null,\n);',
+      );
+    assert.ok(!v1.includes('Scaffold v2'));
+    writeFileSync(brokenTarget, v1);
+    const { migrated } = migrateScaffold(brokenBot, brokenRoot);
+    assert.deepEqual(migrated, ['panel/panel.js']);
+    const fixed = readFileSync(brokenTarget, 'utf8');
+    assert.ok(fixed.includes('Scaffold v2'));
+    execFileSync(process.execPath, ['--check', brokenTarget]);
+    // Erneut: nichts mehr zu tun (einmalig).
+    assert.deepEqual(migrateScaffold(brokenBot, brokenRoot).migrated, []);
+    // Eigene Seite ohne Fingerabdruck: unangetastet.
+    const customRoot = mkdtempSync(join(tmpdir(), 'bot-hub-scaffold-custom-'));
+    const customBot = { id: 'custom-bot', name: 'Custom', cwd: '.' };
+    ensurePanelScaffold(customBot, customRoot);
+    const customTarget = join(
+      startFolderPath(customBot, customRoot),
+      'panel',
+      'panel.js',
+    );
+    writeFileSync(customTarget, '// meine Seite\nimport x from "y";\n');
+    assert.deepEqual(migrateScaffold(customBot, customRoot).migrated, []);
+    assert.equal(
+      readFileSync(customTarget, 'utf8'),
+      '// meine Seite\nimport x from "y";\n',
+    );
+    // Fehlende Datei: kein Fehler, nichts zu tun.
+    const freshRoot = mkdtempSync(join(tmpdir(), 'bot-hub-scaffold-fresh-'));
+    assert.deepEqual(
+      migrateScaffold({ id: 'fresh-bot', cwd: '.' }, freshRoot).migrated,
+      [],
+    );
+  });
 });
 
 describe('Panel-Scaffold End-to-End: Anlage, Sync, Panel-Assets', async () => {

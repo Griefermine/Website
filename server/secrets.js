@@ -8,10 +8,15 @@
  * gemeinsamer Ort verhindert, dass die beiden auseinanderlaufen.
  */
 
+import { randomBytes } from 'node:crypto';
 import {
+  closeSync,
   chmodSync,
   existsSync,
+  fchmodSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   renameSync,
@@ -60,6 +65,28 @@ export const dotenvKey = (key) => {
   return /^[A-Z_]/.test(normalized) ? normalized : `_${normalized}`;
 };
 
+/**
+ * Schlüssel, die allein dem Hub gehören: Der Hub liest diese Werte selbst
+ * wieder ein (OAuth-Konfiguration, Token über `discordConfig` und
+ * `BOT_HUB_*`) oder sie steuern, wie Prozesse Programme finden und laden
+ * (`PATH`, `HOME`, `LD_*`, `NODE_OPTIONS`, `PYTHON*`). Manifest-Felder und
+ * Einstellungen aus Bot-Sicht dürfen niemals unter solchen Schlüsseln in
+ * `data/secrets/<id>.env` landen – sonst schreibt ein Bot die
+ * OAuth-App des Hubs um oder setzt die Binary-Allowlist außer Kraft.
+ */
+export const isReservedEnvKey = (key) => {
+  const normalized = dotenvKey(key);
+  return (
+    normalized.startsWith('DISCORD_') ||
+    normalized.startsWith('BOT_HUB_') ||
+    normalized === 'PATH' ||
+    normalized === 'HOME' ||
+    normalized.startsWith('LD_') ||
+    normalized === 'NODE_OPTIONS' ||
+    normalized.startsWith('PYTHON')
+  );
+};
+
 export const dotenvValue = (value) =>
   `"${String(value ?? '')
     .replace(/\\/g, '\\\\')
@@ -97,18 +124,38 @@ export const storeSecretValues = (
     : Object.fromEntries(Object.entries(values));
   if (!Object.keys(merged).length) return fileOf(projectRoot, id);
   const directory = directoryOf(projectRoot);
+  // Zufällig benannt + `wx`: ein erratbarer Temp-Pfad (pid/Zeit/Math.random)
+  // wäre ein Symlink-Ziel; `wx` öffnet garantiert eine frische Datei.
   const temp = join(
     directory,
-    `.env.bot-hub.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    `.env.bot-hub.tmp-${randomBytes(8).toString('hex')}`,
   );
   mkdirSync(directory, { recursive: true, mode: 0o700 });
+  // `mode` wirkt nur bei einer Neuanlage. Bei einem bereits vorhandenen,
+  // zu offenen Verzeichnis muss der Secret-Speicher ebenfalls geschlossen
+  // werden, bevor dort ein neuer Wert geschrieben wird.
+  chmodSync(directory, 0o700);
+  let fd;
   try {
-    writeFileSync(temp, formatDotenv(Object.entries(merged)), {
+    fd = openSync(temp, 'wx', 0o600);
+    fchmodSync(fd, 0o600);
+    writeFileSync(fd, formatDotenv(Object.entries(merged)), {
       encoding: 'utf8',
-      mode: 0o600,
     });
-    chmodSync(temp, 0o600);
+    // fsync VOR dem Rename: erst wenn der Inhalt auf der Platte steht, darf
+    // der Eintrag unter dem endgültigen Namen sichtbar sein. Ohne diesen
+    // Schritt überlebt ein Systemabsturz möglicherweise eine leere Datei
+    // unter dem Zielnamen – scheinbar erfolgreich gespeichert.
+    fsyncSync(fd);
     renameSync(temp, fileOf(projectRoot, id));
+    // Auch den Verzeichniseintrag dauerhaft machen: fsync der Datei allein
+    // garantiert nach einem Stromausfall nicht, dass das Rename erhalten ist.
+    const dirFd = openSync(directory, 'r');
+    try {
+      fsyncSync(dirFd);
+    } finally {
+      closeSync(dirFd);
+    }
   } catch (error) {
     try {
       if (existsSync(temp)) unlinkSync(temp);
@@ -116,6 +163,18 @@ export const storeSecretValues = (
       /* Der ursprüngliche Fehler ist die relevante Diagnose. */
     }
     throw error;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
   return fileOf(projectRoot, id);
+};
+
+/** Entfernt die Secret-Datei eines Bots, falls sie existiert. */
+export const removeSecretValues = (projectRoot, id) => {
+  const path = fileOf(projectRoot, id);
+  try {
+    unlinkSync(path);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
 };

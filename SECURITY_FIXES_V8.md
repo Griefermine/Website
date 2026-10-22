@@ -1,4 +1,5 @@
 # SECURITY_FIXES_V8.md
+
 # Bot-Hub – OAuth- und Security-Härtung für GitHub Copilot / WebStorm
 
 ## Ziel
@@ -16,6 +17,7 @@
 9. bestehende Rollen, Permissions und Panel-Funktionen weiter funktionieren.
 
 WICHTIG:
+
 - Den zentralen OAuth-Prozess NICHT entfernen.
 - Die Bot-Webseite MUSS weiterhin den OAuth-Prozess der Haupt-Webseite nutzen können.
 - OAuth-Zugriff ist erlaubt; Dateisystemzugriff zwischen Bots ist es nicht.
@@ -132,13 +134,13 @@ Die Bot-Webseite darf dabei nicht die Haupt-Session per JavaScript auslesen.
 NICHT:
 
 ```js
-document.cookie
+document.cookie;
 ```
 
 NICHT:
 
 ```js
-localStorage.getItem("main-session-token")
+localStorage.getItem('main-session-token');
 ```
 
 Keine geheimen Haupt-Session-Tokens in die Bot-Webseite injizieren.
@@ -314,7 +316,7 @@ Ausführung:
 ```js
 spawn(executable, args, {
   cwd: botWorkspace,
-  env: sanitizedEnvironment
+  env: sanitizedEnvironment,
 });
 ```
 

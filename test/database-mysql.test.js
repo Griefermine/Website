@@ -28,7 +28,13 @@
  * damit wiederholte Läufe sich nicht in die Quere kommen.
  */
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -331,7 +337,7 @@ describe('Bot-Speicher über die API auf MySQL', () => {
     mkdirSync(join(hubRoot, name), { recursive: true });
     writeFileSync(
       join(hubRoot, name, 'bot.sh'),
-      'echo "token=$BOT_HUB_TOKEN"\nsleep 30\n',
+      'echo "token=$BOT_HUB_TOKEN"\nprintf "%s" "$BOT_HUB_TOKEN" > runtime-token.txt\nsleep 30\n',
     );
     const created = await callWith('')('/bots', {
       method: 'POST',
@@ -348,15 +354,17 @@ describe('Bot-Speicher über die API auf MySQL', () => {
       body: {},
     });
     for (let i = 0; i < 100; i += 1) {
-      const logs = await callWith('')(
-        `/bots/${created.data.bot.id}/logs?tail=20`,
-      );
-      const token = (logs.data.lines ?? [])
-        .map((line) => line.text.match(/token=(\S+)/)?.[1])
-        .find(Boolean);
-      if (token) {
-        bots.push({ name, token });
-        return { token, id: created.data.bot.id };
+      try {
+        const token = readFileSync(
+          join(hubRoot, name, 'runtime-token.txt'),
+          'utf8',
+        );
+        if (token) {
+          bots.push({ name, token });
+          return { token, id: created.data.bot.id };
+        }
+      } catch {
+        // Der Bot hat sein Runtime-Token noch nicht geschrieben.
       }
       await new Promise((done) => setTimeout(done, 100));
     }

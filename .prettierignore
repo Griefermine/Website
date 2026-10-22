@@ -1,5 +1,12 @@
 dist
 node_modules
 data
+bots
 public/fonts
 package-lock.json
+
+# `bots/` sind Laufzeitdaten: Startordner, Workspace-Kopien und `start-sync.json`
+# schreibt der Hub selbst, und die Datei-Prüfsummen darin entscheiden über das
+# nächste Spiegeln. Ein Formatieren dieser Dateien wäre keine Stilpflege, sondern
+# eine Änderung am Bestand der Bot-Benutzer – und würde beim nächsten Start als
+# Änderung an ihren Bots sichtbar.

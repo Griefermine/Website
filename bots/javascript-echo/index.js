@@ -221,6 +221,10 @@ let contentWarned = false;
 
 const realBot = async () => {
   const { Client, GatewayIntentBits } = await import('discord.js');
+  const proxyUrl = process.env.BOT_HUB_DISCORD_PROXY;
+  const rest = proxyUrl
+    ? { agent: new (await import('undici')).ProxyAgent(proxyUrl) }
+    : undefined;
   // `Messages` gibt es seit discord.js v14 nicht mehr. Für Nachrichten braucht
   // es GuildMessages; den Inhalt liest man nur mit dem privilegierten
   // MessageContent-Intent, der im Developer-Portal freigeschaltet sein muss.
@@ -230,6 +234,7 @@ const realBot = async () => {
       GatewayIntentBits.GuildMessages,
       GatewayIntentBits.MessageContent,
     ],
+    ...(rest ? { rest } : {}),
   });
 
   // v14 nennt das Ereignis noch `ready`, ab v15 heißt es `clientReady`.
@@ -316,7 +321,10 @@ if (!token) {
     await realBot();
   } catch (error) {
     if (error.code === 'ERR_MODULE_NOT_FOUND') {
-      log('warn', 'discord.js fehlt – npm install discord.js – Demo-Modus');
+      log(
+        'warn',
+        'discord.js fehlt – Abhängigkeiten vor dem Produktionsbetrieb im Workspace bereitstellen – Demo-Modus',
+      );
       await demoMode();
     } else {
       log('error', `FEHLER beim Start: ${error.message}`);

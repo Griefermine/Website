@@ -1,231 +1,48 @@
 /**
- * Prüft, was vor einer Veröffentlichung **in den Commit** gelangen würde.
+ * Release-Scanner – zwei strikt getrennte Prüfungen (P0-B):
  *
- * Zwei Fragen, beide beantwortet ohne Netz und ohne Abhängigkeiten:
+ *   1. REPO-MODUS  `node scripts/release-scan.mjs`
+ *      Prüft die Git-getrackten Dateien: Steht ein Geheimnis im Code? Ist
+ *      etwas getrackt, das nicht ins Repository gehört? Das beantwortet die
+ *      Frage nach dem COMMIT – nicht die nach dem Auslieferungspaket.
  *
- *   1. Steht ein Geheimnis im Code? Gesucht werden nur Muster, die in diesem
- *      Projekt etwas bedeuten – ein Discord-Token, ein Bot-Hub-Token, ein
- *      Session-Geheimnis, ein privater Schlüssel, eine `.env` mit Werten.
- *      Allgemeine Muster wie `password` erzeugen sonst nur Lärm.
+ *   2. ARTEFAKT-MODUS  `node scripts/release-scan.mjs --artifact <pfad>`
+ *      Prüft das finale Archiv (ZIP, tar.gz, tar) inhaltlich: Allowlist,
+ *      Denylist, Pfad-Kanonik, Secret-Muster in den Dateiinhalten, Zip-Bomb-
+ *      Limits. Siehe `artifact-scan.mjs`.
  *
- *   2. Ist etwas getrackt, was nicht hineingehört? `data/` (Bot-Speicher,
- *      Geheimnisse), `.env`, Zertifikate, Schlüssel.
+ * Ein grüner Repo-Modus ersetzt den Artefakt-Modus NICHT und umgekehrt.
+ * Die Meldung „bereit für eine Veröffentlichung“ fällt ausschließlich im
+ * Artefakt-Modus für das konkret geprüfte Archiv.
  *
- * Geprüft wird bewusst nur, was Git kennt. Eine `.env` im Arbeitsverzeichnis ist
- * kein Fund – sie ist über `.gitignore` ausgeschlossen und wird nie committet.
- * Sie zu melden hieße, immer dasselbe zu melden und damit nichts mehr.
- *
- * Getrennt davon gibt es eine Warnung für Dateien, die auf diesem Rechner liegen
- * und zu weit lesbar sind. Das ist kein Veröffentlichungsproblem, sondern ein
- * Rechnerproblem – und ein anderes.
- *
- * Aufruf: `node scripts/release-scan.mjs` – bricht mit Exit-Code 1 ab, wenn
- * etwas gefunden wird, damit er in eine Pipeline gehört.
+ * Exit-Codes:
+ *   0 = geprüft und frei
+ *   1 = Fundstelle(n)
+ *   2 = nicht prüfbar (kein Git, unlesbares/kaputtes Archiv …)
+ *      – „nicht prüfbar“ ist bewusst KEIN Erfolg.
  */
 
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { extname, join, resolve } from 'node:path';
 import process from 'node:process';
+import {
+  BINARY_EXTENSIONS,
+  repoUnwantedPatterns,
+  artifactUnwantedPatterns,
+  inhaltFindings,
+  exampleWertePrüfen,
+  istScannerQuelldatei,
+} from './scan-rules.mjs';
+import { scanArtifactFile, ladeManifest } from './artifact-scan.mjs';
 
 const ROOT = resolve(import.meta.dirname, '..');
 
-/** Verzeichnisse, die nie durchsucht werden. */
-const SKIP_DIRS = new Set([
-  'node_modules',
-  '.git',
-  'dist',
-  'coverage',
-  '.vite',
-  'target',
-  'build',
-  '__pycache__',
-  '.venv',
-  'venv',
-]);
-
-/** Dateiendungen ohne Textinhalt. */
-const BINARY = new Set([
-  '.png',
-  '.jpg',
-  '.jpeg',
-  '.gif',
-  '.webp',
-  '.ico',
-  '.avif',
-  '.zip',
-  '.gz',
-  '.tgz',
-  '.bz2',
-  '.xz',
-  '.7z',
-  '.pdf',
-  '.woff',
-  '.woff2',
-  '.ttf',
-  '.otf',
-  '.eot',
-  '.sqlite',
-  '.sqlite3',
-  '.db',
-  // Ein SQL-Dump ist ein Export: er enthält die Daten *und* regelmäßig die
-  // Anweisungen, mit denen sie wieder hereinkommen – inklusive
-  // `IDENTIFIED BY`. Wer einen Dump committet, gibt damit die Datenbank preis.
-  '.sql',
-  '.sql.gz',
-  '.dump',
-  '.so',
-  '.dylib',
-  '.dll',
-  '.exe',
-  '.jar',
-  '.mp3',
-  '.mp4',
-  '.webm',
-  '.mov',
-  '.wav',
-  '.class',
-]);
-
 /**
- * Geheimnisse in Textdateien.
- *
- * Bewusst eng gefasst. Jedes Muster beschreibt etwas, das in diesem Projekt
- * tatsächlich ein Geheimnis wäre – ein Discord-Bot-Token beginnt mit einem
- * festen Präfix, ein Hub-Token ist ein 48-stelliger Hex-Wert, und so weiter.
- * Eine Suche nach `secret` im Allgemeinen findet Variablennamen statt Werte.
+ * Sammelt die Dateien, die Git kennt. Ohne Git bleibt nichts zu prüfen – der
+ * Aufrufer merkt es am Exit-Code 2, statt dass eine leere Prüfung als Erfolg
+ * durchgeht.
  */
-const SECRET_PATTERNS = [
-  {
-    name: 'Discord-Bot-Token',
-    muster: /[MN][A-Za-z0-9_-]{23}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}/,
-  },
-  {
-    name: 'OAuth-Code',
-    ///code# oder /code@ im Fragmente – eine Autorisierungsantwort im Protokoll.
-    muster: /[?&](?:code)=[A-Za-z0-9_-]{20,}/,
-  },
-  {
-    name: 'privater Schlüssel',
-    muster: /-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----/,
-  },
-  {
-    name: 'AWS-Zugriffsschlüssel',
-    muster: /\bAKIA[0-9A-Z]{16}\b/,
-  },
-  {
-    name: 'GitHub-Token',
-    muster: /\bgh[pousr]_[A-Za-z0-9]{36,}\b/,
-  },
-  {
-    name: 'Slack-Token',
-    muster: /\bxox[abposr]-[A-Za-z0-9-]{10,}\b/,
-  },
-  {
-    name: 'Google-API-Schlüssel',
-    muster: /\bAIza[0-9A-Za-z_-]{35}\b/,
-  },
-  {
-    name: 'Zertifikat mit Schlüssel',
-    muster: /-----BEGIN PRIVATE KEY-----[\s\S]*?-----END PRIVATE KEY-----/,
-  },
-];
-
-/**
- * Zuweisungen, bei denen der Wert nicht als Platzhalter aussieht.
- *
- * `<...>`, `example`, `changeme`, `${...}`, leer und Zeichenketten aus Nullen
- * zählen als Platzhalter – die stehen in `.env.example` und in Beispielen.
- */
-/**
- * Zuweisungen, bei denen der Wert nicht als Platzhalter aussieht.
- *
- * `<...>`, `example`, `changeme`, `${...}` und ein leerer Wert zählen als
- * Platzhalter – die stehen in `.env.example` und in Beispielen. Anführungszeichen
- * um einen Wert sind nur Hülle und werden vorher abgenommen: sonst hielte ein
- * `'geheim'` für einen leeren Platzhalter und die Suche fände nichts.
- */
-const istPlatzhalter = (wert) => {
-  const text = String(wert ?? '')
-    .trim()
-    .replace(/^["']|["']$/g, '')
-    .trim();
-  if (!text) return true;
-  if (/^<.*>$/.test(text)) return true;
-  if (/^\$\{.*\}$/.test(text)) return true;
-  // Auslassungspunkte und das typografische Zeichen stehen für "hier steht dein
-  // eigener Wert". Sie können allein stehen (`TOKEN=…`) oder einen Befehl
-  // einleiten (`TOKEN=… python3 bot.py`) – beides ist eine Anleitung, kein Wert.
-  if (/^(…|\.\.\.)($|[^\d])/.test(text)) return true;
-  return /^(x{4,}|changeme|example|placeholder|dein|your|CHANGE_ME|TODO|FIXME)/i.test(
-    text,
-  );
-};
-
-const ASSIGNMENT_PATTERNS = [
-  {
-    name: 'belegte Umgebungsvariable',
-    // `\s` wäre falsch: es greift über den Zeilenumbruch hinweg und nähme dann
-    // die nächste Zeile als Wert. `[^\S\r\n]` ist nur horizontaler Whitespace.
-    muster:
-      /^[^\S\r\n]*(?:export[^\S\r\n]+)?(DISCORD_CLIENT_SECRET|DISCORD_CLIENT_TOKEN|DISCORD_BOT_TOKEN|BOT_HUB_TOKEN|BOT_HUB_SESSION_SECRET|BOT_HUB_DB_PASSWORD|BOT_HUB_ADMIN_DB_PASSWORD|MYSQL_PASSWORD|MYSQL_ROOT_PASSWORD)[^\S\r\n]*=[^\S\r\n]*(.+)$/gm,
-    istPlatzhalter,
-  },
-  {
-    name: 'Datenbank-Passwort in SQL',
-    // `CREATE USER … IDENTIFIED BY` und `SET PASSWORD` stehen in jedem Dump,
-    // den mysqldump mit `--all-databases` oder `--users` erzeugt. Der Wert ist
-    // wörtlich derselbe, mit dem sich jemand anmelden kann.
-    //
-    // Zwei Gruppen, weil die Auswertung an einer Stelle für alle Muster gilt:
-    // Gruppe 1 landet in der Meldung, Gruppe 2 geht an `istPlatzhalter`.
-    // Wichtig ist die Reihenfolge – die Meldung nennt nur `IDENTIFIED BY`,
-    // nie den Wert dahinter. Ein Scanner, der beim Treffer das Passwort
-    // ausgibt, kopiert es in die Konsole und damit in jedes Log, in dem die
-    // Ausgabe landet.
-    muster:
-      /\b(IDENTIFIED\s+BY|SET\s+PASSWORD(?:\s+FOR\s+[^\s]+)?)\s*[:=]?\s*['"]([^'"]{8,})['"]/gi,
-    // Ein Wert in Anführungszeichen hinter diesen Stichwörtern ist immer
-    // wörtlich gemeint – es gibt dort nichts zu erraten.
-    istPlatzhalter: () => false,
-  },
-];
-
-/**
- * Dateiendungen, in denen eine Zuweisung kein Geheimnis belegt.
- *
- * `NAME="…"` in einer Anleitung beschreibt eine Konfiguration, es ist kein
- * Wert. Die Formen ohne Raten – Discord-Token, Schlüssel, Cloud-Schlüssel –
- * gelten trotzdem überall, auch in Dokumentation.
- */
-const DOKUMENTATION = new Set(['.md', '.markdown', '.txt', '.rst', '.adoc']);
-
-/**
- * Pfade, die nicht im Repository gehören.
- *
- * Abgeglichen wird gegen das Git-Verzeichnis, nicht gegen den Namen: `logs`
- * wird in `.gitignore` genannt, taucht aber als Ordner im Arbeitsverzeichnis
- * auf, ohne dass jemand ihn je committet hat.
- */
-const UNWANTED_PATTERNS = [
-  { muster: /^\.env$/, grund: 'enthält Geheimnisse' },
-  { muster: /^\.env\.(?!example)/, grund: 'enthält Geheimnisse' },
-  { muster: /^data\//, grund: 'Bot-Speicher und Geheimnisse' },
-  { muster: /^data\/secrets\//, grund: 'Bot-Geheimnisse' },
-  { muster: /(^|\/)\.env\.local$/, grund: 'lokale Konfiguration' },
-  { muster: /\.pem$/, grund: 'Schlüssel' },
-  { muster: /\.key$/, grund: 'Schlüssel' },
-  { muster: /\.p12$/, grund: 'Zertifikat mit Schlüssel' },
-  { muster: /\.pfx$/, grund: 'Zertifikat mit Schlüssel' },
-  { muster: /(^|\/)\.env\..*\.local$/, grund: 'lokale Konfiguration' },
-  { muster: /(^|\/)id_(rsa|dsa|ecdsa|ed25519)$/, grund: 'privater Schlüssel' },
-  { muster: /\.sqlite(-wal|-shm)?$/, grund: 'Bot-Speicher' },
-  { muster: /\.sql(\.gz)?$/, grund: 'Datenbank-Export' },
-  { muster: /\.dump$/, grund: 'Datenbank-Export' },
-  { muster: /(^|\/)npm-debug\.log/, grund: 'Logdatei' },
-];
-
-/** Sammelt die Dateien, die Git kennt – also die zur Veröffentlichung kämen. */
 const tracked = () => {
   try {
     const ausgabe = execFileSync('git', ['ls-files', '-z'], {
@@ -235,18 +52,19 @@ const tracked = () => {
     });
     return ausgabe.split('\0').filter(Boolean);
   } catch {
-    // Ohne Git (kein Repository, kein Binary) bleibt nichts zu prüfen. Der
-    // Aufrufer merkt es an, statt dass hier eine leere Prüfung als Erfolg
-    // durchgeht.
     console.error(
       'Hinweis: git ist nicht verfügbar – es wurde nichts geprüft.\n' +
-        '        Der Scan prüft nur getrackte Dateien.',
+        '        Der Repo-Scan prüft nur getrackte Dateien; für das finale\n' +
+        '        Release-Artefakt gehört --artifact <pfad> verwendet.',
     );
     return null;
   }
 };
 
-/** Release-Archive (*.tgz/*.tar.gz/*.zip im Root) auf Geheimnis-Pfade prüfen. */
+/**
+ * Release-Archive (*.tgz/*.tar.gz/*.tar/*.zip im Root) auf Geheimnis-Pfade
+ * prüfen. Namen-Schnellprüfung – der Tiefgang kommt im --artifact-Modus.
+ */
 const scanArchiveNamen = () => {
   const funde = [];
   let eintraege = [];
@@ -256,55 +74,34 @@ const scanArchiveNamen = () => {
     return funde;
   }
   for (const name of eintraege) {
-    if (!/\.(tgz|tar\.gz|zip)$/i.test(name)) continue;
-    const pfad = join(ROOT, name);
-    let liste = '';
-    try {
-      if (/\.zip$/i.test(name))
-        liste = execFileSync('unzip', ['-l', pfad], {
-          encoding: 'utf8',
-          maxBuffer: 8 * 1024 * 1024,
-        });
-      else
-        liste = execFileSync('tar', ['-tzf', pfad], {
-          encoding: 'utf8',
-          maxBuffer: 8 * 1024 * 1024,
-        });
-    } catch {
+    if (!/\.(tgz|tar\.gz|tar|zip)$/i.test(name)) continue;
+    for (const { muster, grund } of artifactUnwantedPatterns()) {
+      if (muster.test(name)) {
+        funde.push({ art: 'Release-Archiv', pfad: name, grund });
+        break;
+      }
+    }
+    // Zusätzliche Pfadregeln wie im Repo-Modus:
+    if (
+      /(^|\/)\.env($|\.)/.test(name) ||
+      /\.(sqlite(-wal|-shm)?|db|sql(\.gz)?|dump|pem|key|p12|pfx)$/i.test(name)
+    )
       funde.push({
         art: 'Release-Archiv',
         pfad: name,
-        grund: 'Archiv lässt sich nicht auflisten – bitte manuell prüfen',
+        grund: 'Geheimnis-Pfad im Release-Archiv',
       });
-      continue;
-    }
-    for (const line of liste.split('\n')) {
-      const rel = line.trim().split(/\s+/).pop() ?? '';
-      if (!rel) continue;
-      if (
-        /^\.env($|\.)/.test(rel) ||
-        rel.startsWith('data/') ||
-        rel.startsWith('data/secrets/') ||
-        /\.pem$|\.key$|\.p12$|\.pfx$|\.sqlite$|\.sql$|\.dump$/.test(rel)
-      )
-        funde.push({
-          art: 'Release-Archiv',
-          pfad: `${name}:${rel}`,
-          grund: 'Geheimnis-Pfad im Release-Archiv',
-        });
-    }
   }
   return funde;
 };
 
 /**
  * Dateien, die hier liegen, von Git aber ignoriert werden, und zu weit lesbar
- * sind. Kein Veröffentlichungsproblem – ein Rechnerproblem, deshalb nur eine
- * Warnung.
+ * sind. Kein Veröffentlichungsproblem – ein Rechnerproblem, deshalb Warnung.
  */
 const lokaleWarnungen = () => {
   const warnungen = [];
-  for (const ordner of ['data/secrets']) {
+  for (const ordner of ['data/secrets', 'data']) {
     const voll = join(ROOT, ordner);
     if (!existsSync(voll)) continue;
     try {
@@ -320,9 +117,81 @@ const lokaleWarnungen = () => {
   return warnungen;
 };
 
+const farbe = (text, code) =>
+  process.stdout.isTTY ? `\x1b[${code}m${text}\x1b[0m` : text;
+
+/* ------------------------------ CLI --------------------------------- */
+
+const argv = process.argv.slice(2);
+const artifactIndex = argv.indexOf('--artifact');
+const artifactPfad =
+  artifactIndex >= 0 ? argv[artifactIndex + 1] : process.env.BOT_HUB_ARTIFACT;
+
+if (artifactIndex >= 0 && !artifactPfad) {
+  console.error('FEHLER: --artifact erwartet einen Dateipfad.');
+  process.exit(2);
+}
+
+if (artifactPfad) {
+  /* ----------------------- ARTEFAKT-MODUS ----------------------- */
+  let manifest;
+  try {
+    manifest = ladeManifest(
+      readFileSync(join(import.meta.dirname, 'release-manifest.json'), 'utf8'),
+    );
+  } catch (error) {
+    console.error(`FEHLER: Release-Manifest unlesbar: ${error.message}`);
+    process.exit(2);
+  }
+  const voll = resolve(ROOT, artifactPfad);
+  if (!existsSync(voll)) {
+    console.error(`FEHLER: Artefakt nicht gefunden: ${artifactPfad}`);
+    process.exit(2);
+  }
+  const { status, findings, stats } = scanArtifactFile(voll, manifest);
+  console.log(
+    `Artefakt: ${voll}\nFormat: ${stats.format || '-'} · Einträge: ${stats.eintraege} · Dateien: ${stats.dateien}`,
+  );
+  if (status === 'ok') {
+    console.log(
+      farbe(
+        `✓ ${stats.dateien} Artefakt-Dateien geprüft – ausschließlich freigegebene Inhalte, nichts Geheimnisverdächtiges.`,
+        32,
+      ),
+    );
+    console.log(
+      farbe('  Bereit für eine Veröffentlichung DIESES Archivs.', 32),
+    );
+    process.exit(0);
+  }
+  if (status === 'unpruefbar') {
+    console.error(
+      farbe(
+        '\n✗ Artefakt ist nicht vollständig prüfbar – keine Freigabe:\n',
+        31,
+      ),
+    );
+    for (const f of findings)
+      console.error(`  ${farbe('UNPRÜFBAR', 31)}  ${f.pfad}\n      ${f.grund}`);
+    process.exit(2);
+  }
+  console.error(
+    farbe(`\n✗ ${findings.length} Fundstelle(n) im Release-Artefakt:\n`, 31),
+  );
+  for (const f of findings)
+    console.error(`  ${farbe('FUND', 31)}  ${f.pfad}\n      ${f.grund}`);
+  console.error(
+    '\nDas Archiv ist nicht releasebereit. Erzeuge es aus einem sauberen\n' +
+      'Staging-Verzeichnis (npm run release:build) und prüfen erneut.',
+  );
+  process.exit(1);
+}
+
+/* -------------------------- REPO-MODUS -------------------------- */
+
 const fund = [];
-const geprueft = tracked();
 for (const eintrag of scanArchiveNamen()) fund.push(eintrag);
+const geprueft = tracked();
 
 if (geprueft) {
   for (const rel of geprueft) {
@@ -334,61 +203,53 @@ if (geprueft) {
       continue;
     }
 
-    for (const regel of UNWANTED_PATTERNS) {
+    for (const regel of repoUnwantedPatterns()) {
       if (regel.muster.test(rel))
+        fund.push({ art: 'unerwünschte Datei', pfad: rel, grund: regel.grund });
+    }
+
+    // Diese Dateien nennen die Muster selbst; sich selbst zu melden wäre
+    // Unsinn – die zentrale Liste steht in scan-rules.mjs.
+    if (istScannerQuelldatei(rel)) continue;
+
+    // Verzeichnisse, die der Inhaltssuche nie gehören (binäre Endungen
+    // wurden in BINARY_EXTENSIONS/TEXT_EXCLUDED gebündelt).
+    const ext = extname(rel).toLowerCase();
+    if (BINARY_EXTENSIONS.has(ext)) continue;
+
+    // Muster aus der geteilten Bibliothek (identisch zum Artefakt-Modus):
+    for (const f of inhaltFindings(rel, inhalt))
+      fund.push({ art: 'Geheimnis', pfad: rel, grund: f.grund });
+
+    // `.env.example`: nur Platzhalter, niemals kopierte Testwerte.
+    if (/(^|\/)\.env\.example$/.test(rel)) {
+      for (const zeile of exampleWertePrüfen(inhalt))
         fund.push({
           art: 'unerwünschte Datei',
           pfad: rel,
-          grund: regel.grund,
+          grund: `.env.example enthält Nicht-Platzhalter: ${zeile}`,
         });
-    }
-
-    // Diese Datei nennt die Muster selbst; sich selbst zu melden wäre Unsinn.
-    if (rel === 'scripts/release-scan.mjs') continue;
-
-    for (const { name, muster } of SECRET_PATTERNS) {
-      muster.lastIndex = 0;
-      const treffer = muster.exec(inhalt);
-      if (treffer)
-        fund.push({
-          art: 'Geheimnis',
-          pfad: rel,
-          grund: `${name} (Zeile ${inhalt.slice(0, treffer.index).split('\n').length})`,
-          // Der Wert selbst wird nie ausgegeben – nur, wo er steht.
-        });
-    }
-
-    for (const { name, muster, istPlatzhalter } of ASSIGNMENT_PATTERNS) {
-      // In Dokumentation beschreibt eine Zuweisung eine Konfiguration.
-      if (DOKUMENTATION.has(extname(rel).toLowerCase())) continue;
-      muster.lastIndex = 0;
-      let treffer;
-      while ((treffer = muster.exec(inhalt))) {
-        if (istPlatzhalter(treffer[2])) continue;
-        fund.push({
-          art: 'Geheimnis',
-          pfad: rel,
-          grund: `${name}: ${treffer[1]} (Zeile ${inhalt.slice(0, treffer.index).split('\n').length})`,
-        });
-      }
     }
   }
 }
 
-/* ------------------------------------------------------------------ */
-
-const farbe = (text, code) =>
-  process.stdout.isTTY ? `\x1b[${code}m${text}\x1b[0m` : text;
-
 for (const warnung of lokaleWarnungen())
   console.warn(farbe(`  ACHTUNG  ${warnung}`, 33));
 
-if (geprueft === null) process.exit(2);
+if (geprueft === null) {
+  console.error(
+    farbe('✗ Repo-Scan nicht möglich (kein Git) – kein Erfolg, Exit 2.', 31),
+  );
+  process.exit(2);
+}
 
 if (fund.length === 0) {
   console.log(
     farbe(
-      `✓ ${geprueft.length} getrackte Dateien geprüft, nichts gefunden – bereit für eine Veröffentlichung`,
+      `✓ ${geprueft.length} getrackte Dateien geprüft, nichts gefunden.\n` +
+        '  Hinweis: Das ist die Freigabe des REPOS, nicht eines Archivs.\n' +
+        '  Für das Release-Artefakt immer zusätzlich: npm run release:build\n' +
+        '  bzw. node scripts/release-scan.mjs --artifact <pfad>',
       32,
     ),
   );

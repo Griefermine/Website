@@ -13,18 +13,21 @@
     "start": "node server/index.js",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "node --test test/api.test.js && node --test test/panel.test.js && node --test test/secrets.test.js && node --test test/startup.test.js && node --test test/containers.test.js && node --test test/commands.test.js && node --test test/quota.test.js && node --test test/botFiles.test.js && node --test test/botFiles-api.test.js && node --test test/startFolder.test.js && node --test test/mysql.test.js && node --test test/database.test.js && node --test test/security-v19.test.js && node --test test/panel-scaffold.test.js",
+    "test": "node --test test/api.test.js test/bot-delete.test.js test/botFiles-api.test.js test/botFiles.test.js test/commands.test.js test/containers.test.js test/database.test.js test/egress-proxy.test.js test/history-scan.test.js test/mysql.test.js test/panel-scaffold.test.js test/panel.test.js test/preflight.test.js test/quota.test.js test/release-scan.test.js test/secrets.test.js test/security-v19.test.js test/security-v24.test.js test/security-v25b.test.js test/security-v26-workspace-isolation.test.js test/security-v26-command-injection.test.js test/security-v26-csp.test.js test/startFolder.test.js test/startup.test.js",
     "test:mysql": "BOT_HUB_TEST_MYSQL=1 BOT_HUB_TEST_MYSQL_CONTAINER=1 node --test test/database-mysql.test.js",
     "test:mysql-container": "node --test test/mysql-container.test.js",
-    "release:scan": "node scripts/release-scan.mjs"
+    "release:scan": "node scripts/release-scan.mjs",
+    "release:scan:history": "node scripts/history-scan.mjs",
+    "release:build": "node scripts/release-build.mjs"
   },
   "devDependencies": {
-    "concurrently": "^9.1.2",
+    "concurrently": "^9.2.5",
     "prettier": "^3.3.1",
-    "vite": "^8.3.1"
+    "vite": "^8.3.5"
   },
   "dependencies": {
-    "discord.js": "^14.27.0"
+    "discord.js": "^14.27.0",
+    "undici": "^6.29.0"
   },
   "optionalDependencies": {
     "mysql2": "^3.24.5"

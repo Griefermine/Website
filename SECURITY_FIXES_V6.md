@@ -267,7 +267,7 @@ Ein Bot darf sein Arbeitsverzeichnis nie außerhalb des erlaubten Projekt-/Bot-B
 In `server/manager.js` eine zentrale Funktion erstellen, z. B.:
 
 ```js
-resolveTrustedBotDir(bot)
+resolveTrustedBotDir(bot);
 ```
 
 Regeln:
@@ -432,32 +432,44 @@ Die Änderung ist erst fertig, wenn alle Punkte erfüllt sind:
 # Empfohlene Reihenfolge
 
 ## Schritt 1
+
 `server/manager.js`
+
 - `botEnv()` auf Allowlist umstellen.
 - Panel-Discord-Auth-Routen vor der normalen Panel-Permission behandeln.
 
 ## Schritt 2
+
 `server/auth.js`
+
 - konfigurierbare Bootstrap-Owner-ID(s) ergänzen.
 
 ## Schritt 3
+
 `server/manager.js` / `server/util.js`
+
 - zentrale realpath-basierte Bot-Dir-Prüfung ergänzen und verwenden.
 - `/api/health` entschärfen.
 
 ## Schritt 4
+
 `server/panel.js`
+
 - Query-Token standardmäßig deaktivieren.
 - Header-basierte Tokenprüfung beibehalten.
 
 ## Schritt 5
+
 Repository-Hygiene
+
 - Secrets entfernen.
 - `.env.example` prüfen.
 - `data/` und lokale Laufzeitdaten nicht committen.
 
 ## Schritt 6
+
 Dependencies und Tests
+
 - Vite aktualisieren.
 - `npm audit`.
 - `npm test`.

@@ -1,0 +1,24 @@
+services:
+  discord-egress:
+    build:
+      context: .
+    image: bot-hub-discord-egress:local
+    container_name: bot-hub-discord-egress
+    labels:
+      bot-hub.discord-egress: filtered-egress-v5
+    # The shared proxy is reachable only through its two private gateway
+    # addresses. Keeping it off the shared container bridges lets Docker's
+    # inter-container isolation block bot-to-bot and installer-to-installer
+    # traffic without blocking access to Squid.
+    network_mode: host
+    user: '13:13'
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - /etc/bot-hub/callback-domains.txt:/etc/squid/callback-domains.txt:ro
+    tmpfs:
+      - /tmp:size=16m,mode=1777

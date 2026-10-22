@@ -1,10 +1,15 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import {
   chmodSync,
+  closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
   writeFileSync,
+  renameSync,
+  unlinkSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 
@@ -182,19 +187,38 @@ export const currentUser = (req) => session(req)?.user ?? null;
 // Discord-Access-Tokens bleiben dabei absichtlich außerhalb dieses Moduls.
 export const currentAuthSession = (req) => session(req);
 
-const saveAccess = () => {
-  if (!accessFile) return;
+const saveAccess = (strict = false) => {
+  if (!accessFile) {
+    if (strict) throw new Error('Zugriffsdatei ist nicht konfiguriert');
+    return;
+  }
+  const temporary = `${accessFile}.${process.pid}.tmp`;
   try {
     mkdirSync(dirname(accessFile), { recursive: true });
-    writeFileSync(accessFile, `${JSON.stringify(access, null, 2)}\n`, {
+    writeFileSync(temporary, `${JSON.stringify(access, null, 2)}\n`, {
       mode: 0o600,
     });
-    chmodSync(accessFile, 0o600);
+    chmodSync(temporary, 0o600);
+    const fd = openSync(temporary, 'r');
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporary, accessFile);
   } catch (error) {
+    try {
+      unlinkSync(temporary);
+    } catch {
+      /* A leftover temp file is harmless; report the original write error. */
+    }
     console.error(
       '[hub] Zugriffsrechte konnten nicht gespeichert werden:',
       error.message,
     );
+    // Irreversible Schritte (Bot-Delete) dürfen Schreibfehler nicht
+    // verschlucken, sondern melden sie als Teilfehler.
+    if (strict) throw error;
   }
 };
 
@@ -365,12 +389,18 @@ export const updateAccess = (id, input, actorId) => {
     allowed.has(permission),
   );
   const requestedBots =
-    input.bots && typeof input.bots === 'object' ? input.bots : existing.bots ?? {};
+    input.bots && typeof input.bots === 'object'
+      ? input.bots
+      : (existing.bots ?? {});
   const botsClean = {};
   for (const [bid, cfg] of Object.entries(requestedBots)) {
     if (!/^[A-Za-z0-9._-]{1,64}$/.test(bid)) continue;
     const perms = Array.isArray(cfg?.permissions)
-      ? [...new Set(cfg.permissions.filter((p) => DEFAULT_PERMISSIONS.includes(p)))]
+      ? [
+          ...new Set(
+            cfg.permissions.filter((p) => DEFAULT_PERMISSIONS.includes(p)),
+          ),
+        ]
       : [];
     botsClean[bid] = { permissions: perms.filter((p) => allowed.has(p)) };
   }
@@ -397,6 +427,30 @@ export const removeAccess = (id, actorId) => {
     throw new Error('Der letzte Eigentümer kann nicht entfernt werden');
   delete access.users[id];
   saveAccess();
+};
+
+/**
+ * Entfernt beim Bot-Löschen alle Berechtigungseinträge dieser Bot-ID aus
+ * sämtlichen Benutzern. Nur die gelöschte ID wird angefasst, andere
+ * Bot-Rechte bleiben unverändert. Gibt die Zahl bereinigter Benutzer zurück.
+ */
+export const purgeBotAccess = (botId) => {
+  const id = String(botId ?? '');
+  if (!id) return 0;
+  let purged = 0;
+  for (const entry of Object.values(access.users)) {
+    if (entry?.bots && Object.hasOwn(entry.bots, id)) {
+      delete entry.bots[id];
+      entry.updatedAt = Date.now();
+      purged += 1;
+    }
+  }
+  // Immer persistieren (strict), sobald konfiguriert: War ein früherer
+  // Versuch an einem Schreibfehler gescheitert, ist der Speicher bereits
+  // bereinigt, aber die Datei noch nicht – erst das erneute Schreiben stellt
+  // Konvergenz her.
+  if (purged || accessFile) saveAccess(true);
+  return purged;
 };
 
 export const authSession = (req) => {

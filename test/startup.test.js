@@ -83,6 +83,15 @@ describe('Startschutz für unsichere Konfiguration', () => {
     assert.match(out, /ABBRUCH: BOT_HUB_CONTAINER_MODE=disabled/);
   });
 
+  it('verweigert einen öffentlich gebundenen Produktions-HTTP-Listener', async () => {
+    const { code, out } = await startHub({
+      NODE_ENV: 'production',
+      HOST: '0.0.0.0',
+    });
+    assert.equal(code, 1);
+    assert.match(out, /Produktionsbetrieb darf nicht auf 0\.0\.0\.0 lauschen/);
+  });
+
   it('startet mit Testmodus, wenn NODE_ENV=test gesetzt ist', async () => {
     const out = await startAndRead({
       NODE_ENV: 'test',

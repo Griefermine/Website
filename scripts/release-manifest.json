@@ -1,0 +1,34 @@
+{
+  "_comment": [
+    "Allowlist für das Release-Artefakt (P0-B/P0-C). Unbekannt = abgelehnt.",
+    "Die Denylist in scripts/scan-rules.mjs wirkt zusätzlich und härter.",
+    "geändert am 2026-10-22 zusammen mit P0-B; bewusst ohne data/, bots/, dist/, .git, node_modules und lokale .env.",
+    "Verzeichniseinträge (`.github`, `.github/workflows`) stehen einzeln drin: ein",
+    "tar-Archiv führt sie als eigene Einträge, und der Artefakt-Scan verlangt für",
+    "jeden Eintrag einen Treffer – ein Muster wie `.github/**` würde dagegen jeden",
+    "zukünftigen Workflow ungeprüft durchlassen."
+  ],
+  "allow": [
+    "README*",
+    "package.json",
+    "package-lock.json",
+    "vite.config.js",
+    "index.html",
+    ".prettierrc",
+    ".env.example",
+    ".gitignore",
+    ".prettierignore",
+    "LICENSE*",
+    "server/**",
+    "src/**",
+    "public/**",
+    "documents/**",
+    "deploy/**",
+    "scripts/**",
+    "test/**",
+    ".github/workflows/ci.yml",
+    ".github",
+    ".github/workflows"
+  ],
+  "exclude": ["test/.startup/**"]
+}

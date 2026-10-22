@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   statSync,
   symlinkSync,
   writeFileSync,
@@ -59,7 +60,7 @@ const startBot = async (name) => {
   mkdirSync(join(root, dir), { recursive: true });
   writeFileSync(
     join(root, dir, 'bot.sh'),
-    'echo "token=$BOT_HUB_TOKEN"\nsleep 30\n',
+    'echo "token=$BOT_HUB_TOKEN"\nprintf "%s" "$BOT_HUB_TOKEN" > runtime-token.txt\nsleep 30\n',
   );
   const bot = await createBot({
     name,
@@ -70,13 +71,12 @@ const startBot = async (name) => {
   });
   await call(`/bots/${bot.id}/start`, { method: 'POST', body: {} });
   for (let i = 0; i < 100; i += 1) {
-    const lines = (await call(`/bots/${bot.id}/logs?tail=20`)).data.lines.map(
-      (line) => line.text,
-    );
-    const token = lines
-      .map((line) => line.match(/token=(\S+)/)?.[1])
-      .find(Boolean);
-    if (token) return { bot, token };
+    try {
+      const token = readFileSync(join(root, dir, 'runtime-token.txt'), 'utf8');
+      if (token) return { bot, token };
+    } catch {
+      // Der Bot hat sein Runtime-Token noch nicht geschrieben.
+    }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error('Timeout: Bot hat sein Token nicht gemeldet');

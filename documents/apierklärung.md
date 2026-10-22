@@ -62,13 +62,13 @@ Die Funktion bekommt zwei Eingaben:
 - `options`: zusätzliche Einstellungen für die Anfrage, zum Beispiel die HTTP-Methode oder Daten, die gesendet werden sollen
 
 ```js
-options = {}
+options = {};
 ```
 
 Wenn keine Einstellungen übergeben werden, verwendet JavaScript ein leeres Objekt. So funktioniert auch ein einfacher Aufruf:
 
 ```js
-request('/health')
+request('/health');
 ```
 
 ohne dass `options` ausdrücklich angegeben werden muss.
@@ -84,7 +84,7 @@ const response = await fetch(`/api${path}`, {
 Vor `path` wird immer `/api` gesetzt. Aus
 
 ```js
-request('/bots')
+request('/bots');
 ```
 
 wird also tatsächlich eine Anfrage an:
@@ -122,7 +122,7 @@ JSON ist eine Textdarstellung von Daten. Ein JavaScript-Objekt wie dieses:
 wird als JSON ungefähr so übertragen:
 
 ```json
-{"name":"Mein Bot","language":"javascript"}
+{ "name": "Mein Bot", "language": "javascript" }
 ```
 
 ### 1.5 Optionen mit `...options` hinzufügen
@@ -174,7 +174,7 @@ options.body = { force: true };
 wird zu:
 
 ```json
-{"force":true}
+{ "force": true }
 ```
 
 Das ist nötig, weil `fetch` Daten nicht automatisch als JSON-Text verschickt.
@@ -203,7 +203,7 @@ Diese Zeile bedeutet:
 Beispiel:
 
 ```json
-{"id":7,"name":"Mein Bot"}
+{ "id": 7, "name": "Mein Bot" }
 ```
 
 wird zu einem JavaScript-Objekt:
@@ -233,7 +233,7 @@ Wenn ein Fehler vorliegt, wird ein Fehlerobjekt erstellt:
 Beispiel einer Serverantwort:
 
 ```json
-{"error":"Bot wurde nicht gefunden"}
+{ "error": "Bot wurde nicht gefunden" }
 ```
 
 Dann wird ein Fehler mit der Nachricht `Bot wurde nicht gefunden` ausgelöst. Der aufrufende Code kann diesen Fehler dann anzeigen oder anderweitig behandeln.
@@ -383,7 +383,7 @@ const payload = JSON.parse(event.data);
 Beispiel einer Nachricht:
 
 ```json
-{"botId":3,"message":"Bot gestartet"}
+{ "botId": 3, "message": "Bot gestartet" }
 ```
 
 Danach kann der Code mit `payload.botId` und `payload.message` arbeiten.
@@ -459,7 +459,7 @@ list: () => request('/bots'),
 ### `health`
 
 ```js
-api.health()
+api.health();
 ```
 
 fragt `/api/health` ab. Damit kann geprüft werden, ob der Server erreichbar und gesund ist.
@@ -467,7 +467,7 @@ fragt `/api/health` ab. Damit kann geprüft werden, ob der Server erreichbar und
 ### `languages`
 
 ```js
-api.languages()
+api.languages();
 ```
 
 fragt `/api/languages` ab. Vermutlich liefert der Server damit die unterstützten Programmiersprachen.
@@ -475,7 +475,7 @@ fragt `/api/languages` ab. Vermutlich liefert der Server damit die unterstützte
 ### `list`
 
 ```js
-api.list()
+api.list();
 ```
 
 fragt `/api/bots` ab und liefert eine Liste der vorhandenen Bots.
@@ -578,7 +578,7 @@ api.install(3, true);
 Der Server bekommt dann:
 
 ```json
-{"force":true}
+{ "force": true }
 ```
 
 ---
@@ -595,7 +595,7 @@ Diese Funktion lädt Log-Ausgaben.
 Der Ausdruck:
 
 ```js
-id ? `/bots/${id}` : ''
+id ? `/bots/${id}` : '';
 ```
 
 ist ein sogenannter **ternärer Operator**. Er bedeutet:
@@ -714,7 +714,7 @@ das einen Pfad von einem Dateinamen trennt. Deshalb wird jeder Abschnitt einzeln
 kodiert und wieder mit einem Schrägstrich verbunden:
 
 ```js
-encodePath('src/hilfe.py')
+encodePath('src/hilfe.py');
 ```
 
 ergibt:
@@ -776,7 +776,7 @@ api.panelState(3, { open: true });
 Dabei wird eine `PUT`-Anfrage mit folgendem Inhalt gesendet:
 
 ```json
-{"state":{"open":true}}
+{ "state": { "open": true } }
 ```
 
 `PUT` wird häufig verwendet, wenn ein bestimmter Zustand vollständig gespeichert oder ersetzt werden soll.
@@ -828,7 +828,7 @@ api.panelCommand(3, 'say hello', { channel: 'general' });
 Befehle können Leerzeichen oder Sonderzeichen enthalten. Solche Zeichen sind in einer URL problematisch.
 
 ```js
-encodeURIComponent('say hello')
+encodeURIComponent('say hello');
 ```
 
 macht daraus ungefähr:
@@ -842,7 +842,7 @@ So bleibt der Befehl ein sicherer und gültiger Teil der URL.
 `args = {}` bedeutet, dass ein Befehl auch ohne zusätzliche Argumente aufgerufen werden kann. In diesem Fall wird ein leeres Objekt gesendet:
 
 ```json
-{"args":{}}
+{ "args": {} }
 ```
 
 ---

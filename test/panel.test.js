@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -147,7 +147,7 @@ before(async () => {
   mkdirSync(join(root, 'fremd'));
   writeFileSync(
     join(root, 'worker', 'bot.sh'),
-    'echo "hub=$BOT_HUB_URL"\necho "token=$BOT_HUB_TOKEN"\necho "settings=$BOT_HUB_SETTINGS"\necho "setting=$BOT_HUB_SETTING_LOG_CHANNEL"\nsleep 30\n',
+    'echo "hub=$BOT_HUB_URL"\necho "token=$BOT_HUB_TOKEN"\nprintf "%s" "$BOT_HUB_TOKEN" > runtime-token.txt\necho "settings=$BOT_HUB_SETTINGS"\necho "setting=$BOT_HUB_SETTING_LOG_CHANNEL"\nsleep 30\n',
   );
   writeFileSync(join(root, 'worker', 'bot-hub.json'), JSON.stringify(MANIFEST));
   writeFileSync(
@@ -174,12 +174,12 @@ before(async () => {
   writeFileSync(join(root, 'worker', 'report.sh'), 'echo "bericht $1"\n');
   writeFileSync(
     join(root, 'nackt', 'bot.sh'),
-    'echo "token=$BOT_HUB_TOKEN"\nsleep 30\n',
+    'echo "token=$BOT_HUB_TOKEN"\nprintf "%s" "$BOT_HUB_TOKEN" > runtime-token.txt\nsleep 30\n',
   );
   for (const ordner of ['callback', 'fremd'])
     writeFileSync(
       join(root, ordner, 'bot.sh'),
-      'echo "token=$BOT_HUB_TOKEN"\nsleep 30\n',
+      'echo "token=$BOT_HUB_TOKEN"\nprintf "%s" "$BOT_HUB_TOKEN" > runtime-token.txt\nsleep 30\n',
     );
 
   process.env.BOT_DASHBOARD_ROOT = root;
@@ -530,10 +530,7 @@ describe('Bot-Seite aus dem laufenden Prozess', () => {
     await waitFor(bot.id, ['running', 'error']);
     await new Promise((resolve) => setTimeout(resolve, 400));
 
-    const line = (await logText(bot.id)).find((item) =>
-      item.startsWith('token='),
-    );
-    token = line.slice('token='.length);
+    token = readFileSync(join(root, 'nackt', 'runtime-token.txt'), 'utf8');
     assert.equal(token.length, 48);
 
     const asBot = callWithToken(token);
@@ -1036,10 +1033,11 @@ describe('Callback-Adresse', () => {
     await call(`/bots/${bot.id}/start`, { method: 'POST' });
     await waitFor(bot.id, ['running', 'error']);
     await new Promise((resolve) => setTimeout(resolve, 400));
-    const line = (await logText(bot.id)).find((item) =>
-      item.startsWith('token='),
+    const token = readFileSync(
+      join(root, 'callback', 'runtime-token.txt'),
+      'utf8',
     );
-    asBot = callWithToken(line.slice('token='.length));
+    asBot = callWithToken(token);
   });
 
   const setzen = (url, token = 'callback-token') =>
@@ -1078,7 +1076,7 @@ describe('Callback-Adresse', () => {
       assert.equal(status, 400, `zugelassen: ${url}`);
       assert.match(
         data.error + (data.message ?? ''),
-        /Loopback|BOT_HUB_CALLBACK_ALLOW|nicht auflösen/,
+        /Loopback|Callback-Allowlist|nicht auflösen/,
         `falsche Begründung für ${url}`,
       );
     }
@@ -1163,13 +1161,17 @@ describe('Callback-Adresse', () => {
     const vorher = process.env.BOT_HUB_CALLBACK_ALLOW;
     // V19 #18: Allowlist umgeht DNS-Schutz niemals. Ein Name ohne DNS-Eintrag
     // wird abgelehnt (400); eine allowlistete IP ohne Metadaten wird angenommen.
-    process.env.BOT_HUB_CALLBACK_ALLOW =
-      'bot.example.test:9999,93.184.216.34:9999';
+    process.env.BOT_HUB_CALLBACK_ALLOW = 'bot.example.test,93.184.216.34';
     try {
       const unaufloesbar = await setzen('http://bot.example.test:9999/hook');
       assert.equal(unaufloesbar.status, 400);
-      const { status } = await setzen('http://93.184.216.34:9999/hook');
+      const { status } = await setzen('https://93.184.216.34/hook');
       assert.equal(status, 200);
+      assert.equal((await setzen('http://93.184.216.34/hook')).status, 400);
+      assert.equal(
+        (await setzen('https://93.184.216.34:8443/hook')).status,
+        400,
+      );
       await setzen(null);
     } finally {
       if (vorher === undefined) delete process.env.BOT_HUB_CALLBACK_ALLOW;
@@ -1201,14 +1203,351 @@ describe('Callback-Adresse', () => {
     await call(`/bots/${fremder.id}/start`, { method: 'POST' });
     await waitFor(fremder.id, ['running', 'error']);
     await new Promise((resolve) => setTimeout(resolve, 400));
-    const line = (await logText(fremder.id)).find((item) =>
-      item.startsWith('token='),
+    const token = readFileSync(
+      join(root, 'fremd', 'runtime-token.txt'),
+      'utf8',
     );
-    const alsFremder = callWithToken(line.slice('token='.length));
+    const alsFremder = callWithToken(token);
 
     // Der Token gehört zum anderen Bot – er darf dessen Callback nicht setzen.
     const { data } = await alsFremder('/hub/session');
     assert.equal(data.bot.id, fremder.id);
     await call(`/bots/${fremder.id}/stop`, { method: 'POST' });
+  });
+
+  it('lehnt Loopback-Ziele im Container-Betrieb ab', async () => {
+    // Bots laufen im Container und erreichen den Loopback des Hub-Rechners
+    // selbst nicht – über den Hub kämen sie trotzdem heran, und die Antwort
+    // fließt als Body in untrusted Bot-Code zurück. Darum ist Loopback tabu,
+    // solange die Container-Runtime aktiv ist. Die Prüfung erfolgt bewusst
+    // zur Anfragezeit (nicht beim Import): der Modus-Switch wirkt dadurch
+    // auch mitten im Prozess – hier wird er nur für diese Anfrage gestellt.
+    const vorherTest = process.env.BOT_HUB_TEST_MODE;
+    const vorherContainer = process.env.BOT_HUB_CONTAINER_MODE;
+    delete process.env.BOT_HUB_TEST_MODE; // sonst gilt die Runtime als abgeschaltet
+    process.env.BOT_HUB_CONTAINER_MODE = 'enabled';
+    try {
+      for (const url of [
+        'http://127.0.0.1:9999/hook',
+        'http://localhost:9999/hook',
+        'http://[::1]:9999/hook',
+      ]) {
+        const { status, data } = await setzen(url);
+        assert.equal(status, 400, `zugelassen: ${url}`);
+        assert.match(
+          data.error + (data.message ?? ''),
+          /Container-Betrieb/,
+          `falsche Begründung für ${url}`,
+        );
+      }
+      // Die Ablehnung darf den gehookten Pfad nicht zurückgeben.
+      const { data: abweis } = await setzen(
+        'http://127.0.0.1:9999/geheim/pfad',
+      );
+      assert.doesNotMatch(
+        JSON.stringify(abweis),
+        /geheim/,
+        'Fehlermeldung leakt den Callback-Pfad',
+      );
+    } finally {
+      if (vorherTest === undefined) delete process.env.BOT_HUB_TEST_MODE;
+      else process.env.BOT_HUB_TEST_MODE = vorherTest;
+      if (vorherContainer === undefined)
+        delete process.env.BOT_HUB_CONTAINER_MODE;
+      else process.env.BOT_HUB_CONTAINER_MODE = vorherContainer;
+    }
+    // Ohne Container-Runtime (Entwicklung, Tests) bleibt Loopback erlaubt –
+    // der Hub teilt sich dort den Loopback mit dem Bot.
+    const { status } = await setzen('http://127.0.0.1:9999/hook');
+    assert.equal(status, 200, 'Loopback im Nicht-Container-Modus abgelehnt');
+    await setzen(null);
+  });
+
+  it('ruft den Hook über die zuvor geprüfte Adresse auf (Lookup-Pinning)', async () => {
+    // Der laufende Prozess braucht einen frischen Token und `runAction`
+    // verlangt ein lebendes Kind – also neu starten und tokenisieren.
+    // Härtung (Test-Timing, keine gelockerte Assertion): /stop antwortet,
+    // solange der Kindprozess noch nicht gestorben ist – /start würde dann
+    // mit 409 „läuft bereits“ ins Leere laufen und der Status bliebe
+    // dauerhaft stopped. Also erst das echte Ende abwarten …
+    const tokenVorher = (() => {
+      try {
+        return readFileSync(
+          join(root, 'callback', 'runtime-token.txt'),
+          'utf8',
+        );
+      } catch {
+        return '';
+      }
+    })();
+    await call(`/bots/${bot.id}/stop`, { method: 'POST' });
+    await waitFor(bot.id, ['stopped']);
+    await call(`/bots/${bot.id}/start`, { method: 'POST' });
+    await waitFor(bot.id, ['running', 'error']);
+    // … und dann den FRISCH geschriebenen Token lesen: die Datei trägt bis
+    // zum Überschreiben durch den neuen Prozess noch den alten Wert – der
+    // feste 400-ms-Schlaf hat unter Last den alten Token erwischt (401).
+    let token = tokenVorher;
+    const seit = Date.now();
+    while (token === tokenVorher && Date.now() - seit < 5000) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      try {
+        token = readFileSync(
+          join(root, 'callback', 'runtime-token.txt'),
+          'utf8',
+        );
+      } catch {
+        /* Datei noch nicht wieder da */
+      }
+    }
+    assert.notEqual(
+      token,
+      tokenVorher,
+      'neuer Runtime-Token wurde nicht geschrieben',
+    );
+    assert.ok(token.length >= 8, `Token unplausibel kurz: ${token.length}`);
+    const alsBot = callWithToken(token);
+
+    // Empfangsserver dual-stack (bindet ::), damit er die geprüfte Adresse
+    // trifft, egal ob `localhost` auf 127.0.0.1 oder ::1 auflöst.
+    const empfangen = [];
+    const hookServer = createServer((req, res) => {
+      const stücke = [];
+      req.on('data', (stück) => stücke.push(stück));
+      req.on('end', () => {
+        empfangen.push({
+          pfad: req.url,
+          token: String(req.headers['x-bot-hub-token'] ?? ''),
+          body: JSON.parse(Buffer.concat(stücke).toString('utf8')),
+        });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ echo: 'angekommen' }));
+      });
+    });
+    try {
+      await new Promise((resolve, ablehnen) => {
+        hookServer.once('error', ablehnen);
+        hookServer.listen(0, '::', () => {
+          hookServer.removeListener('error', ablehnen);
+          resolve();
+        });
+      });
+    } catch {
+      // Kein IPv6 an dieser Stelle: dann eben IPv4-Loopback.
+      await new Promise((resolve) =>
+        hookServer.listen(0, '127.0.0.1', resolve),
+      );
+    }
+    const port = hookServer.address().port;
+    try {
+      // Aktion ohne Skript: beantwortbar nur über den Callback.
+      await alsBot('/hub/panel', {
+        method: 'POST',
+        body: {
+          panel: { title: 'Hook', commands: [{ id: 'hook', label: 'Hook' }] },
+        },
+      });
+      const gesetzt = await alsBot('/hub/callback', {
+        method: 'POST',
+        body: { url: `http://localhost:${port}/hook`, token: 'pinn-token' },
+      });
+      assert.equal(gesetzt.status, 200);
+      const { data } = await call(`/bots/${bot.id}/panel/commands/hook`, {
+        method: 'POST',
+        body: {},
+      });
+      assert.equal(data.result?.ok, true, JSON.stringify(data));
+      assert.equal(data.result.via, 'callback');
+      assert.deepEqual(data.result.data, { echo: 'angekommen' });
+      // Der Hook wurde real getroffen – über die geprüfte, gepinnte Adresse,
+      // nicht über eine beim Verbindungsaufbau neu aufgelöste.
+      assert.equal(empfangen.length, 1);
+      assert.equal(empfangen[0].pfad, '/hook');
+      assert.equal(empfangen[0].token, 'pinn-token');
+      assert.equal(empfangen[0].body.id, 'hook');
+    } finally {
+      await alsBot('/hub/callback', { method: 'POST', body: { url: null } });
+      hookServer.closeAllConnections?.();
+      hookServer.close();
+      await call(`/bots/${bot.id}/stop`, { method: 'POST' });
+    }
+  });
+});
+
+/**
+ * Reine Filter und Pinning-Entscheider für Callback-Ziele – ohne Server,
+ * ohne DNS. Diese Tests sind der Beweis, dass die Blockliste genau dort
+ * dicht ist, wo sie dicht sein muss, und offen dort, wo der Betreiber sie
+ * ausdrücklich freigibt.
+ */
+describe('Callback-Filter (reine Prüfung)', () => {
+  let panelApi;
+  before(async () => {
+    // Import bewusst erst im Hook, nicht im describe-Rumpf: der Rumpf läuft
+    // schon während der Sammlung – also bevor der Datei-Hook NODE_ENV und
+    // den Discord-Mock setzt. Ein zu früher Import würde in panel.js das
+    // echte Discord einkompilieren und die Login-Tests dieser Datei zerlegen.
+    panelApi = await import('../server/panel.js');
+  });
+
+  it('lässt öffentliche Adressen durch (Allowlist lebt wieder)', () => {
+    // P0-Regression: `::ffff:0:0/96` landete im IPv4-Baum als 0.0.0.0/0 und
+    // ließ keine einzige öffentliche IPv4-Adresse mehr durch.
+    for (const adresse of [
+      '8.8.8.8',
+      '1.1.1.1',
+      '93.184.216.34',
+      '2606:2800:220:1:248:1893:25c8:1946',
+    ])
+      assert.equal(
+        panelApi.isNonPublicCallbackAddress(adresse),
+        false,
+        `fälschlich blockiert: ${adresse}`,
+      );
+  });
+
+  it('blockiert private, reservierte, eingebettete und nicht-IP-Ziele', () => {
+    for (const adresse of [
+      '127.0.0.1',
+      '::1',
+      '::ffff:7f00:1',
+      '::ffff:a9fe:a9fe',
+      'fe80::1',
+      'fc00::1',
+      '10.0.0.1',
+      '169.254.169.254',
+      'kein-hostname',
+    ])
+      assert.equal(
+        panelApi.isNonPublicCallbackAddress(adresse),
+        true,
+        `fälschlich erlaubt: ${adresse}`,
+      );
+  });
+
+  it('blockiert Well-Known-NAT64 und Discard-Netz (Härtung)', () => {
+    // 64:ff9b::/96 übersetzt IPv4-Ziele in den IPv6-Raum – auch die
+    // Metadaten-Adresse 169.254.169.254; 100::/64 ist reserviert (discard).
+    assert.equal(
+      panelApi.isNonPublicCallbackAddress('64:ff9b::a9fe:a9fe'),
+      true,
+    );
+    assert.equal(panelApi.isNonPublicCallbackAddress('64:ff9b::1'), true);
+    assert.equal(panelApi.isNonPublicCallbackAddress('100::1'), true);
+  });
+
+  it('erkennt IPv4-kompatible Hex-Form ::h:h als IPv4 (Härtung F-3)', () => {
+    // `new URL` serialisiert ::127.0.0.1 als ::7f00:1 und ::169.254.169.254
+    // als ::a9fe:a9fe. Ohne Deutung als IPv4 entkamen diese Kanonisierungen
+    // sowohl embeddedIPv4 als auch der v6-Blockliste und galten als öffentlich.
+    for (const adresse of ['::7f00:1', '::a9fe:a9fe'])
+      assert.equal(
+        panelApi.isNonPublicCallbackAddress(adresse),
+        true,
+        `fälschlich erlaubt: ${adresse}`,
+      );
+    // Gegenproben – die Deutung darf nur die Zwei-Gruppen-Form treffen:
+    assert.equal(
+      panelApi.isNonPublicCallbackAddress('::1'),
+      true,
+      'v6-Loopback muss blockiert bleiben',
+    );
+    assert.equal(
+      panelApi.isNonPublicCallbackAddress('2606:2800:220:1:248:1893:25c8:1946'),
+      false,
+      'normale v6-Adresse falsch klassiert',
+    );
+    // ::808:808 = 8.8.8.8 in kompatibler Form: öffentlich, muss durch.
+    assert.equal(panelApi.isNonPublicCallbackAddress('::808:808'), false);
+    // Und die schon vorher behandelte mapped-Form darf nicht kippen:
+    assert.equal(panelApi.isNonPublicCallbackAddress('::ffff:8.8.8.8'), false);
+    assert.equal(panelApi.isNonPublicCallbackAddress('::ffff:7f00:1'), true);
+  });
+
+  it('pinnt die Verbindung auf die geprüfte Adresse (Rebinding-Schutz)', () => {
+    const pin = panelApi.callbackLookupPin(
+      'bot.example.test',
+      '93.184.216.34',
+      false,
+    );
+    assert.equal(typeof pin, 'function', 'externes Ziel ohne Proxy ungepinnt');
+    let gesehen;
+    pin(
+      'bot.example.test',
+      { all: true, hints: 32 },
+      (fehler, sätze, familie) => {
+        gesehen = { fehler, sätze, familie };
+      },
+    );
+    assert.equal(gesehen.fehler, null);
+    // Net erwartet seit Node 22.21 (all:true, Happy Eyeballs) einen
+    // Adresssatz mit family-Feld – Einzel-String und familienlose
+    // Einträge laufen dort als „Invalid IP address“ ins Leere.
+    assert.ok(Array.isArray(gesehen.sätze), 'Lookup antwortet nicht mit Liste');
+    assert.deepEqual(gesehen.sätze, [{ address: '93.184.216.34', family: 4 }]);
+    assert.equal(gesehen.familie, 4);
+    // Loopback wird immer gepinnt – er läuft über NO_PROXY direkt, dort
+    // prüft kein Proxy die Ziel-IP nach.
+    const pinLoopback = panelApi.callbackLookupPin('localhost', '::1', true);
+    assert.equal(typeof pinLoopback, 'function', 'Loopback bei Proxy aktiv');
+    pinLoopback('localhost', {}, (fehler, sätze) => {
+      gesehen = { fehler, sätze };
+    });
+    assert.equal(gesehen.fehler, null);
+    assert.deepEqual(gesehen.sätze, [{ address: '::1', family: 6 }]);
+  });
+
+  it('verzichtet auf den Pin nur beim Produktions-Proxy und bei IP-Literalen', () => {
+    // Nur bei aktivem Produktions-Proxy geht Traffic zum Proxy – dort prüft
+    // Squid die Ziel-IP beim CONNECT, und ein Pin-Lookup würde den Weg zum
+    // Proxy verbiegen.
+    assert.equal(
+      panelApi.callbackLookupPin('bot.example.test', '93.184.216.34', true),
+      undefined,
+    );
+    // IP-Literale löst Node gar nicht auf – das Literal ist das Ziel.
+    assert.equal(
+      panelApi.callbackLookupPin('93.184.216.34', '93.184.216.34', false),
+      undefined,
+    );
+    // Fail-safe: ist die geprüfte Adresse keine IP, wird nicht ungeprüft
+    // neu aufgelöst, sondern der Lookup schlägt fehl (Close, nicht Loophole).
+    const kaputt = panelApi.callbackLookupPin(
+      'bot.example.test',
+      'kein-hostname',
+      false,
+    );
+    assert.equal(typeof kaputt, 'function');
+    kaputt('bot.example.test', {}, (fehler) => assert.ok(fehler));
+  });
+
+  it('erkennt den Produktionsproxy nur vollständig und fail-safe', () => {
+    const vorher = {
+      NODE_ENV: process.env.NODE_ENV,
+      NODE_USE_ENV_PROXY: process.env.NODE_USE_ENV_PROXY,
+      HTTP_PROXY: process.env.HTTP_PROXY,
+      HTTPS_PROXY: process.env.HTTPS_PROXY,
+      http_proxy: process.env.http_proxy,
+      https_proxy: process.env.https_proxy,
+    };
+    try {
+      process.env.NODE_USE_ENV_PROXY = '1';
+      process.env.HTTP_PROXY = 'http://proxy.invalid:1';
+      process.env.HTTPS_PROXY = 'http://proxy.invalid:1';
+      // Außerhalb von Produktion gilt nie „Proxy prüft schon“ – selbst mit
+      // Proxy-Umgebung wird gepinnt.
+      process.env.NODE_ENV = 'test';
+      assert.equal(panelApi.produktionsEgressProxyAktiv(), false);
+      process.env.NODE_ENV = 'production';
+      assert.equal(panelApi.produktionsEgressProxyAktiv(), true);
+      delete process.env.HTTPS_PROXY;
+      delete process.env.https_proxy;
+      // Unvollständige Einrichtung heißt „Proxy nicht aktiv“ – also pinnen.
+      assert.equal(panelApi.produktionsEgressProxyAktiv(), false);
+    } finally {
+      for (const [name, wert] of Object.entries(vorher))
+        if (wert === undefined) delete process.env[name];
+        else process.env[name] = wert;
+    }
   });
 });

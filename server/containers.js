@@ -1,19 +1,51 @@
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { existsSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  closeSync,
+  existsSync,
+  fchmodSync,
+  openSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { isAbsolute, join, relative } from 'node:path';
 
 import { managedConfig, managedMySqlActive } from './mysql.js';
 
 const RUNTIME = process.env.BOT_HUB_CONTAINER_RUNTIME || 'docker';
 const PREFIX = process.env.BOT_HUB_CONTAINER_PREFIX || 'bot-hub';
+const PRODUCTION_BOT_NETWORK = 'bot-hub-discord';
+const PRODUCTION_DEPENDENCY_NETWORK = 'bot-hub-dependencies';
+export const PRODUCTION_BOT_GATEWAY = '172.30.250.1';
+export const PRODUCTION_BOT_HUB_PORT = 8788;
+const DISCORD_EGRESS_PROXY = 'http://172.30.250.1:3128';
+const DEPENDENCY_EGRESS_PROXY = 'http://172.30.251.1:3128';
+const containerNetwork = () => {
+  const configured = String(process.env.BOT_HUB_CONTAINER_NETWORK ?? '').trim();
+  const production = process.env.NODE_ENV === 'production';
+  if (production && configured && configured !== PRODUCTION_BOT_NETWORK)
+    throw new Error(
+      `In Produktion ist nur das isolierte Netzwerk ${PRODUCTION_BOT_NETWORK} erlaubt.`,
+    );
+  const network =
+    configured || (production ? PRODUCTION_BOT_NETWORK : 'bridge');
+  if (
+    !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$/.test(network) ||
+    network.toLowerCase() === 'host'
+  )
+    throw new Error(
+      'BOT_HUB_CONTAINER_NETWORK muss ein gültiger, vom Host-Netz verschiedener Docker-Netzwerkname sein.',
+    );
+  return network;
+};
 
 const BASE_IMAGES = {
   python: 'python:3.12-bookworm',
   javascript: 'node:22-bookworm',
   typescript: 'node:22-bookworm',
-  java: 'eclipse-temurin:17-jdk',
-  kotlin: 'eclipse-temurin:17-jdk',
+  java: 'maven:3.9-eclipse-temurin-17',
+  kotlin: 'maven:3.9-eclipse-temurin-17',
   go: 'golang:1.24-bookworm',
   csharp: 'mcr.microsoft.com/dotnet/sdk:8.0',
   rust: 'rust:1-bookworm',
@@ -122,6 +154,22 @@ const nameOf = (bot) => {
 };
 
 const imageOf = (bot) => IMAGES[bot.language] || IMAGES.custom;
+const runtimeSystemPath = (bot) => {
+  const languagePath =
+    {
+      java: '/opt/java/openjdk/bin:/usr/share/maven/bin',
+      kotlin: '/opt/java/openjdk/bin:/usr/share/maven/bin',
+      go: '/usr/local/go/bin',
+      rust: '/usr/local/cargo/bin',
+      csharp: '/usr/share/dotnet',
+    }[bot.language] || '';
+  return [
+    languagePath,
+    '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+  ]
+    .filter(Boolean)
+    .join(':');
+};
 const workspacePath = (bot, projectRoot) =>
   join(projectRoot, bot.workspaceRoot || `bots/${bot.id}/workspace`);
 const hostUid = () =>
@@ -159,17 +207,18 @@ const sharedVolume = (projectRoot) => {
 };
 
 /**
- * Nur wenn `BOT_HUB_CONTAINER_URL` gesetzt ist, bekommt der Container einen
- * Weg zum Host. Der Eintrag `host.docker.internal` erlaubt einem Bot nämlich
- * jeden Dienst auf dem Host – auch SSH und andere lokal laufende Programme.
- * Wer ihn nicht braucht, bekommt ihn nicht; wer ihn braucht, konfiguriert
- * ausdrücklich eine Container-URL. Eine Firewall je Container gibt es mit
- * Bordmitteln nicht, das bleibt eine Randnotiz in documents/container-bots.md.
+ * `host.docker.internal` erlaubt einem Bot jeden Dienst auf dem Host – auch
+ * SSH und andere lokal laufende Programme. In Produktion ist es deshalb
+ * gesperrt; dort gibt es einen getrennten internen Hub-Listener.
  */
-const hostMapping = () =>
-  String(process.env.BOT_HUB_CONTAINER_URL ?? '').trim()
-    ? ['--add-host', 'host.docker.internal:host-gateway']
-    : [];
+const hostMapping = () => {
+  if (!String(process.env.BOT_HUB_CONTAINER_URL ?? '').trim()) return [];
+  if (process.env.NODE_ENV === 'production')
+    throw new Error(
+      'BOT_HUB_CONTAINER_URL ist in Produktion gesperrt, damit Bots keine Host-Dienste erreichen.',
+    );
+  return ['--add-host', 'host.docker.internal:host-gateway'];
+};
 
 /**
  * Alles, was sich beim Erstellen nicht nachträglich ändern lässt, kommt hier
@@ -186,6 +235,9 @@ const containerSignature = (bot, projectRoot) =>
         workspacePath(bot, projectRoot),
         sharedVolume(projectRoot).join(' '),
         hostMapping().join(' '),
+        containerNetwork(),
+        'filesystem:read-only,tmpfs:/tmp:rw,nosuid,size=128m',
+        'entrypoint:tail -f /dev/null',
       ].join('\u0000'),
     )
     .digest('hex')
@@ -202,12 +254,17 @@ export const containerCreateArgs = (bot, projectRoot) => [
   'ALL',
   '--security-opt',
   'no-new-privileges:true',
+  '--read-only',
+  '--tmpfs',
+  '/tmp:rw,nosuid,size=128m',
   '--pids-limit',
   '256',
   '--memory',
   process.env.BOT_HUB_CONTAINER_MEMORY || '512m',
   '--cpus',
   process.env.BOT_HUB_CONTAINER_CPUS || '2',
+  '--network',
+  containerNetwork(),
   '--workdir',
   '/workspace',
   '--label',
@@ -216,6 +273,8 @@ export const containerCreateArgs = (bot, projectRoot) => [
   '--volume',
   `${workspacePath(bot, projectRoot)}:/workspace`,
   ...sharedVolume(projectRoot),
+  '--entrypoint',
+  'tail',
   imageOf(bot),
   'tail',
   '-f',
@@ -293,6 +352,117 @@ export const ensureContainer = async (bot, projectRoot) => {
   return name;
 };
 
+/**
+ * Produktions-Bots dürfen nur in das vorbereitete interne Discord-Netz.
+ * Fehlendes Netz oder Proxy beendet den Hub-Start, statt Container später mit
+ * einem ungefilterten Netz zu starten.
+ */
+export const validateProductionBotNetwork = async () => {
+  if (process.env.NODE_ENV !== 'production') return;
+  if (String(process.env.BOT_HUB_CONTAINER_URL ?? '').trim())
+    throw new Error(
+      'BOT_HUB_CONTAINER_URL ist gesperrt. Produktions-Bots erhalten automatisch die private Hub-API-Adresse.',
+    );
+  const network = await run(
+    [
+      'network',
+      'inspect',
+      containerNetwork(),
+      '--format',
+      '{{.Internal}}|{{json .Options}}|{{range .IPAM.Config}}{{.Subnet}} {{.Gateway}}{{end}}',
+    ],
+    { capture: true },
+  );
+  const [internal, rawOptions, addressing] = network.stdout.trim().split('|');
+  let options = {};
+  try {
+    options = JSON.parse(rawOptions);
+  } catch {
+    /* handled by the fail-closed condition below */
+  }
+  if (
+    network.code !== 0 ||
+    internal !== 'true' ||
+    options['com.docker.network.bridge.name'] !== 'br-bothubdisc' ||
+    options['com.docker.network.bridge.enable_icc'] !== 'false' ||
+    !String(addressing ?? '').includes('172.30.250.0/24 172.30.250.1')
+  )
+    throw new Error(
+      `Docker-Netz ${PRODUCTION_BOT_NETWORK} fehlt oder entspricht nicht der isolierten Netzkonfiguration. Starte deploy/discord-egress/compose.yaml.`,
+    );
+
+  const dependencies = await run(
+    [
+      'network',
+      'inspect',
+      PRODUCTION_DEPENDENCY_NETWORK,
+      '--format',
+      '{{.Internal}}|{{json .Options}}|{{range .IPAM.Config}}{{.Subnet}} {{.Gateway}}{{end}}',
+    ],
+    { capture: true },
+  );
+  const [dependenciesInternal, rawDependenciesOptions, dependenciesAddressing] =
+    dependencies.stdout.trim().split('|');
+  let dependenciesOptions = {};
+  try {
+    dependenciesOptions = JSON.parse(rawDependenciesOptions);
+  } catch {
+    /* handled by the fail-closed condition below */
+  }
+  if (
+    dependencies.code !== 0 ||
+    dependenciesInternal !== 'true' ||
+    dependenciesOptions['com.docker.network.bridge.name'] !== 'br-bothubdeps' ||
+    dependenciesOptions['com.docker.network.bridge.enable_icc'] !== 'false' ||
+    !String(dependenciesAddressing ?? '').includes(
+      '172.30.251.0/24 172.30.251.1',
+    )
+  )
+    throw new Error(
+      `Docker-Paketnetz ${PRODUCTION_DEPENDENCY_NETWORK} fehlt oder ist nicht isoliert. Starte deploy/discord-egress/compose.yaml.`,
+    );
+
+  const proxy = await run(
+    [
+      'container',
+      'inspect',
+      '--format',
+      '{{.HostConfig.NetworkMode}} {{index .Config.Labels "bot-hub.discord-egress"}} {{.State.Running}} {{.Config.User}}',
+      'bot-hub-discord-egress',
+    ],
+    { capture: true },
+  );
+  if (
+    proxy.code !== 0 ||
+    proxy.stdout.trim() !== 'host filtered-egress-v5 true 13:13'
+  )
+    throw new Error(
+      'Der Discord-Ausgangsproxy läuft nicht im Host-Netz mit den privaten Gateway-Listenern. Starte deploy/discord-egress/compose.yaml.',
+    );
+
+  const firewallChecker = '/usr/local/sbin/bot-hub-host-firewall-check';
+  const firewallCheck = await new Promise((resolve) => {
+    const command =
+      process.getuid?.() === 0 ? firewallChecker : '/usr/bin/sudo';
+    const args = command === 'sudo' ? ['-n', firewallChecker] : [];
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (data) => (stdout += data));
+    child.stderr.on('data', (data) => (stderr += data));
+    child.once('error', (error) =>
+      resolve({ code: -1, stderr: error.message }),
+    );
+    child.once('exit', (code) => resolve({ code: code ?? -1, stdout, stderr }));
+  });
+  if (firewallCheck.code !== 0)
+    throw new Error(
+      'Die aktive Host-Firewall sperrt die Docker-Bridges nicht nachweislich. ' +
+        'Führe das Host-Firewall-Setup aus und richte den Prüfer für den Hub-Benutzer ein. ' +
+        (firewallCheck.stderr?.trim() || firewallCheck.stdout?.trim() || ''),
+    );
+};
+
 const isRunning = async (name) => {
   const result = await run(
     ['inspect', '--format', '{{.State.Running}}', name],
@@ -309,10 +479,89 @@ export const stopContainer = async (bot) => {
 };
 
 export const removeContainer = async (bot) => {
+  // Idempotent und laufzeitbewusst: ohne Container-Runtime gibt es nichts zu
+  // entfernen (kein docker-Aufruf, kein ENOENT im Test-/Dev-Modus). Ein
+  // bereits verschwundener Container ist ebenfalls OK – nur echte
+  // Docker-Fehler werden gemeldet. Der Name stammt immer aus nameOf(bot),
+  // niemals aus Request-Parametern.
+  if (!containerRuntimeEnabled()) return;
   const name = nameOf(bot);
-  if (await exists(name)) await run(['rm', '--force', name]);
+  try {
+    if (await exists(name)) await run(['rm', '--force', name]);
+  } catch (error) {
+    if (/no such container|not found/i.test(String(error?.message ?? '')))
+      return;
+    throw error;
+  }
 };
 
+/**
+ * Übergibt die Container-Umgebung nicht als `--env KEY=WERT` in der
+ * Argumentliste – die wäre für jeden lokalen Benutzer in `ps` und in
+ * `/proc/<pid>/cmdline` lesbar, inklusive Bot-Token und Runtime-Token.
+ * Stattdessen eine Datei in `tmpdir()`: 0600, zufälliger Name, mit `wx`
+ * angelegt (existiert sie bereits, scheitert der Aufruf statt sie zu
+ * überschreiben). Der Aufrufer löscht sie, sobald der docker-CLI-Prozess
+ * fertig ist (`cleanupExecEnvFile`). Gibt den Pfad zurück oder null,
+ * wenn nichts zu übergeben ist.
+ */
+const writeExecEnvFile = (env) => {
+  const lines = [];
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) continue;
+    const text = String(value);
+    // Das env-file-Format ist zeilenbasiert: Schlüssel ohne `=`, Werte
+    // mit Zeilenumbruch würden Zeilen verschieben oder Variablen
+    // einschleusen. Solche Einträge bleiben weg, statt die Datei zu
+    // beschädigen.
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || /[\r\n]/.test(text)) {
+      console.warn(
+        `[hub] Container-Umgebungsvariable "${key}" ist für die env-Datei unbrauchbar – weggelassen.`,
+      );
+      continue;
+    }
+    lines.push(`${key}=${text}`);
+  }
+  if (!lines.length) return null;
+  const path = join(tmpdir(), `bot-hub-exec-env-${randomUUID()}`);
+  const fd = openSync(path, 'wx', 0o600);
+  try {
+    fchmodSync(fd, 0o600);
+    writeFileSync(fd, `${lines.join('\n')}\n`);
+  } catch (error) {
+    try {
+      unlinkSync(path);
+    } catch {
+      /* Die ursprüngliche Meldung ist die relevante Diagnose. */
+    }
+    throw error;
+  } finally {
+    try {
+      closeSync(fd);
+    } catch {
+      /* writeFileSync hat das Descriptor-Ende selbst behandelt. */
+    }
+  }
+  return path;
+};
+
+/** Best-Effort-Löschen der env-Datei nach Abschluss des docker-CLI. */
+export const cleanupExecEnvFile = (path) => {
+  if (!path) return;
+  try {
+    unlinkSync(path);
+  } catch (error) {
+    if (error?.code !== 'ENOENT')
+      console.warn(`[hub] exec-env-Datei blieb zurück: ${error.message}`);
+  }
+};
+
+/**
+ * `docker exec` für einen Befehl im Bot-Container. Die Umgebung läuft
+ * über eine 0600-Datei (`--env-file`), niemals über die Argumentliste –
+ * siehe `writeExecEnvFile`. Gibt `{ args, envFile }` zurück; `envFile`
+ * ist nach Abschluss des spawns per `cleanupExecEnvFile` zu löschen.
+ */
 export const execArgs = (bot, projectRoot, dir, command, env = {}) => {
   const workspace = workspacePath(bot, projectRoot);
   const workdir = relative(workspace, dir);
@@ -335,8 +584,7 @@ export const execArgs = (bot, projectRoot, dir, command, env = {}) => {
       delete containerEnv.VIRTUAL_ENV;
     }
   }
-  const systemPath =
-    '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+  const systemPath = runtimeSystemPath(bot);
   if (containerEnv.PATH) {
     const venvPath = dockerVirtualEnv
       ? `${dockerVirtualEnv}/bin:${dockerVirtualEnv}/Scripts:`
@@ -349,14 +597,164 @@ export const execArgs = (bot, projectRoot, dir, command, env = {}) => {
   containerEnv.XDG_CACHE_HOME = '/tmp/bot-home/.cache';
   containerEnv.npm_config_cache = '/tmp/bot-home/.npm';
   containerEnv.PIP_CACHE_DIR = '/tmp/bot-home/.cache/pip';
-  for (const [key, value] of Object.entries(containerEnv)) {
-    if (value !== undefined) args.push('--env', `${key}=${value}`);
+  containerEnv.CARGO_HOME = '/workspace/.cache/cargo';
+  containerEnv.CARGO_TARGET_DIR = '/workspace/target';
+  containerEnv.GOMODCACHE = '/workspace/.cache/go-mod';
+  containerEnv.GOCACHE = '/workspace/.cache/go-build';
+  containerEnv.GRADLE_USER_HOME = '/workspace/.cache/gradle';
+  containerEnv.MAVEN_OPTS = '-Dmaven.repo.local=/workspace/.cache/maven';
+  containerEnv.NUGET_PACKAGES = '/workspace/.cache/nuget';
+  if (
+    process.env.NODE_ENV === 'production' &&
+    containerNetwork() === PRODUCTION_BOT_NETWORK
+  ) {
+    // Nur Bibliotheken, die explizit Proxy-Umgebungsvariablen unterstützen,
+    // nutzen diese automatisch. Das interne Netz verhindert den Direktweg.
+    containerEnv.BOT_HUB_DISCORD_PROXY = DISCORD_EGRESS_PROXY;
+    containerEnv.HTTPS_PROXY = DISCORD_EGRESS_PROXY;
+    containerEnv.https_proxy = DISCORD_EGRESS_PROXY;
+    containerEnv.HTTP_PROXY = DISCORD_EGRESS_PROXY;
+    containerEnv.http_proxy = DISCORD_EGRESS_PROXY;
+    // Das einzige direkte Ziel neben Discord ist die lokale, token-geschützte
+    // Hub-API am Docker-Bridge-Gateway. nftables erlaubt dort nur TCP 8788.
+    containerEnv.NO_PROXY = PRODUCTION_BOT_GATEWAY;
+    containerEnv.no_proxy = PRODUCTION_BOT_GATEWAY;
+    // Node 22.21+ routes its default HTTP(S) agents through HTTPS_PROXY.
+    // Older runtimes ignore this and will fail closed on the internal network.
+    containerEnv.NODE_USE_ENV_PROXY = '1';
   }
+  const envFile = writeExecEnvFile(containerEnv);
+  if (envFile) args.push('--env-file', envFile);
   args.push(nameOf(bot), command.executable, ...command.args);
-  return args;
+  return { args, envFile };
+};
+
+/**
+ * Kurzlebiger Paket-Runner: nur Workspace, keine Bot-Secrets, nur das interne
+ * Paketnetz. Der normale Bot-Container erhält dieses Netz niemals.
+ */
+export const dependencyRunArgs = (bot, projectRoot, dir, command, env = {}) => {
+  if (process.env.NODE_ENV !== 'production')
+    throw new Error(
+      'Der isolierte Paket-Runner ist nur für Produktion gedacht.',
+    );
+  const workspace = workspacePath(bot, projectRoot);
+  const workdir = relative(workspace, dir);
+  const dockerWorkdir =
+    !workdir || workdir === '.' ? '/workspace' : `/workspace/${workdir}`;
+  const containerEnv = { ...env };
+  const virtualEnv = containerEnv.VIRTUAL_ENV;
+  let dockerVirtualEnv = '';
+  if (virtualEnv) {
+    const virtualEnvRelative = relative(workspace, virtualEnv);
+    if (
+      !virtualEnvRelative.startsWith('..') &&
+      !virtualEnvRelative.includes('\0') &&
+      !virtualEnvRelative.startsWith('/')
+    ) {
+      dockerVirtualEnv = `/workspace/${virtualEnvRelative}`;
+      containerEnv.VIRTUAL_ENV = dockerVirtualEnv;
+    } else {
+      delete containerEnv.VIRTUAL_ENV;
+    }
+  }
+  if (containerEnv.PATH) {
+    const venvPath = dockerVirtualEnv
+      ? `${dockerVirtualEnv}/bin:${dockerVirtualEnv}/Scripts:`
+      : '';
+    containerEnv.PATH = `${venvPath}${runtimeSystemPath(bot)}`;
+  }
+  let executable = command.executable;
+  if (isAbsolute(executable)) {
+    const executableRelative = relative(workspace, executable);
+    if (executableRelative.startsWith('..') || isAbsolute(executableRelative))
+      throw new Error('Installer-Programm liegt außerhalb des Bot-Workspace.');
+    executable = `/workspace/${executableRelative}`;
+  }
+  Object.assign(containerEnv, {
+    HOME: '/tmp/bot-home',
+    XDG_CACHE_HOME: '/workspace/.cache',
+    npm_config_cache: '/workspace/.cache/npm',
+    PIP_CACHE_DIR: '/workspace/.cache/pip',
+    HTTPS_PROXY: DEPENDENCY_EGRESS_PROXY,
+    https_proxy: DEPENDENCY_EGRESS_PROXY,
+    HTTP_PROXY: DEPENDENCY_EGRESS_PROXY,
+    http_proxy: DEPENDENCY_EGRESS_PROXY,
+    NO_PROXY: '',
+    no_proxy: '',
+    NODE_USE_ENV_PROXY: '1',
+    CARGO_HTTP_PROXY: DEPENDENCY_EGRESS_PROXY,
+    CARGO_HOME: '/workspace/.cache/cargo',
+    CARGO_TARGET_DIR: '/workspace/target',
+    GOMODCACHE: '/workspace/.cache/go-mod',
+    GOCACHE: '/workspace/.cache/go-build',
+    GOPROXY: 'https://proxy.golang.org',
+    GOSUMDB: 'sum.golang.org',
+    GRADLE_USER_HOME: '/workspace/.cache/gradle',
+    MAVEN_OPTS: '-Dmaven.repo.local=/workspace/.cache/maven',
+    NUGET_PACKAGES: '/workspace/.cache/nuget',
+    DOTNET_CLI_TELEMETRY_OPTOUT: '1',
+    DOTNET_NOLOGO: '1',
+    JAVA_TOOL_OPTIONS:
+      '-Dhttp.proxyHost=172.30.251.1 -Dhttp.proxyPort=3128 -Dhttps.proxyHost=172.30.251.1 -Dhttps.proxyPort=3128',
+  });
+  for (const key of [
+    'DISCORD_BOT_TOKEN',
+    'BOT_HUB_API_TOKEN',
+    'BOT_HUB_RUNTIME_TOKEN',
+  ])
+    delete containerEnv[key];
+  const envFile = writeExecEnvFile(containerEnv);
+  const containerName = `bot-hub-deps-${randomUUID()}`;
+  const args = [
+    'run',
+    '--rm',
+    '--name',
+    containerName,
+    '--init',
+    '--network',
+    PRODUCTION_DEPENDENCY_NETWORK,
+    '--user',
+    containerUser(),
+    '--cap-drop',
+    'ALL',
+    '--security-opt',
+    'no-new-privileges:true',
+    '--pids-limit',
+    '256',
+    '--memory',
+    process.env.BOT_HUB_CONTAINER_MEMORY || '512m',
+    '--cpus',
+    process.env.BOT_HUB_CONTAINER_CPUS || '2',
+    '--read-only',
+    '--tmpfs',
+    '/tmp:rw,nosuid,size=256m',
+    '--workdir',
+    dockerWorkdir,
+  ];
+  if (envFile) args.push('--env-file', envFile);
+  args.push(
+    '--volume',
+    `${workspace}:/workspace`,
+    '--label',
+    'bot-hub.dependency-install=true',
+    '--entrypoint',
+    executable,
+    imageOf(bot),
+    ...command.args,
+  );
+  return { args, envFile, containerName };
 };
 
 export const containerRuntimeName = () => RUNTIME;
+export const containerHubUrl = () =>
+  process.env.NODE_ENV === 'production'
+    ? `http://${PRODUCTION_BOT_GATEWAY}:${PRODUCTION_BOT_HUB_PORT}`
+    : String(
+        process.env.BOT_HUB_CONTAINER_URL ||
+          process.env.BOT_HUB_URL ||
+          `http://127.0.0.1:${process.env.PORT || 8787}`,
+      ).replace(/\/+$/, '');
 export const containerRuntimeEnabled = () =>
   process.env.BOT_HUB_TEST_MODE !== '1' &&
   process.env.BOT_HUB_CONTAINER_MODE !== 'disabled';
@@ -365,6 +763,8 @@ export const containerRuntimeEnabled = () =>
 export const containerSecurityFacts = () => ({
   hubRunsAsRoot: hubRunsAsRoot(),
   containerUser: containerUser(),
+  containerNetwork: containerNetwork(),
+  discordProxyUrl: DISCORD_EGRESS_PROXY,
   unpinnedImages: unpinnedImages(),
   digestRequired: digestRequired(),
 });

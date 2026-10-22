@@ -201,6 +201,8 @@ const INSERT_ONE = `
 const DELETE_ONE = `
   DELETE FROM bot_store
    WHERE bot_id = ? AND collection = ? AND key_name = ?`;
+const DELETE_BOT_DATA = 'DELETE FROM bot_store WHERE bot_id = ?';
+const DELETE_BOT_USAGE = 'DELETE FROM bot_store_usage WHERE bot_id = ?';
 
 /* ------------------------------------------------------------------ *
  * Verbrauchszähler je Bot
@@ -1022,6 +1024,21 @@ const createStore = (config) => {
         normaliseKey(key),
       ]);
       return row ? entryOf(row) : null;
+    },
+
+    /** Löscht alle persistenten Werte und Quota-Zähler eines Bots. */
+    removeBot: async (botId) => {
+      const id = normaliseBotId(botId);
+      const open = await connect();
+      await withWrite(() =>
+        open.transaction(async (tx) => {
+          await tx.run(DELETE_BOT_DATA, [id]);
+          await tx.run(DELETE_BOT_USAGE, [id]);
+        }),
+      );
+      for (const key of rateBuckets.keys())
+        if (key.startsWith(`${id}:`)) rateBuckets.delete(key);
+      return true;
     },
 
     set: async (botId, collection, key, value) => {

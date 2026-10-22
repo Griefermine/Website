@@ -1,11 +1,13 @@
 import { createServer as createServerFactory } from 'node:http';
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { join, resolve } from 'node:path';
 import {
   containerRuntimeEnabled,
   containerSecurityFacts,
+  PRODUCTION_BOT_GATEWAY,
+  PRODUCTION_BOT_HUB_PORT,
+  validateProductionBotNetwork,
 } from './containers.js';
-import { createServer, stopAllBots } from './manager.js';
+import { createServer, stopAllBots, flushPersist } from './manager.js';
+import { collectSecurityFindings, resolveBindHost } from './preflight.js';
 import {
   closeDatabase,
   describeDatabase,
@@ -14,6 +16,7 @@ import {
   storeOutsideDataDir,
 } from './database.js';
 import { managedMySqlActive, provisionManagedMySql } from './mysql.js';
+import { configureProductionEgress } from './egress.js';
 
 // BOT_HUB_TEST_MODE schaltet Anmeldung, Rate-Limits und Pfadprüfung ab.
 // Das darf in einer veröffentlichten Instanz niemals passieren – sonst
@@ -29,6 +32,18 @@ if (process.env.BOT_HUB_TEST_MODE === '1' && process.env.NODE_ENV !== 'test') {
       : '[hub] ABBRUCH: BOT_HUB_TEST_MODE=1 hebt Anmeldung und Rate-Limits auf und ist nur mit NODE_ENV=test erlaubt (NODE_ENV ist nicht gesetzt).',
   );
   process.exit(1);
+}
+
+// Production Hub requests (Discord OAuth and explicitly allowed callbacks)
+// must use the local domain-filtering proxy. This is enabled before any
+// outbound request is made and cannot be disabled by an inherited NO_PROXY.
+if (process.env.NODE_ENV === 'production') {
+  try {
+    configureProductionEgress();
+  } catch (error) {
+    console.error(`[hub] ABBRUCH: Ausgangsproxy: ${error.message}`);
+    process.exit(1);
+  }
 }
 
 // Die Container sind die Isolationsgrenze zwischen fremdem Bot-Code und dem
@@ -49,7 +64,24 @@ if (!containerRuntimeEnabled() && process.env.NODE_ENV !== 'test') {
 }
 
 const port = Number(process.env.PORT || 8787);
-const host = process.env.HOST || '0.0.0.0';
+// P1-D: Bind-Adresse zentral auflösen. Default ist Loopback; eine öffentliche
+// Bindung braucht ein ausdrückliches HOST und wird außerhalb von Tests mit
+// Warnung quittiert. In Produktion bricht ein nicht-lokaler HOST ab.
+const bind = resolveBindHost(process.env);
+const host = bind.host;
+for (const warning of bind.warnings) console.warn(`[hub] WARNUNG: ${warning}`);
+if (process.env.NODE_ENV === 'production' && bind.errors.length) {
+  for (const error of bind.errors) console.error(`[hub] ABBRUCH: ${error}`);
+  process.exit(1);
+}
+if (process.env.NODE_ENV === 'production') {
+  try {
+    await validateProductionBotNetwork();
+  } catch (error) {
+    console.error(`[hub] ABBRUCH: Discord-Ausgangsfilter: ${error.message}`);
+    process.exit(1);
+  }
+}
 
 // Der Bot-Speicher wird wie die Container geprüft: eine Konfiguration, die
 // nicht zu diesem Rechner passt, bricht den Start ab, statt erst beim ersten
@@ -156,114 +188,13 @@ if (
   );
 
 /**
- * Startup-Selbstprüfung.
- *
- * Zwei Ebenen: `errors` verhindern den Start, `warnings` nicht. Getrennt
- * gehalten wird nur, was sich nicht anders entscheiden lässt – Bedingungen wie
- * "Testmodus in Produktion" oder "Container abgeschaltet" brechen weiter oben
- * schon den Start ab, und sie hier noch einmal zu prüfen hieße, zwei Stellen
- * zu haben, an denen dieselbe Regel steht.
- *
- * Wichtig für die Pfadprüfungen: gemessen wird am Projekt-Root, nicht am
- * aktuellen Arbeitsverzeichnis. Der Hub läuft nicht immer von dort, und eine
- * Prüfung, die das falsche Verzeichnis ansieht, hält eine Fehlkonfiguration für
- * eine richtige.
+ * Startup-Selbstprüfung – Regeln Leben in `preflight.js`, damit sie ohne den
+ * lauschenden Prozess tested werden können. `errors` verhindern den Start.
  */
-const collectSecurityFindings = ({
-  env = process.env,
-  projectRoot = resolve(env.BOT_DASHBOARD_ROOT || process.cwd()),
-} = {}) => {
-  const errors = [];
-  const warnings = [];
-  const production = env.NODE_ENV === 'production';
-
-  // 1) Der Hub darf in Produktion nicht als root laufen. Sonst bekommen auch
-  //    die Container root, und die Trennung zwischen fremdem Bot-Code und dem
-  //    Host trägt nicht mehr.
-  const facts = containerSecurityFacts();
-  if (production && facts.hubRunsAsRoot) {
-    errors.push(
-      'Der Hub läuft als root. Container würden dann ebenfalls als root laufen; bitte einen eigenen Benutzer anlegen und den Hub unter diesem starten.',
-    );
-  }
-
-  // 2) Images ohne Digest sind nur über ein Tag festgelegt, das jedezeit
-  //    jemand anderes umschreiben kann.
-  if (facts.unpinnedImages.length > 0) {
-    const liste = facts.unpinnedImages
-      .map((item) => `${item.language}=${item.reference}`)
-      .join(', ');
-    const text =
-      `Container-Images sind nicht per Digest festgelegt: ${liste}. ` +
-      'Ein Tag kann auf ein anderes Image zeigen, ohne dass es hier etwas ändert.';
-    if (facts.digestRequired) {
-      errors.push(
-        `${text} BOT_HUB_REQUIRE_IMAGE_DIGEST verlangt Digests – bitte ` +
-          'BOT_HUB_CONTAINER_IMAGES mit Digest-Referenzen setzen.',
-      );
-    } else if (production) {
-      errors.push(
-        `${text} In Produktion sind Digest-gepinnte Images Pflicht – bitte ` +
-          'BOT_HUB_CONTAINER_IMAGES mit Digest-Referenzen setzen.',
-      );
-    }
-  }
-
-  // 3) Der Docker-Socket ist der Weg aus dem Host heraus. Er muss da sein,
-  //    damit Container laufen – gemountet wird er dennoch nicht.
-  if (existsSync('/var/run/docker.sock')) {
-    warnings.push(
-      'Docker Socket vorhanden: er darf nicht in einen Bot-Container gemountet werden, sonst steuert der Bot den Host.',
-    );
-  }
-
-  // 4) `.env` im Projekt-Root: hier stehen im Betrieb keine Geheimnisse, die
-  //    liegen in `data/secrets/`. Eine belegte Datei ist ein Fund, kein Vorwurf.
-  const envPath = join(projectRoot, '.env');
-  if (existsSync(envPath)) {
-    try {
-      const content = readFileSync(envPath, 'utf8');
-      const filled = [
-        /^\s*DISCORD_CLIENT_SECRET\s*=\s*\S+/m,
-        /^\s*DISCORD_BOT_TOKEN\s*=\s*\S+/m,
-        /^\s*BOT_HUB_TOKEN\s*=\s*\S+/m,
-        /^\s*BOT_HUB_SESSION_SECRET\s*=\s*\S+/m,
-      ].some((muster) => muster.test(content));
-      if (filled)
-        warnings.push(
-          '.env enthält belegte Geheimnisse. Bitte nach data/secrets/ umziehen und die Werte hier leeren – eine Datei im Projekt-Root landet leicht im Git.',
-        );
-    } catch {
-      warnings.push(
-        '.env ist vorhanden, aber nicht lesbar – bitte Rechte prüfen.',
-      );
-    }
-  }
-
-  // 5) Das Secret-Verzeichnis muss für andere Benutzer gesperrt sein.
-  const secretsDir = join(projectRoot, 'data', 'secrets');
-  if (existsSync(secretsDir)) {
-    try {
-      const { mode } = statSync(secretsDir);
-      // Prüfung des Others-Bits: bei 0077 oder strenger ist nichts fremdlesbar.
-      if (process.platform !== 'win32' && (mode & 0o077) !== 0)
-        warnings.push(
-          `data/secrets/ ist für andere Benutzer lesbar (Modus ${(mode & 0o777).toString(8)}). Bitte auf 700 setzen.`,
-        );
-    } catch {
-      warnings.push(
-        'data/secrets/ ist nicht prüfbar – bitte Rechte kontrollieren.',
-      );
-    }
-  } else if (production) {
-    warnings.push('data/secrets/ fehlt und wird erst bei Bedarf angelegt.');
-  }
-
-  return { errors, warnings };
-};
-
 const securitySelfCheck = () => {
-  const { errors, warnings } = collectSecurityFindings();
+  const { errors, warnings } = collectSecurityFindings({
+    facts: containerSecurityFacts(),
+  });
   for (const warning of warnings)
     console.warn(`[hub] SICHERHEITS-WARNUNG: ${warning}`);
   if (errors.length === 0) return;
@@ -275,7 +206,10 @@ const securitySelfCheck = () => {
 
 securitySelfCheck();
 
-const server = createServerFactory(createServer());
+const handler = createServer();
+const server = createServerFactory(handler);
+const botApiServer =
+  process.env.NODE_ENV === 'production' ? createServerFactory(handler) : null;
 
 // Ein belegter Port ist ein Bedienfehler, kein Absturz. Ohne diese Auswertung
 // steht hier ein halber Seitenfehler-Stack, der mehr irritiert als erklärt –
@@ -305,16 +239,41 @@ server.listen(port, host, () => {
       `${databaseConfig.driver === 'sqlite' ? ` → ${databaseConfig.file}` : ''}\n`,
   );
 });
+if (botApiServer) {
+  botApiServer.on('error', (error) => {
+    console.error(`[hub] ABBRUCH: interne Bot-API: ${error.message}`);
+    stopAllBots();
+    process.exit(1);
+  });
+  botApiServer.listen(PRODUCTION_BOT_HUB_PORT, PRODUCTION_BOT_GATEWAY, () => {
+    console.log(
+      `[hub] Interne Bot-API nur im isolierten Docker-Netz: ${PRODUCTION_BOT_GATEWAY}:${PRODUCTION_BOT_HUB_PORT}`,
+    );
+  });
+}
 
 let closing = false;
 const shutdown = () => {
   if (closing) process.exit(0);
   closing = true;
   stopAllBots();
+  // Ausstehende Persistenz (Delete-Lifecycle, Secret-Migration) vor dem
+  // Exit auf die Platte zwingen – sonst verliert der Timer seinen Flush.
+  try {
+    flushPersist();
+  } catch (error) {
+    console.error('[hub] Letztes Speichern fehlgeschlagen:', error.message);
+  }
   // Eine offene SQLite-Verbindung hält den Prozess sonst fest; MySQL würde
   // beim Beenden ohnehin wegbrechen, deshalb wird beides geschlossen.
   closeDatabase().catch(() => {});
-  server.close(() => process.exit(0));
+  let remaining = botApiServer ? 2 : 1;
+  const closed = () => {
+    remaining -= 1;
+    if (remaining === 0) process.exit(0);
+  };
+  server.close(closed);
+  botApiServer?.close(closed);
   setTimeout(() => process.exit(0), 2000).unref();
 };
 

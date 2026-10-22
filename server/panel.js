@@ -24,7 +24,7 @@ import {
   timingSafeEqual,
 } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
-import { isIP } from 'node:net';
+import { BlockList, isIP } from 'node:net';
 import {
   chmodSync,
   existsSync,
@@ -43,19 +43,24 @@ import {
   MIME,
   parseDotenv,
   readBody,
+  safeDecode,
   sendJson,
+  withBotCredentials,
   MASK,
 } from './util.js';
 import { getLanguage } from './languages.js';
 import { secureCookies } from './auth.js';
+import { containerHubUrl } from './containers.js';
 import { database } from './database.js';
 import {
   dotenvKey,
   formatDotenv,
+  isReservedEnvKey,
   readSecretValues,
   storeSecretValues,
 } from './secrets.js';
 import {
+  cleanupExecEnvFile,
   containerRuntimeEnabled,
   containerRuntimeName,
   ensureContainer,
@@ -94,11 +99,13 @@ const FIELD_TYPES = new Set([
 let envFor = (bot, dir) => ({ ...process.env });
 let broadcastEvent = () => {};
 let markDirty = () => {};
+let withLifecycle = async (_bot, operation) => operation();
 
-export const configurePanel = ({ env, broadcast, touch } = {}) => {
+export const configurePanel = ({ env, broadcast, touch, lifecycle } = {}) => {
   if (typeof env === 'function') envFor = env;
   if (typeof broadcast === 'function') broadcastEvent = broadcast;
   if (typeof touch === 'function') markDirty = touch;
+  if (typeof lifecycle === 'function') withLifecycle = lifecycle;
 };
 
 /* ------------------------------------------------------------------ *
@@ -168,6 +175,41 @@ export const revokeRuntimeToken = (id) => {
   botStreams.delete(id);
 };
 
+/**
+ * Widerruft beim Bot-Löschen sofort sämtlichen botgebundenen Sitzungszustand:
+ * Runtime-/Panel-Tokens, Panel-Sessions, Bootstrap-Tokens, Callback-Eintrag,
+ * Bot-Streams sowie alle Discord-OAuth-Zustände dieses Bots. Danach darf kein
+ * bereits ausgegebener Bot-Token mehr Zugriff erlauben – auch dann nicht, wenn
+ * ein späterer Cleanup-Schritt (Dateisystem/DB) noch fehlschlägt.
+ */
+export const revokeBotSessions = (id) => {
+  revokeRuntimeToken(id);
+  panelTokens.delete(id);
+  for (const [token, entry] of panelSessionTokens)
+    if (entry?.botId === id) panelSessionTokens.delete(token);
+  for (const [token, entry] of panelBootstrapTokens)
+    if (entry?.botId === id) panelBootstrapTokens.delete(token);
+  for (const [state, entry] of discordAuthStates)
+    if (entry?.botId === id) discordAuthStates.delete(state);
+  for (const [ticket, entry] of discordLoginTickets)
+    if (entry?.botId === id) discordLoginTickets.delete(ticket);
+  const deadSessions = new Set();
+  for (const [panelKey, sessionId] of discordPanelSessions)
+    if (panelKey === id || panelKey.startsWith(`${id}:`)) {
+      discordPanelSessions.delete(panelKey);
+      deadSessions.add(sessionId);
+    }
+  for (const [sessionId, session] of discordSessions)
+    if (session?.botId === id || deadSessions.has(sessionId))
+      discordSessions.delete(sessionId);
+  for (const cacheKey of manifestCache.keys())
+    if (cacheKey.startsWith(`${id}:`)) manifestCache.delete(cacheKey);
+  for (const cacheKey of runtimeBuckets.keys())
+    if (cacheKey.startsWith(`${id}:`)) runtimeBuckets.delete(cacheKey);
+  for (const cacheKey of callbackCalls.keys())
+    if (cacheKey.startsWith(`${id}:`)) callbackCalls.delete(cacheKey);
+};
+
 /** Token für die eingebettete Seite – darf lesen/speichern, aber nichts anmelden. */
 export const panelToken = (id) => {
   let token = panelTokens.get(id);
@@ -200,7 +242,8 @@ const consumePanelBootstrapToken = (botId, token) => {
   return sessionToken;
 };
 
-const sameToken = (a, b) => {
+// Exportiert für Tests: zeitkonstanter Vergleich ist reine Funktion.
+export const sameToken = (a, b) => {
   const left = Buffer.from(String(a ?? ''));
   const right = Buffer.from(String(b ?? ''));
   return (
@@ -648,7 +691,7 @@ const panelDiscordAuth = async (bot, req, res, url, rest) => {
       !code
     )
       throw httpError(400, 'Ungültige Discord-Anmeldung');
-    if (!browser || browser !== state.preAuth) {
+    if (!browser || !sameToken(browser, state.preAuth)) {
       // Nur die Namen, nie die Werte – im Log stehen keine Geheimnisse.
       const names = String(req.headers.cookie ?? '')
         .split(';')
@@ -724,6 +767,7 @@ const panelDiscordAuth = async (bot, req, res, url, rest) => {
     }
     const sessionId = randomUUID();
     discordSessions.set(sessionId, {
+      botId: bot.id,
       user: {
         id: user.id,
         name: user.global_name ?? user.username,
@@ -801,6 +845,7 @@ const linkHubDiscordSession = async (
   const installedGuildIds = await botGuilds(bot);
   const sessionId = randomUUID();
   discordSessions.set(sessionId, {
+    botId: bot.id,
     user: {
       id: authSession.user.id,
       name: authSession.user.name,
@@ -890,6 +935,13 @@ const normaliseOptions = (raw) => {
 const normaliseField = (raw) => {
   const key = slug(raw?.key);
   if (!key) return null;
+  // Reservierte Schlüssel (DISCORD_*, BOT_HUB_*, PATH, LD_*, NODE_OPTIONS,
+  // PYTHON*) verwirft das Manifest wie ungültige: Nur der Hub schreibt
+  // diese Werte, niemals ein Bot über sein Manifest.
+  if (isReservedEnvKey(key)) {
+    console.warn(`[hub] Panel-Feld "${key}" verworfen: reservierter Schlüssel`);
+    return null;
+  }
   const type = FIELD_TYPES.has(raw?.type) ? raw.type : 'text';
   const field = {
     key,
@@ -1037,6 +1089,9 @@ const writePanelEnv = (bot, settings) => {
   for (const [key, value] of Object.entries(bot.secretEnv ?? {}))
     values.set(dotenvKey(key), value);
   for (const field of fields) {
+    // Manifest-Felder dürfen reservierte Schlüssel nie überschreiben –
+    // auch nicht, wenn ein bereits gespeichertes Manifest sie noch enthält.
+    if (isReservedEnvKey(field.key)) continue;
     const key = dotenvKey(field.key);
     values.set(key, settings[field.key] ?? '');
   }
@@ -1100,7 +1155,8 @@ const readManifest = (bot) => {
   } catch {
     return null;
   }
-  const cached = manifestCache.get(path);
+  const cacheKey = `${bot.id}:${path}`;
+  const cached = manifestCache.get(cacheKey);
   if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size)
     return cached.value;
 
@@ -1125,7 +1181,11 @@ const readManifest = (bot) => {
   } catch (error) {
     value = { manifest: null, path, signature: '', error: error.message };
   }
-  manifestCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, value });
+  manifestCache.set(cacheKey, {
+    mtimeMs: stat.mtimeMs,
+    size: stat.size,
+    value,
+  });
   return value;
 };
 
@@ -1313,6 +1373,9 @@ export const saveSettings = (bot, incoming) => {
   for (const [key, raw] of Object.entries(incoming ?? {})) {
     const field = fields.get(key);
     if (!field) continue;
+    // Doppelhalter: Auch wenn ein Manifest aus alter Speicherung noch
+    // einen reservierten Schlüssel trägt – geschrieben wird er nie.
+    if (isReservedEnvKey(key)) continue;
     if (field.secret) {
       const value = String(raw ?? '');
       if (value === MASK) continue;
@@ -1470,15 +1533,27 @@ const openBotStream = (bot, req, res) => {
  * interne Dienste erreicht.
  *
  * Für Container, deren Loopback der Hub nicht teilt, kann ein Betreiber Ziele
- * ausdrücklich freigeben: `BOT_HUB_CALLBACK_ALLOW=host:port,host`.
+ * ausdrücklich freigeben. In Produktion kommt diese Liste aus dem root-eigenen
+ * `/etc/bot-hub/callback-egress.allow`; in der Entwicklung aus der Umgebung.
  */
-const callbackAllowlist = () =>
-  new Set(
-    String(process.env.BOT_HUB_CALLBACK_ALLOW ?? '')
-      .split(',')
+const callbackAllowlist = () => {
+  let configured;
+  // Production uses the same root-owned file as Squid, so an application
+  // environment value cannot silently expand host egress beyond proxy policy.
+  if (process.env.NODE_ENV === 'production') {
+    try {
+      configured = readFileSync('/etc/bot-hub/callback-egress.allow', 'utf8');
+    } catch {
+      configured = '';
+    }
+  } else configured = process.env.BOT_HUB_CALLBACK_ALLOW;
+  return new Set(
+    String(configured ?? '')
+      .split(/[\n,]/)
       .map((value) => value.trim().toLowerCase())
       .filter(Boolean),
   );
+};
 
 /** Loopback über den echten Adresstyp, nicht über einen Zeichenketten-Vergleich. */
 const isLoopbackAddress = (address) => {
@@ -1492,6 +1567,14 @@ const isLoopbackAddress = (address) => {
     if (mapped) return /^127\./.test(mapped[1]);
   }
   return false;
+};
+
+const isLoopbackCallbackHost = (hostname) => {
+  const host = String(hostname ?? '')
+    .toLowerCase()
+    .replace(/^\[|\]$/g, '')
+    .replace(/\.$/, '');
+  return host === 'localhost' || (isIP(host) !== 0 && isLoopbackAddress(host));
 };
 
 /** Alle Adressen eines Namens – eine einzige reicht nicht, sonst gewinnt der letzte Eintrag. */
@@ -1512,15 +1595,180 @@ const resolveAll = async (hostname) => {
  * Adresse – und deshalb wird unten auch genau die Adresse gespeichert und
  * aufgerufen, die geprüft wurde.
  */
-const isMetadataAddress = (address) => {
-  const text = String(address ?? '').toLowerCase();
-  // Cloud-Metadaten + Link-Local dürfen auch via Allowlist nie erreicht werden:
-  // allowlist = welcher öffentliche Host erlaubt ist, nicht "darf überall hin".
-  if (text === '169.254.169.254' || text === '169.254.169.253') return true;
-  if (text.startsWith('169.254.')) return true;
-  if (text === '::ffff:169.254.169.254' || text === '::ffff:169.254.169.253')
+/**
+ * IPv4-Texte aus IPv6-Schreibweisen gewinnen (Dotted-Form, die
+ * Hex-Gruppen-Form ::ffff:a9fe:a9fe und die IPv4-kompatible Hex-Form
+ * ::a9fe:a9fe), damit alle Schreibweisen derselben Adresse im Filter
+ * zusammenfallen.
+ */
+const embeddedIPv4 = (text) => {
+  const mapped = text.match(/^(?:::ffff:|::)((?:\d{1,3}\.){3}\d{1,3})$/);
+  if (mapped && isIP(mapped[1]) === 4) return mapped[1];
+  const hex = text.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (hex) {
+    const high = Number.parseInt(hex[1], 16);
+    const low = Number.parseInt(hex[2], 16);
+    if (Number.isFinite(high) && Number.isFinite(low))
+      return `${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`;
+  }
+  // Härtung F-3: IPv4-kompatible v6-Form OHNE ffff-Präfix. `new URL`
+  // serialisiert ::127.0.0.1 als ::7f00:1 und ::169.254.169.254 als
+  // ::a9fe:a9fe – genau diese Kanonisierung muss hier wieder als IPv4
+  // lesbar werden. Nur exakt `::` + zwei Gruppen (die unteren 32 Bit);
+  // ::ffff:x:x hat drei Gruppen und wurde oben schon als mapped behandelt,
+  // ein ffff-Start hier wäre eine Doppeldeutung und bleibt ausgeschlossen.
+  const kompatibel = text.match(/^::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (kompatibel && kompatibel[1] !== 'ffff') {
+    const high = Number.parseInt(kompatibel[1], 16);
+    const low = Number.parseInt(kompatibel[2], 16);
+    if (Number.isFinite(high) && Number.isFinite(low))
+      return `${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`;
+  }
+  return '';
+};
+
+/**
+ * IPv6-Adresse in die acht vollen Gruppen expandieren (klein, mit Nullen
+ * gepolstert), damit komprimierte und ausgeschriebene Form desselben Ziels
+ * im Filter zusammenfallen. Bei unverständlicher Form bleibt der Original-
+ * text stehen; die Prüfung läuft dann mit Präfixvergleich weiter (fail-safe).
+ */
+const expandiereIPv6 = (text) => {
+  const rein = String(text).split('%')[0];
+  const teile = rein.split('::');
+  if (teile.length > 2) return text;
+  const gruppen = (teil) =>
+    teil === '' ? [] : teil.split(':').map((g) => g.toLowerCase());
+  let liste;
+  if (teile.length === 1) liste = gruppen(teile[0]);
+  else {
+    const kopf = gruppen(teile[0]);
+    const schwanz = gruppen(teile[1]);
+    const mitte = Array(Math.max(0, 8 - kopf.length - schwanz.length)).fill(
+      '0',
+    );
+    liste = [...kopf, ...mitte, ...schwanz];
+  }
+  if (liste.length !== 8 || !liste.every((g) => /^[0-9a-f]{1,4}$/.test(g)))
+    return text;
+  return liste.map((g) => g.padStart(4, '0')).join(':');
+};
+
+const nichtOeffentlicheCallbackZiele = new BlockList();
+/**
+ * BlockList.addSubnet will Netz, Präfixlänge und Familie als getrennte
+ * Argumente – ein CIDR-String wie `10.0.0.0/8` wäre als Netz mit dem
+ * Präfix „ipv4“ gemeint und würde mit ERR_INVALID_ADDRESS werfen. Das
+ * Aufteilen passiert hier einmalig, damit die Listen darunter reine Daten
+ * bleiben.
+ */
+const zoneAddieren = (liste, subnet, familie) => {
+  const [netz, praefix] = String(subnet).split('/');
+  liste.addSubnet(netz, Number(praefix), familie);
+};
+for (const subnet of [
+  '0.0.0.0/8',
+  '10.0.0.0/8',
+  '100.64.0.0/10',
+  '100.100.100.200/32',
+  '127.0.0.0/8',
+  '168.63.129.16/32',
+  '169.254.0.0/16',
+  '172.16.0.0/12',
+  '192.0.0.0/24',
+  '192.0.2.0/24',
+  '192.88.99.0/24',
+  '192.168.0.0/16',
+  '198.18.0.0/15',
+  '198.51.100.0/24',
+  '203.0.113.0/24',
+  '224.0.0.0/4',
+  '240.0.0.0/4',
+  '255.255.255.255/32',
+])
+  zoneAddieren(nichtOeffentlicheCallbackZiele, subnet, 'ipv4');
+// Kein `::ffff:0:0/96` in dieser Liste: Node legt den Eintrag im IPv4-Baum
+// als 0.0.0.0/0 ab und würde damit JEDE öffentliche IPv4-Adresse als nicht
+// öffentlich einstufen (die Callback-Allowlist wäre tot). Das ist auch nicht
+// nötig – `embeddedIPv4()` wandelt `::ffff:a.b.c.d`, `::a.b.c.d`, die
+// Hex-Form `::ffff:h:h` und die IPv4-kompatible Hex-Form `::h:h`
+// (URL-Kanonik von `::a.b.c.d`) vor jeder Prüfung in die IPv4-Form um,
+// sodass solche Ziele ganz normal durch die IPv4-Liste laufen.
+for (const subnet of [
+  '::/128',
+  '::1/128',
+  '100::/64',
+  // Well-Known NAT64 (RFC 6052): übersetzt u. a. 169.254.169.254 in den
+  // IPv6-Raum. Die Rückübersetzung leistet die IPv4-Seite hier nicht – der
+  // Block gilt nur für direkt adressierte IPv6-Ziele.
+  '64:ff9b::/96',
+  '64:ff9b:1::/48',
+  '2001::/23',
+  '2001:db8::/32',
+  '2002::/16',
+  'fc00::/7',
+  'fe80::/10',
+  'ff00::/8',
+  'fd00:ec2::/32',
+])
+  zoneAddieren(nichtOeffentlicheCallbackZiele, subnet, 'ipv6');
+
+export const isNonPublicCallbackAddress = (address) => {
+  let text = String(address ?? '')
+    .toLowerCase()
+    .replace(/^\[|\]$/g, '');
+  const embedded = embeddedIPv4(text);
+  if (embedded) text = embedded;
+  const family = isIP(text);
+  if (family === 4) return nichtOeffentlicheCallbackZiele.check(text, 'ipv4');
+  if (family === 6) return nichtOeffentlicheCallbackZiele.check(text, 'ipv6');
+  return true;
+};
+
+// Exportiert für Tests: der Filter ist reine Funktion, kein Netzwerk nötig.
+export const isMetadataAddress = (address) => {
+  let text = String(address ?? '')
+    .toLowerCase()
+    .replace(/^\[|\]$/g, '');
+  // IPv4-mapped IPv6 (::ffff:…) vor der Prüfung in IPv4 zurückverwandeln –
+  // sonst entkommt ::ffff:a9fe:a9fe (= 169.254.169.254) dem Textvergleich.
+  const embedded = embeddedIPv4(text);
+  if (embedded) text = embedded;
+  if (isIP(text) === 4) {
+    // Link-local cloud metadata plus Alibaba's CGNAT metadata IP and Azure's
+    // platform virtual IP. The latter stay blocked even for allowed callbacks.
+    return (
+      text.startsWith('169.254.') ||
+      text === '100.100.100.200' ||
+      text === '168.63.129.16'
+    );
+  }
+  // Expandiert, damit komprimierte und ausgeschriebene Formen
+  // (fd00:ec2::254 und fd00:ec2:0:0:0:0:0:254) denselben Text ergeben.
+  const full = expandiereIPv6(text);
+  // AWS-IMDS über IPv6 (fd00:ec2::) und Link-Local fe80::/10.
+  if (full.startsWith('fd00:0ec2:') || full.startsWith('fd00:ec2:'))
     return true;
+  const first = full.split(':')[0] ?? '';
+  if (/^fe[89ab][0-9a-f]$/.test(first)) return true;
   return false;
+};
+
+/**
+ * Container-Betrieb: Bots dürfen den Hub nicht als Leser für Loopback-Dienste
+ * des Host-Rechners einspannen – der Bot selbst käme an localhost nicht heran,
+ * der Hub schon, und die Antwort fließt als Body in untrusted Bot-Code zurück.
+ * Außerhalb von Containern (Entwicklung, Tests) teilen Hub und Bot den
+ * Loopback ohnehin, dort bleibt er erlaubt. Bewusst ein Aufruf zur Anfragezeit
+ * und kein beim Import gemerkter Wert: `containerRuntimeEnabled()` liest die
+ * Umgebung bei jedem Aufruf, der Schalter wirkt also sofort.
+ */
+const loopbackNurOhneContainer = () => {
+  if (!containerRuntimeEnabled()) return;
+  throw httpError(
+    400,
+    'callback.url: Loopback-Ziele sind im Container-Betrieb nicht erlaubt – der Hub würde sonst Dienste auf dem Host-Rechner für den Bot lesbar machen.',
+  );
 };
 
 const assertCallbackTarget = async (parsed) => {
@@ -1529,22 +1777,29 @@ const assertCallbackTarget = async (parsed) => {
   const allow = callbackAllowlist();
   const allowlisted = allow.has(hostname) || allow.has(`${hostname}:${port}`);
   if (allowlisted) {
-    // Auch allowlistete Hosts müssen auflösbar sein und dürfen nie auf
-    // Cloud-Metadaten zeigen. Private Netze bleiben explizites Operator-
-    // Opt-in, Metadaten nie.
+    // Auch allowlistete Hosts müssen auflösbar und global routbar sein.
+    // Squid prüft die Ziel-IP beim tatsächlichen Verbindungsaufbau erneut.
     if (isIP(hostname)) {
-      if (isMetadataAddress(hostname))
+      if (isNonPublicCallbackAddress(hostname) || isMetadataAddress(hostname))
         throw httpError(
           400,
-          'callback.url: Metadaten-Adresse ist nie erlaubt.',
+          'callback.url: private, reservierte und Metadaten-Adressen sind nie erlaubt.',
         );
       return hostname;
     }
     const addresses = await resolveAll(hostname);
     if (addresses.length === 0)
       throw httpError(400, 'callback.url: Hostname lässt sich nicht auflösen');
-    if (addresses.some((address) => isMetadataAddress(address)))
-      throw httpError(400, 'callback.url: Metadaten-Adresse ist nie erlaubt.');
+    if (
+      addresses.some(
+        (address) =>
+          isNonPublicCallbackAddress(address) || isMetadataAddress(address),
+      )
+    )
+      throw httpError(
+        400,
+        'callback.url: private, reservierte und Metadaten-Adressen sind nie erlaubt.',
+      );
     return addresses[0];
   }
 
@@ -1552,8 +1807,9 @@ const assertCallbackTarget = async (parsed) => {
     if (!isLoopbackAddress(hostname))
       throw httpError(
         400,
-        'callback.url darf nur auf den eigenen Rechner zeigen (Loopback). Für andere Ziele braucht es BOT_HUB_CALLBACK_ALLOW.',
+        'callback.url darf nur auf den eigenen Rechner zeigen (Loopback). Für externe Ziele ist eine ausdrückliche Callback-Allowlist erforderlich (Produktion: --callback-host beim UFW-Setup).',
       );
+    loopbackNurOhneContainer();
     return hostname;
   }
 
@@ -1565,17 +1821,82 @@ const assertCallbackTarget = async (parsed) => {
   if (addresses.some((address) => !isLoopbackAddress(address)))
     throw httpError(
       400,
-      'callback.url löst auf eine Adresse außerhalb des Loopback auf (SSRF-Schutz). Für andere Ziele braucht es BOT_HUB_CALLBACK_ALLOW.',
+      'callback.url löst auf eine Adresse außerhalb des Loopback auf (SSRF-Schutz). Für externe Ziele ist eine ausdrückliche Callback-Allowlist erforderlich (Produktion: --callback-host beim UFW-Setup).',
     );
+  loopbackNurOhneContainer();
   return addresses[0];
 };
 
-// Connect to the address that passed policy checks while retaining the URL
-// hostname for Host and TLS certificate validation. This closes the DNS
-// check/connect gap that otherwise permits DNS rebinding.
+/**
+ * Stellt fest, ob der gefilterte Produktions-Egress-Proxy (Squid) aktiv ist.
+ * `configureProductionEgress` (server/egress.js) setzt genau diese Marke:
+ * NODE_USE_ENV_PROXY=1 plus HTTP_PROXY/HTTPS_PROXY, und der Hub ruft ihn nur
+ * unter NODE_ENV=production auf. Die Proxy-Zieladresse wird bewusst nicht
+ * verglichen – nicht der Wert entscheidet, sondern dass der Hub über den
+ * Proxy geht und Squid die Ziel-IP beim CONNECT selbst prüft. Fail-safe:
+ * jede Unsicherheit (oder ein Fehler beim Lesen) gilt als „Proxy nicht
+ * aktiv“ und führt damit zum stricten Pfad, also zum Pinnen.
+ */
+export const produktionsEgressProxyAktiv = () => {
+  try {
+    return (
+      process.env.NODE_ENV === 'production' &&
+      process.env.NODE_USE_ENV_PROXY === '1' &&
+      Boolean(process.env.HTTP_PROXY || process.env.http_proxy) &&
+      Boolean(process.env.HTTPS_PROXY || process.env.https_proxy)
+    );
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Reine Entscheidungshilfe für `requestCallback`, exportiert für Tests:
+ * liefert einen Lookup, der die Verbindung auf die bereits geprüfte Adresse
+ * festlegt (DNS-Rebinding-Schutz: Prüfung und Verbindungsaufbau treffen
+ * dieselbe IP), oder `undefined`, wenn nicht gepinnt wird. Nicht gepinnt
+ * wird nur, wenn der Hostname schon ein IP-Literal ist (da löst Node gar
+ * nicht auf) oder wenn externer Traffic über den aktiven Produktions-Proxy
+ * läuft – dort öffnet Node die Verbindung zum Proxy, und ein Pinn-Lookup
+ * würde den Weg zum Proxy verbiegen; Squid prüft die Ziel-IP beim CONNECT
+ * selbst. Loopback läuft über NO_PROXY immer direkt und bleibt deshalb auch
+ * bei aktivem Proxy gepinnt. Ist die geprüfte Adresse keine IP (eigentlich
+ * unerreichbar, `assertCallbackTarget` gibt nur IPs zurück), schlägt der
+ * Lookup fehl, statt ungeprüft neu aufzulösen – Abschluss statt Loophole.
+ */
+export const callbackLookupPin = (hostname, address, proxyAktiv) => {
+  const host = String(hostname ?? '')
+    .toLowerCase()
+    .replace(/^\[|\]$/g, '');
+  if (isIP(host)) return undefined;
+  const familie = isIP(String(address ?? ''));
+  if (familie === 0)
+    return (_hostname, _options, callback) =>
+      callback(new Error('Geprüfte Callback-Adresse ist keine IP.'));
+  if (proxyAktiv && !isLoopbackCallbackHost(host)) return undefined;
+  return (_hostname, _options, callback) => {
+    // Seit Node 22.21 ruft net den Lookup immer mit all:true auf
+    // (Happy Eyeballs) und erwartet einen Adresssatz mit family-Feld –
+    // Einzel-Strings und familienlose Einträge kommen als „Invalid IP
+    // address“/„Invalid address family“ durch. Formate sind vertraglich
+    // englisch, deshalb hier ausnahmsweise family statt familie.
+    callback(null, [{ address, family: familie }], familie);
+  };
+};
+
+// Jeder Zielhostname wird beim Verbindungsaufbau auf die Adresse festgelegt,
+// die eben erst die Prüfung durchlaufen hat (siehe callbackLookupPin). Nur
+// externe Ziele bei aktivem Produktions-Proxy bleiben ausgenommen: dort
+// wiederholt Squid die Ziel-IP-Prüfung selbst und blockiert Metadaten
+// unabhängig vom DNS.
 const requestCallback = (parsed, address, token, payload) =>
   new Promise((resolve, reject) => {
     let request;
+    const lookupPin = callbackLookupPin(
+      parsed.hostname,
+      address,
+      produktionsEgressProxyAktiv(),
+    );
     const timeout = setTimeout(
       () => request.destroy(new Error('Callback-Zeitüberschreitung.')),
       CALLBACK_TIMEOUT,
@@ -1593,12 +1914,9 @@ const requestCallback = (parsed, address, token, payload) =>
           'x-bot-hub-token': token,
           'content-length': Buffer.byteLength(payload),
         },
-        ...(isIP(parsed.hostname.replace(/^\[|\]$/g, ''))
-          ? {}
-          : {
-              lookup: (_hostname, _options, callback) =>
-                callback(null, address, isIP(address)),
-            }),
+        // Local and (outside the production proxy) every other callback is
+        // pinned to the checked address; see callbackLookupPin above.
+        ...(lookupPin ? { lookup: lookupPin } : {}),
       },
       (response) => {
         const chunks = [];
@@ -1642,7 +1960,15 @@ const registerCallback = async (bot, url, token) => {
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
     throw httpError(400, 'callback.url muss http oder https verwenden');
-  await assertCallbackTarget(parsed);
+  const targetAddress = await assertCallbackTarget(parsed);
+  if (
+    !isLoopbackCallbackHost(parsed.hostname) &&
+    (parsed.protocol !== 'https:' || (parsed.port && parsed.port !== '443'))
+  )
+    throw httpError(
+      400,
+      'Externe Callbacks müssen HTTPS auf Port 443 verwenden.',
+    );
   // Nicht auf den Hub selbst: sonst lässt sich der Hub als Vermittler für
   // eigene Aufrufe benutzen.
   if (
@@ -1743,7 +2069,20 @@ const callCallback = async (bot, hook, command, args) => {
     // beiden Zeitpunkten kann sich ein DNS-Eintrag geändert haben.
     const parsed = new URL(hook.url);
     const address = await assertCallbackTarget(parsed);
-    const response = await requestCallback(parsed, address, hook.token, payload);
+    if (
+      !isLoopbackCallbackHost(parsed.hostname) &&
+      process.env.NODE_ENV === 'production' &&
+      process.env.HTTPS_PROXY !== 'http://127.0.0.1:3129'
+    )
+      throw new Error(
+        'Der gefilterte HTTPS-Ausgangsproxy ist nicht eingerichtet.',
+      );
+    const response = await requestCallback(
+      parsed,
+      address,
+      hook.token,
+      payload,
+    );
     const raw = response.body;
     let data = raw;
     try {
@@ -1868,18 +2207,26 @@ const runScript = async (bot, command, args) => {
     }
   }
   return new Promise((resolveRun) => {
+    const exec = inContainer
+      ? execArgs(bot, projectRoot(), dir, spec, scriptEnv)
+      : null;
     const child = spawn(
       inContainer ? containerRuntimeName() : spec.executable,
-      inContainer
-        ? execArgs(bot, projectRoot(), dir, spec, scriptEnv)
-        : spec.args,
-      {
+      inContainer ? exec.args : spec.args,
+      // Gleiche Rechteabsenkung wie beim Bot-Prozess selbst: ohne sie
+      // liefen Panel-Aktionen als Hub-Benutzer, obwohl der Betreiber
+      // mit BOT_HUB_BOT_UID gehärtet glaubt.
+      withBotCredentials({
         cwd: inContainer ? projectRoot() : dir,
         env: inContainer ? process.env : scriptEnv,
         stdio: ['ignore', 'pipe', 'pipe'],
         detached: true,
-      },
+      }),
     );
+    if (exec?.envFile) {
+      child.once('exit', () => cleanupExecEnvFile(exec.envFile));
+      child.once('error', () => cleanupExecEnvFile(exec.envFile));
+    }
 
     let out = '';
     let err = '';
@@ -2005,11 +2352,21 @@ const settingEnv = (settings) => {
 /** Alles, was der Hub dem gestarteten Prozess mitgibt. */
 export const hubEnv = (bot, dir) => {
   const settings = effectiveSettings(bot);
+  const token = issueRuntimeToken(bot.id);
+  // Härtung F-2: Das Runtime-Token wechselt bei jedem Spawn und der Bot-Prozess
+  // kann es roh ausgeben (console.log(process.env.BOT_HUB_TOKEN)). Die
+  // Wert-Redaktion in manager.js (redactKnownSecretValues) braucht den
+  // konkreten Wert, darum liegt er am Bot – wie busy/logs ein reines
+  // Internal-Feld: publicBot() und toFile() filtern es raus, es verlässt nie
+  // die API oder bots.json. issueRuntimeToken ersetzt bei jeder Zuteilung den
+  // alten Wert (pro Bot gilt genau ein Token; Revoke löscht ihn), deshalb
+  // trifft das Feld immer den aktuell gültigen Wert – kein Listenbedarf.
+  if (bot && typeof bot === 'object') bot.runtimeToken = token;
   return {
-    BOT_HUB_URL: hubBaseUrl(),
+    BOT_HUB_URL: containerHubUrl(),
     BOT_HUB_ID: bot.id,
     BOT_HUB_NAME: bot.name,
-    BOT_HUB_TOKEN: issueRuntimeToken(bot.id),
+    BOT_HUB_TOKEN: token,
     BOT_HUB_MANIFEST: bot.panel?.path || relative(projectRoot(), dir),
     BOT_HUB_PANEL: `/api/bots/${bot.id}/panel`,
     BOT_HUB_SETTINGS: JSON.stringify(settings),
@@ -2169,8 +2526,15 @@ const sendFile = (res, path, assetOrigin = '') => {
   res.end(readFileSync(path));
 };
 
-const servePanelFile = (bot, req, res, rest, publicStatic = false) => {
-  const rel = safeRelPath(decodeURIComponent(rest));
+const servePanelFile = (
+  bot,
+  req,
+  res,
+  rest,
+  publicStatic = false,
+  panelTokenAuth = false,
+) => {
+  const rel = safeRelPath(safeDecode(rest));
   if (!rel) throw httpError(400, 'Ungültiger Pfad');
   if (publicStatic) {
     const ext = rel.slice(rel.lastIndexOf('.')).toLowerCase();
@@ -2191,11 +2555,28 @@ const servePanelFile = (bot, req, res, rest, publicStatic = false) => {
       ]).has(ext)
     )
       throw httpError(404, 'Datei nicht gefunden');
-    const entry =
-      bot.panel?.manifest?.entry || bot.panel?.manifest?.pages?.[0]?.href || '';
-    const root = entry.includes('/') ? entry.split('/')[0] : '';
-    if (root && rel !== root && !rel.startsWith(`${root}/`))
-      throw httpError(404, 'Datei nicht gefunden');
+    // Öffentliche Auslieferung ohne Panel-Token: nur der Ordner des Entry.
+    // Liegt der Entry im Workspace-Root, gibt es keinen eigenen Ordner – dann
+    // sind nur der Entry selbst, die in manifest.pages genannten Dateien und
+    // direkt daneben liegende Assets erlaubt, aber kein Unterordner. Ohne
+    // Entry wird gar nichts öffentlich ausgeliefert. Mit gültigem Panel-Token
+    // gilt weiterhin der volle Workspace (wie vor dieser Prüfung üblich).
+    if (!panelTokenAuth) {
+      const entry = String(bot.panel?.manifest?.entry ?? '');
+      if (!entry) throw httpError(404, 'Datei nicht gefunden');
+      const pages = new Set(
+        (bot.panel?.manifest?.pages ?? [])
+          .map((page) => String(page?.href ?? ''))
+          .filter(Boolean),
+      );
+      const dir = entry.includes('/')
+        ? entry.slice(0, entry.lastIndexOf('/'))
+        : '';
+      const inside = dir
+        ? rel === entry || rel.startsWith(`${dir}/`) || pages.has(rel)
+        : rel === entry || pages.has(rel) || !rel.includes('/');
+      if (!inside) throw httpError(404, 'Datei nicht gefunden');
+    }
   }
   let dir;
   let target;
@@ -2305,6 +2686,10 @@ const view = (panel) => {
     secrets: panel.secrets,
     state: panel.state,
     online: panel.online,
+    // Ob ein laufender Bot auf Aktionen hört (Callback registriert): Die
+    // Beispielseite deaktiviert Demo-Buttons sichtbar, solange kein Bot
+    // antworten kann – statt erst beim Klick mit 501 zu scheitern.
+    callback: Boolean(panel.callback),
     // Nur die sichtbaren Angaben – der Pfad des Skripts bleibt im Hub.
     commands: (panel.commands ?? []).map(
       ({ id, label, description, danger }) => ({ id, label, description, danger }),
@@ -2412,6 +2797,7 @@ export const handlePanelRoutes = async (
   url,
   panelTokenAuth = false,
   publicStatic = false,
+  panelHubManage = false,
 ) => {
   const parts = url.pathname.split('/').filter(Boolean).slice(3); // ohne api/bots/:id
   if (parts[0] === 'panel') parts.shift();
@@ -2443,9 +2829,25 @@ export const handlePanelRoutes = async (
     }
   }
 
-  const authResult = await panelDiscordAuth(bot, req, res, url, rest);
+  const discordAuthMutation =
+    (req.method === 'GET' &&
+      (rest === 'discord/login' || rest === 'discord/callback')) ||
+    (req.method === 'POST' && rest === 'discord/logout');
+  const authResult = discordAuthMutation
+    ? await withLifecycle(bot, () => panelDiscordAuth(bot, req, res, url, rest))
+    : await panelDiscordAuth(bot, req, res, url, rest);
   if (authResult !== false) return authResult;
 
+  // Das Panel-Token berechtigt nur zu Lesenzugriffen und zum Senden von
+  // State und Meldungen. Einstellungen schreiben (`PUT settings`) und
+  // Befehle ausführen (`POST commands/…`) verlangen zusätzlich die
+  // zentrale Hub-Sitzung mit panel.manage für diesen Bot – das Token wird
+  // bereits bei `/panel/open` mit bloßen Leserechten ausgestellt und darf
+  // deshalb keine Schreib- oder Ausführungsrechte tragen.
+  const hubManageWrite =
+    panelHubManage &&
+    ((req.method === 'PUT' && rest === 'settings') ||
+      (req.method === 'POST' && rest.startsWith('commands/')));
   if (
     panelTokenAuth &&
     !(
@@ -2456,11 +2858,10 @@ export const handlePanelRoutes = async (
           rest === 'discord/config' ||
           rest === 'bridge.js' ||
           rest.startsWith('file/'))) ||
-      (req.method === 'PUT' && (rest === 'settings' || rest === 'state')) ||
+      (req.method === 'PUT' && rest === 'state') ||
       (req.method === 'POST' &&
-        (rest === 'notify' ||
-          rest === 'discord/logout' ||
-          rest.startsWith('commands/')))
+        (rest === 'notify' || rest === 'discord/logout')) ||
+      hubManageWrite
     )
   )
     throw httpError(403, 'Diese Panel-Aktion ist nur im Dashboard erlaubt');
@@ -2479,29 +2880,35 @@ export const handlePanelRoutes = async (
   }
 
   if (req.method === 'POST' && rest === 'reload') {
-    const path = bot.panel?.path;
-    manifestCache.delete(path);
-    // Leere Signatur erzwingt das erneute Einlesen; gespeicherte Werte und
-    // Geheimnisse bleiben erhalten, applyPanel übernimmt nur passende Felder.
-    bot.panel = { ...(bot.panel ?? emptyPanel()), signature: '' };
-    ensurePanel(bot);
-    markDirty(bot);
-    broadcastEvent('panel', { id: bot.id, panel: publicPanel(bot) });
-    return sendJson(res, 200, { panel: publicPanel(bot) });
+    const panel = await withLifecycle(bot, async () => {
+      const path = bot.panel?.path;
+      manifestCache.delete(`${bot.id}:${path}`);
+      bot.panel = { ...(bot.panel ?? emptyPanel()), signature: '' };
+      ensurePanel(bot);
+      markDirty(bot);
+      broadcastEvent('panel', { id: bot.id, panel: publicPanel(bot) });
+      return publicPanel(bot);
+    });
+    return sendJson(res, 200, { panel });
   }
 
   if (req.method === 'DELETE' && !rest) {
-    callbacks.delete(bot.id);
-    bot.panel = emptyPanel();
-    markDirty(bot);
-    broadcastEvent('panel', { id: bot.id, panel: publicPanel(bot) });
-    return sendJson(res, 200, { panel: publicPanel(bot) });
+    const panel = await withLifecycle(bot, async () => {
+      callbacks.delete(bot.id);
+      bot.panel = emptyPanel();
+      markDirty(bot);
+      broadcastEvent('panel', { id: bot.id, panel: publicPanel(bot) });
+      return publicPanel(bot);
+    });
+    return sendJson(res, 200, { panel });
   }
 
   if (req.method === 'PUT' && rest === 'settings') {
     requirePanelDiscordLogin(bot, req);
     const body = await readBody(req);
-    const result = saveSettings(bot, body.values ?? {});
+    const result = await withLifecycle(bot, () =>
+      saveSettings(bot, body.values ?? {}),
+    );
     return sendJson(res, 200, { panel: publicPanel(bot), ...result });
   }
 
@@ -2511,7 +2918,10 @@ export const handlePanelRoutes = async (
   if (req.method === 'PUT' && rest === 'state') {
     requirePanelDiscordLogin(bot, req);
     const body = await readBody(req);
-    return sendJson(res, 200, { state: pushState(bot, body.state ?? {}) });
+    const state = await withLifecycle(bot, () =>
+      pushState(bot, body.state ?? {}),
+    );
+    return sendJson(res, 200, { state });
   }
 
   // Meldung aus der Bot-Seite. Sie laeuft ueber die Panel-API und nicht ueber
@@ -2520,14 +2930,19 @@ export const handlePanelRoutes = async (
   if (req.method === 'POST' && rest === 'notify') {
     requirePanelDiscordLogin(bot, req);
     const body = await readBody(req);
-    return sendJson(res, 200, notifyUser(bot, body.message, body.kind));
+    const result = await withLifecycle(bot, () =>
+      notifyUser(bot, body.message, body.kind),
+    );
+    return sendJson(res, 200, result);
   }
 
   if (req.method === 'POST' && rest.startsWith('commands/')) {
     requirePanelDiscordLogin(bot, req);
-    const commandId = decodeURIComponent(rest.slice('commands/'.length));
+    const commandId = safeDecode(rest.slice('commands/'.length));
     const body = await readBody(req);
-    const result = await runAction(bot, commandId, body.args ?? {});
+    const result = await withLifecycle(bot, () =>
+      runAction(bot, commandId, body.args ?? {}),
+    );
     return sendJson(res, 200, { result });
   }
 
@@ -2543,6 +2958,7 @@ export const handlePanelRoutes = async (
       res,
       rest.slice('file/'.length),
       publicStatic,
+      panelTokenAuth,
     );
 
   throw httpError(405, 'Methode nicht erlaubt');
@@ -2607,7 +3023,9 @@ export const handleHubRoutes = async (req, res, url, getBot) => {
         'Nur der laufende Prozess darf Werte überschreiben.',
       );
     const body = await readBody(req);
-    const result = saveSettings(bot, body.values ?? {});
+    const result = await withLifecycle(bot, () =>
+      saveSettings(bot, body.values ?? {}),
+    );
     return sendJson(res, 200, { panel: publicPanel(bot), ...result });
   }
 
@@ -2630,7 +3048,8 @@ export const handleHubRoutes = async (req, res, url, getBot) => {
         400,
         'panel braucht mindestens entry, settings, commands oder pages.',
       );
-    return sendJson(res, 200, { panel: registerPanel(bot, manifest) });
+    const panel = await withLifecycle(bot, () => registerPanel(bot, manifest));
+    return sendJson(res, 200, { panel });
   }
 
   if (req.method === 'POST' && rest === '/callback') {
@@ -2640,14 +3059,20 @@ export const handleHubRoutes = async (req, res, url, getBot) => {
         'Nur der laufende Prozess darf eine Callback-URL setzen.',
       );
     const body = await readBody(req);
-    if (body.url === null || body.url === '') callbacks.delete(bot.id);
-    else
+    if (body.url === null || body.url === '') {
+      await withLifecycle(bot, async () => {
+        callbacks.delete(bot.id);
+        broadcastEvent('panel', { id: bot.id, panel: publicPanel(bot) });
+      });
+    } else {
       return sendJson(
         res,
         200,
-        await registerCallback(bot, body.url, body.token),
+        await withLifecycle(bot, () =>
+          registerCallback(bot, body.url, body.token),
+        ),
       );
-    broadcastEvent('panel', { id: bot.id, panel: publicPanel(bot) });
+    }
     return sendJson(res, 200, { ok: true, url: null });
   }
 
@@ -2660,7 +3085,10 @@ export const handleHubRoutes = async (req, res, url, getBot) => {
         'Nur der laufende Prozess darf den Zustand des Bots aendern.',
       );
     const body = await readBody(req);
-    return sendJson(res, 200, { state: pushState(bot, body.state ?? body) });
+    const state = await withLifecycle(bot, () =>
+      pushState(bot, body.state ?? body),
+    );
+    return sendJson(res, 200, { state });
   }
 
   if (req.method === 'POST' && rest === '/notify') {
@@ -2672,7 +3100,10 @@ export const handleHubRoutes = async (req, res, url, getBot) => {
         'Nur der laufende Prozess darf Benachrichtigungen ausloesen.',
       );
     const body = await readBody(req);
-    return sendJson(res, 200, notifyUser(bot, body.message, body.kind));
+    const result = await withLifecycle(bot, () =>
+      notifyUser(bot, body.message, body.kind),
+    );
+    return sendJson(res, 200, result);
   }
 
   if (rest === '/db' || rest.startsWith('/db/'))
@@ -2751,14 +3182,18 @@ const handleStoreRoutes = async (req, res, url, bot, identity) => {
       const body = await readBody(req);
       if (!Object.prototype.hasOwnProperty.call(body, 'value'))
         throw httpError(400, 'PUT erwartet ein Feld "value".');
-      const result = await store.set(botId, collection, key, body.value);
+      const result = await withLifecycle(bot, () =>
+        store.set(botId, collection, key, body.value),
+      );
       return sendJson(res, 200, {
         entry: { collection, key, ...result },
       });
     }
     if (req.method === 'DELETE')
       return sendJson(res, 200, {
-        removed: await store.remove(botId, collection, key),
+        removed: await withLifecycle(bot, () =>
+          store.remove(botId, collection, key),
+        ),
       });
     throw httpError(405, 'Methode nicht erlaubt');
   }
