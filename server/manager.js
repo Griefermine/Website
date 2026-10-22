@@ -1,12 +1,12 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import {
   closeSync,
+  cpSync,
   existsSync,
+  fchmodSync,
   fsyncSync,
   lstatSync,
-  chmodSync,
-  cpSync,
   openSync,
   readFileSync,
   renameSync,
@@ -41,7 +41,9 @@ import {
   isEvalFlag,
   parseDotenv,
   readBody,
+  safeDecode,
   sendJson,
+  withBotCredentials,
   MIME,
   MASK,
 } from './util.js';
@@ -76,6 +78,8 @@ import {
 import {
   containerRuntimeEnabled,
   containerRuntimeName,
+  cleanupExecEnvFile,
+  dependencyRunArgs,
   ensureContainer,
   execArgs,
   stopContainer,
@@ -88,7 +92,16 @@ const PROJECT_ROOT = resolve(process.env.BOT_DASHBOARD_ROOT || process.cwd());
 const DATA_FILE = join(PROJECT_ROOT, 'data', 'bots.json');
 const ACCESS_FILE = join(PROJECT_ROOT, 'data', 'access.json');
 const MAX_LOG_LINES = 800;
-const MAX_BOTS = 24;
+// Untergrenze für Bot-Slots. In Tests wird sie über BOT_HUB_MAX_BOTS gesenkt,
+// um Parallelität gegen die Obergrenze zu prüfen, ohne 24 Bots anlegen zu
+// müssen. Der Default bleibt 24; ein Wert unter 1 wäre unsinnig und wird
+// darum auf 1 begrenzt.
+const MAX_BOTS = Math.max(
+  1,
+  Number(process.env.BOT_HUB_MAX_BOTS) > 0
+    ? Number(process.env.BOT_HUB_MAX_BOTS)
+    : 24,
+);
 
 /**
  * Obergrenze für den JSON-Body einer Datei-Route. Rechnet man die Quotation
@@ -133,13 +146,91 @@ const clientAddress = (req) => {
   }
   return candidate;
 };
+/**
+ * P1-G: Eine einzige kanonische Pfad-Auflösung für Rate-Limits, Routing und
+ * Audit. Der Router zerlegt `split('/').filter(Boolean)` und ignoriert damit
+ * leerer Segmente und Abschluss-Slashes; tat der Rate-Limiter das nicht,
+ * wären `/api/bots`, `/api/bots/` und `/api//bots` drei verschiedene Buckets
+ * – und jedes davon ein Weg, das Limit zu umgehen.
+ *
+ * Prozent-Kodierung wird hier bewusst NICHT dekodiert: `new URL()` hat bereits
+ * genau einmal normalisiert, und mehrfaches Dekodieren (`%252f` → `%2f` →
+ * `/`) wäre genau die Mehrdeutigkeit, die wir ausschließen wollen. Gefährliche
+ * Rohformen (`..`, kodierte Slashes) prüfen die Routen selbst gegen ihre
+ * jeweils dekodierten Parameter.
+ */
+const canonicalPathname = (pathname) => {
+  const collapsed = String(pathname ?? '').replace(/\/{2,}/g, '/');
+  if (collapsed.length > 1 && collapsed.endsWith('/'))
+    return collapsed.slice(0, -1);
+  return collapsed;
+};
+
+/**
+ * Schlüssel-Pfad für den Rate-Limit-Bucket: kanonisch UND pro Segment genau
+ * einmal prozent-dekodiert – exakt so, wie der Router segmentweise dekodiert.
+ * Würde der Limiter `%62ots` als eigenen Pfad sehen, während der Router darin
+ * `bots` erkennt, wäre die Prozentkodierung ein zweiter, limitfreier Bucket –
+ * genau die Umgehung, die P1-G verbietet. Doppelte Kodierung (`%2562f`) wird
+ * bewusst NICHT ein zweites Mal gelöst: sie bleibt ein anderer, dann
+ * unauflösbarer Pfad (404), nie ein Routing-Trick.
+ */
+const rateLimitPath = (url) => {
+  const parts = canonicalPathname(url.pathname).split('/');
+  return parts
+    .map((part) => {
+      try {
+        return decodeURIComponent(part);
+      } catch {
+        return part; // ungültige Kodierung: roh behalten, Router scheitert daran
+      }
+    })
+    .join('/');
+};
+
+/**
+ * V25b (DoS-Vektor): Bei vollen Buckets durfte nicht pauschal 429 gegeben
+ * werden – ein Angreifer konnte mit tausenden frischen Keys/Identitäten
+ * legitime Inhaber aus ihren Buckets verdrängen, ohne selbst je ein Limit zu
+ * sehen. Stattdessen wird bei Kapazitätsüberschreitung zuerst bereinigt:
+ * abgelaufene Buckets sind ohnehin frei, und reicht das nicht, weicht der am
+ * längsten unangetastete Bucket (lastTouched) – der steht als Nächstes ohnehin
+ * zum Ablauf an und kostet seinen Inhaber am wenigsten. Bestehende Zähler
+ * werden beim Sweeping nie resettet; nur echte Verdrängung oder Ablauf macht
+ * einen Bucket frei. Das pauschale 429 bleibt als letzte Notbremse, wenn der
+ * Speicherdruck nach der Bereinigung immer noch akut ist.
+ */
 const takeRateBucket = (key, limit, now) => {
   let bucket = rateBuckets.get(key);
   if (!bucket || bucket.expiresAt <= now) {
-    if (!bucket && rateBuckets.size >= MAX_RATE_BUCKETS)
-      return httpError(429, 'Zu viele Anfragen');
-    bucket = { count: 0, expiresAt: now + 60_000 };
+    if (!bucket && rateBuckets.size >= MAX_RATE_BUCKETS) {
+      // Erste Stufe: abgelaufene Buckets aussortieren (identisch zur
+      // Bedeutung des regulären rateCleanup – hier nur früher).
+      for (const [altSchluessel, altBucket] of rateBuckets) {
+        if (altBucket.expiresAt <= now) rateBuckets.delete(altSchluessel);
+      }
+      // Zweite Stufe: den am längsten unangetasteten Bucket verdrängen.
+      if (rateBuckets.size >= MAX_RATE_BUCKETS) {
+        let aeltesterSchluessel = null;
+        let aeltesteBeruehrung = Infinity;
+        for (const [altSchluessel, altBucket] of rateBuckets) {
+          if (altBucket.lastTouched < aeltesteBeruehrung) {
+            aeltesteBeruehrung = altBucket.lastTouched;
+            aeltesterSchluessel = altSchluessel;
+          }
+        }
+        if (aeltesterSchluessel !== null)
+          rateBuckets.delete(aeltesterSchluessel);
+      }
+      // Notbremse: Speicherdruck ist nach Bereinigung immer noch akut
+      // (praktisch nur, wenn gar nichts verdrängbar ist).
+      if (rateBuckets.size >= MAX_RATE_BUCKETS)
+        return httpError(429, 'Zu viele Anfragen');
+    }
+    bucket = { count: 0, expiresAt: now + 60_000, lastTouched: now };
     rateBuckets.set(key, bucket);
+  } else {
+    bucket.lastTouched = now;
   }
   bucket.count += 1;
   if (bucket.count > limit) {
@@ -151,7 +242,9 @@ const takeRateBucket = (key, limit, now) => {
 };
 const rateLimit = (req, url) => {
   if (process.env.BOT_HUB_TEST_MODE === '1') return null;
-  const path = url.pathname;
+  // P1-G: dieselbe kanonische Form wie fürs Routing – inklusive einfacher
+  // Prozent-Dekodierung, damit kodierte Varianten denselben Bucket treffen.
+  const path = rateLimitPath(url);
   let limit = 0;
   let rateClass = '';
   if (/^\/api\/auth\/discord\/(?:login|callback)$/.test(path)) {
@@ -172,6 +265,15 @@ const rateLimit = (req, url) => {
   } else if (/\/files(?:\/|$)/.test(path)) {
     limit = MAX_UPLOADS_PER_MINUTE;
     rateClass = 'files';
+  } else if (
+    /^\/api\/logs(?:\/|$)/.test(path) ||
+    /^\/api\/bots\/[^/]+\/logs(?:\/|$)/.test(path)
+  ) {
+    // V25b: Beide Log-Pfade (global und pro Bot) waren bisher undrosselt.
+    // Die Antworten können bis zu 500 Zeilen Log enthalten – ohne Klasse
+    // war das ein billiger Weg, den Hub mit teuren Reads zuzuschütten.
+    limit = 300;
+    rateClass = 'logs';
   }
   const now = Date.now();
   const ip = clientAddress(req);
@@ -188,10 +290,10 @@ const rateLimit = (req, url) => {
 
   let mutationLimit = 0;
   let mutationClass = '';
-  if (req.method === 'POST' && url.pathname === '/api/bots') {
+  if (req.method === 'POST' && path === '/api/bots') {
     mutationLimit = 10;
     mutationClass = 'bot-create';
-  } else if (/^\/api\/bots\/[^/]+$/.test(url.pathname)) {
+  } else if (/^\/api\/bots\/[^/]+$/.test(path)) {
     if (req.method === 'DELETE') {
       mutationLimit = 20;
       mutationClass = 'bot-delete';
@@ -199,7 +301,7 @@ const rateLimit = (req, url) => {
       mutationLimit = 60;
       mutationClass = 'bot-update';
     }
-  } else if (/^\/api\/access(?:\/|$)/.test(url.pathname) && req.method !== 'GET') {
+  } else if (/^\/api\/access(?:\/|$)/.test(path) && req.method !== 'GET') {
     mutationLimit = 30;
     mutationClass = 'access-change';
   }
@@ -298,6 +400,16 @@ const takeUploadBytes = (req, url, incomingBytes) => {
 const bots = new Map();
 const listeners = new Set();
 const dirty = new Set();
+/**
+ * P1-H: Reservierte, aber noch nicht abgeschlossene Bot-Erstellungen. Die
+ * wirksame Zahl ist `bots.size + pendingBotCreations`; die Reservierung wird
+ * nach Body-Lesen/Validierung unmittelbar vor dem ersten Ressourcen-Schritt
+ * gesetzt und im `finally` wieder freigegeben. Ohne sie sähen mehrere
+ * parallele POST-Requests dieselbe freie Kapazität und überschritten MAX_BOTS.
+ * Ein Bot im Löschvorgang bleibt bis zum Abschluss im `bots`-Map – die Zahl
+ * bleibt dadurch in beide Richtungen konservativ.
+ */
+let pendingBotCreations = 0;
 
 /**
  * Bots im Löschvorgang: Während DELETE läuft, werden Start, Restart,
@@ -306,6 +418,14 @@ const dirty = new Set();
  * bleiben erlaubt.
  */
 const deletingBots = new Set();
+/**
+ * P1-J: Vorbereitete Löschung. DELETE markiert den Bot hier, BEVOR es auf
+ * den Lifecycle-Lock wartet: eine laufende Installation hält den Lock noch,
+ * darf aber keinen weiteren Installationsschritt mehr beginnen und keine neue
+ * Installation darf anlaufen. `deletingBots` bleibt der eigentliche In-Flight
+ * Marker (davon prüft `assertNoDeleteInFlight` den Retry-Fall ab).
+ */
+const deletePending = new Set();
 /**
  * Sperrprüfung für den Delete-Lifecycle: In-Flight-Löschungen (Speicher) und
  * persistente Zustände (`deleting`/`cleanup_failed`, über Neustarts hinweg)
@@ -317,6 +437,7 @@ const isDeleteLocked = (bot) =>
   Boolean(
     bot &&
     (deletingBots.has(bot.id) ||
+      deletePending.has(bot.id) ||
       bot.deleteState === 'deleting' ||
       bot.deleteState === 'cleanup_failed'),
   );
@@ -359,7 +480,14 @@ const withBotLifecycleLock = async (botId, operation) => {
 };
 
 let persistTimer = null;
-const schedulePersist = () => {
+// `persistForced` markiert eine Persistenz, die NICHT von der `dirty`-Menge
+// abhängt: nach der Secret-Migration müssen alle Bots neu geschrieben werden,
+// auch wenn kein einzelner Datensatz als geändert gilt. Ohne dieses Flag
+// kehrte flush() wegen einer leeren dirty-Menge ohne Schreiben zurück – und
+// die migrierten Geheimnisse blieben für immer im Klartext in bots.json.
+let persistForced = false;
+const schedulePersist = (force = false) => {
+  if (force) persistForced = true;
   if (persistTimer) return;
   persistTimer = setTimeout(() => {
     persistTimer = null;
@@ -368,24 +496,28 @@ const schedulePersist = () => {
 };
 
 const flush = (strict = false) => {
-  if (!dirty.size) return;
+  if (!dirty.size && !persistForced) return;
   // Atomar: tmp schreiben + fsync + rename. Ein Absturz hinterlässt nie eine
-  // halb geschriebene bots.json, sondern höchstens eine tmp-Leiche.
-  const tmp = `${DATA_FILE}.${process.pid}.tmp`;
+  // halb geschriebene bots.json, sondern höchstens eine tmp-Leiche. Der
+  // Temp-Name ist zufällig: `<bots.json>.<pid>.tmp` wäre erratbar und damit
+  // ein Ziel für Symlink-Angriffe lokaler Nutzer; `wx` öffnet garantiert neu.
+  const tmp = join(
+    dirname(DATA_FILE),
+    `.bots.json.${randomBytes(8).toString('hex')}.tmp`,
+  );
   try {
-    mkdirSync(dirname(DATA_FILE), { recursive: true });
-    writeFileSync(tmp, `${JSON.stringify(toFile(), null, 2)}\n`, {
-      mode: 0o600,
-    });
-    const fd = openSync(tmp, 'r');
+    mkdirSync(dirname(DATA_FILE), { recursive: true, mode: 0o700 });
+    const fd = openSync(tmp, 'wx', 0o600);
     try {
+      fchmodSync(fd, 0o600);
+      writeFileSync(fd, `${JSON.stringify(toFile(), null, 2)}\n`);
       fsyncSync(fd);
     } finally {
       closeSync(fd);
     }
-    chmodSync(tmp, 0o600);
     renameSync(tmp, DATA_FILE);
     dirty.clear();
+    persistForced = false;
   } catch (error) {
     try {
       unlinkSync(tmp);
@@ -406,9 +538,15 @@ const flush = (strict = false) => {
 const readSecretFile = (id) => readSecretValues(PROJECT_ROOT, id);
 
 /**
- * Liest die Geheimnisse eines Bots und holt sie in die Datei mit 0600 Rechten.
- * Der Wert aus bots.json hat Vorrang, weil die Datei sonst einen älteren
- * Stand zurückschreiben würde; anschließend wandert er aus bots.json heraus.
+ * Liest die Geheimnisse eines Bots und holt Altbestände aus bots.json in die
+ * Datei mit 0600 Rechten. Die Secret-Datei ist die kanonische Quelle: ein
+ * Wert aus der Datei gewinnt immer gegen ein Legacy-Feld aus bots.json.
+ * Sonst würde ein alter Stand eine längst vollzogene Rotation zurücksetzen
+ * (befund P0-A). Legacy-Werte dienen nur als Erstbefüllung.
+ *
+ * Rückgabe `migrated: false` bedeutet: Die Legacy-Werte sind noch NICHT
+ * sicher in der Secret-Datei. `bots.json` behält sie dann weiter – sonst
+ * gingen sie beim nächsten Umschreiben der Übersicht verloren.
  */
 const migrateSecrets = (config) => {
   const legacyEnv = { ...(config.secretEnv ?? {}) };
@@ -422,7 +560,7 @@ const migrateSecrets = (config) => {
     ...(Array.isArray(config.panel?.secretKeys) ? config.panel.secretKeys : []),
   ]);
   if (!envKeys.size && !panelKeys.size)
-    return { secretEnv: {}, secretSettings: {} };
+    return { secretEnv: {}, secretSettings: {}, migrated: true };
 
   const stored = readSecretFile(config.id);
   const secretEnv = {};
@@ -432,29 +570,53 @@ const migrateSecrets = (config) => {
   // Hub ein geheimes Panel-Feld nach dem ersten Speichern nicht wieder.
   for (const key of envKeys) {
     const fileKey = dotenvKey(key);
-    const value = legacyEnv[key] ?? stored[fileKey];
+    const value = stored[fileKey] ?? legacyEnv[key];
     if (value === undefined) continue;
     secretEnv[key] = String(value);
     carryOver[fileKey] = String(value);
   }
   for (const key of panelKeys) {
     const fileKey = dotenvKey(key);
-    const value = legacyPanel[key] ?? stored[fileKey];
+    const value = stored[fileKey] ?? legacyPanel[key];
     if (value === undefined) continue;
     secretSettings[key] = String(value);
     carryOver[fileKey] = String(value);
   }
+  // Nur Legacy-Werte, die in der kanonischen Datei (noch) fehlen, müssen
+  // überhaupt geschrieben werden. Ein Bot ohne Altbestand verlangt keinen
+  // Schreibvorgang – und darf auch nicht an einem scheitern, der gar
+  // nicht nötig wäre.
+  const needsStore =
+    Object.entries(legacyEnv).some(
+      ([key, value]) =>
+        value !== undefined && stored[dotenvKey(key)] !== String(value),
+    ) ||
+    Object.entries(legacyPanel).some(
+      ([key, value]) =>
+        value !== undefined && stored[dotenvKey(key)] !== String(value),
+    );
+  if (!needsStore) return { secretEnv, secretSettings, migrated: true };
   try {
     storeSecretValues(PROJECT_ROOT, config.id, carryOver);
-    return { secretEnv, secretSettings };
+    return { secretEnv, secretSettings, migrated: true };
   } catch (error) {
-    // Ohne sichere Ablage bleiben die Werte im Speicher, werden aber nicht
-    // aus bots.json entfernt - sonst waeren sie verloren.
+    // Ohne sichere Ablage bleiben die Werte im Speicher UND werden durch
+    // `pendingLegacySecrets` in bots.json konserviert – sonst wäre der
+    // letzte bekannte Stand beim nächsten Umschreiben verloren. Es wird
+    // kein Erfolg geloggt und kein Wert ausgegeben.
     console.error(
       `[hub] Geheimnisse für ${config.name} konnten nicht in data/secrets gesichert werden:`,
       error.message,
     );
-    return { secretEnv: { ...secretEnv, ...config.secretEnv }, secretSettings };
+    return {
+      secretEnv: { ...secretEnv, ...legacyEnv },
+      secretSettings: { ...secretSettings, ...legacyPanel },
+      migrated: false,
+      pendingLegacySecrets: {
+        secretEnv: legacyEnv,
+        secretSettings: legacyPanel,
+      },
+    };
   }
 };
 
@@ -462,25 +624,43 @@ const migrateSecrets = (config) => {
  * `bots.json` ist die Übersicht der Bots, nicht der Geheimnisspeicher. Werte
  * gehen nicht hinein, nur die Namen der Schlüssel - die liegen in
  * `data/secrets/<id>.env` (Verzeichnis 0700, Datei 0600).
+ *
+ * Einzige Ausnahme: ein Bot mit `pendingLegacySecrets` – dessen Migration ist
+ * beim Lesen fehlgeschlagen. Die Legacy-Werte wandern zurück in die Datei,
+ * damit sie nicht verloren gehen, und werden beim nächsten Start erneut
+ * migriert.
  */
 const toFile = () =>
-  [...bots.values()].map(({ child, busy, logs, restartTimer, ...rest }) => {
-    const secretKeys = Object.keys(rest.secretEnv ?? {});
-    // Live-Zustand der Bot-Seite gehört nicht in die Datei.
-    const { state, secretSettings, ...panel } = rest.panel ?? {};
-    return {
-      ...rest,
-      secretEnv: {},
-      secretKeys,
-      panel: rest.panel
-        ? {
-            ...panel,
-            secretSettings: {},
-            secretKeys: Object.keys(secretSettings ?? {}),
-          }
-        : rest.panel,
-    };
-  });
+  [...bots.values()].map(
+    ({
+      child,
+      busy,
+      logs,
+      restartTimer,
+      pendingLegacySecrets,
+      runtimeToken, // Internal: nur Wert-Redaktion, nie die Datei
+      ...rest
+    }) => {
+      const secured = !pendingLegacySecrets;
+      const secretKeys = Object.keys(rest.secretEnv ?? {});
+      // Live-Zustand der Bot-Seite gehört nicht in die Datei.
+      const { state, secretSettings, ...panel } = rest.panel ?? {};
+      return {
+        ...rest,
+        secretEnv: secured ? {} : { ...(pendingLegacySecrets.secretEnv ?? {}) },
+        secretKeys,
+        panel: rest.panel
+          ? {
+              ...panel,
+              secretSettings: secured
+                ? {}
+                : { ...(pendingLegacySecrets.secretSettings ?? {}) },
+              secretKeys: Object.keys(secretSettings ?? {}),
+            }
+          : rest.panel,
+      };
+    },
+  );
 
 /* ------------------------------------------------------------------ *
  * Pfad-Sicherheit: Bots dürfen nur innerhalb des Projektordners
@@ -743,7 +923,12 @@ const pushLine = (botId, stream, line) => {
     ts: Date.now(),
     stream,
     level: detectLogLevel(text),
-    text: text.slice(0, 2000),
+    // Zentral maskiert: REST und SSE nutzen dieselbe Quelle, damit der
+    // Live-Stream keine Geheimnisse zeigt, die der REST-Pfad maskiert.
+    // V25b: hinter der Muster-Redaktion zusätzlich die konkreten Werte –
+    // druckt ein Bot sein Secret roh (ohne KEY=/Bearer-Kontext), greift
+    // kein Muster, aber die bekannte Secret-Liste des Bots.
+    text: redactKnownSecretValues(redactLogSecrets(text), bot).slice(0, 2000),
   };
   bot.logs.push(chunk);
   if (bot.logs.length > MAX_LOG_LINES)
@@ -759,6 +944,55 @@ const redactLogSecrets = (value) => {
     '$1[REDACTED]',
   );
   return text;
+};
+
+// Unterhalb dieser Länge lohnt die Wert-Redaktion nicht: ein Zwei-Zeichen-
+// „Secret“ würde sonst jede normale Zeile zerhacken.
+const MIN_SECRET_VALUE_LENGTH = 8;
+
+/**
+ * V25b (Redaction-Lücke): `redactLogSecrets` ist nur muster-basiert. Druckt
+ * ein Bot seinen Token roh – ohne Schlüssel-Kontext wie KEY= oder Bearer –,
+ * landete der Klartextwert in bot.logs und damit in REST und SSE. Darum
+ * werden zusätzlich die konkreten Werte ersetzt, die der Bot als Secrets
+ * kennt: die Secret-Umgebung (`secretEnv`), die geheimen Panel-Felder
+ * (`panel.secretSettings`) und das bei jedem Spawn neu zugeteilte
+ * Runtime-Token (`runtimeToken`, von hubEnv am Bot abgelegt – pro Bot gilt
+ * genau eines, Zuteilung ersetzt den Vorgänger, daher Skalar statt Liste).
+ * pushLine ist heiß – pro Aufruf läuft einmal die kleine Wertliste durch,
+ * kein Regex pro Secret. Leere, Nicht-Text- und Kurzwerte (< 8 Zeichen)
+ * werden ignoriert, damit kein Ein-Zeichen-Wert jede Zeile unlesbar macht.
+ * Ersetzt wird in Länge absteigend (Härtung F-4): enthielt ein längerer
+ * Wert einen kürzeren, hätte das kurze sonst den langen aufgerissen und
+ * einen Klartext-Rest stehen lassen.
+ */
+const redactKnownSecretValues = (text, bot) => {
+  let out = String(text ?? '');
+  const quellen = [bot?.secretEnv, bot?.panel?.secretSettings];
+  const werte = [];
+  for (const quelle of quellen) {
+    if (!quelle || typeof quelle !== 'object') continue;
+    for (const wert of Object.values(quelle)) {
+      if (typeof wert !== 'string' || wert.length < MIN_SECRET_VALUE_LENGTH)
+        continue;
+      werte.push(wert);
+      // Secret-Dateien dürfen Rand-Leerzeichen tragen; der Bot druckt den
+      // Wert meist getrimmt – beide Formen zählen als derselbe Wert.
+      const randlos = wert.trim();
+      if (randlos.length >= MIN_SECRET_VALUE_LENGTH && randlos !== wert)
+        werte.push(randlos);
+    }
+  }
+  if (
+    typeof bot?.runtimeToken === 'string' &&
+    bot.runtimeToken.length >= MIN_SECRET_VALUE_LENGTH
+  )
+    werte.push(bot.runtimeToken);
+  werte.sort((a, b) => b.length - a.length);
+  for (const wert of werte) {
+    if (out.includes(wert)) out = out.split(wert).join('[REDACTED]');
+  }
+  return out;
 };
 
 const pushOutput = (botId, stream, buffer) => {
@@ -803,8 +1037,30 @@ const outputLineReader = (botId, stream) => {
 const broadcast = (type, payload) => {
   if (!listeners.size) return;
   const frame = `event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`;
+  // Log-zeilen nur an Clients, die das Bot-Leserecht für genau diesen Bot
+  // haben – dasselbe logs.read-Scoping, das auch die REST-Route prüft.
+  const logScope =
+    type === 'log' && payload?.botId
+      ? {
+          allowed: bots.has(payload.botId),
+          botId: payload.botId,
+        }
+      : null;
   for (const client of listeners) {
     try {
+      if (logScope) {
+        if (!logScope.allowed) continue;
+        const req = client.__sseReq;
+        if (
+          !req ||
+          !(
+            hasPermission(req, 'logs.read', { botId: logScope.botId }) ||
+            hasPermission(req, 'logs.read.global') ||
+            hasPermission(req, 'bots.manage')
+          )
+        )
+          continue;
+      }
       client.write(frame);
     } catch {
       listeners.delete(client);
@@ -813,7 +1069,19 @@ const broadcast = (type, payload) => {
 };
 
 const publicBot = (bot) => {
-  const { child, busy, logs, restartTimer, ...rest } = bot;
+  // runtimeToken bleibt innen: der Wert gehört nur der Log-Redaktion
+  // (redactKnownSecretValues) und darf nie die API oder einen SSE-Rahmen
+  // erreichen – Maskierung wie bei secretEnv wäre hier zwecklos, das Feld
+  // selbst hat in der öffentlichen Form nichts zu suchen.
+  const {
+    child,
+    busy,
+    logs,
+    restartTimer,
+    pendingLegacySecrets,
+    runtimeToken,
+    ...rest
+  } = bot;
   ensurePanel(bot);
   return {
     ...rest,
@@ -838,15 +1106,26 @@ const setStatus = (bot, status, extra = {}) => {
 
 const hydrate = (config) => {
   const workspace = workspaceConfig(config);
-  // Jeder Bot bekommt seinen Startordner, beim ersten Start genauso wie beim
-  // zehnten. Hier muss sichergestellt werden, dass es ihn gibt – nicht nur beim
-  // Anlegen, sonst fiele er bei einem Bot, der eine Nacht alt ist, einfach weg.
-  dateien.ensureStartFolder(
-    { id: config.id, workspaceRoot: workspace.workspaceRoot },
-    PROJECT_ROOT,
-  );
-  const secrets = migrateSecrets(config);
-  return {
+  const deleteLocked =
+    config.deleteState === 'deleting' ||
+    config.deleteState === 'cleanup_failed';
+  // P1-I: Ein Bot im Delete-Recovery-Zustand bekommt KEINE neuen
+  // Runtime-Ressourcen – kein Startordner, kein Scaffold, keine Secrets.
+  // Recovery braucht nur die validierte Identität, um idempotent aufzuräumen.
+  if (!deleteLocked) {
+    // Jeder Bot bekommt seinen Startordner, beim ersten Start genauso wie beim
+    // zehnten. Hier muss sichergestellt werden, dass es ihn gibt – nicht nur
+    // beim Anlegen, sonst fiele er bei einem Bot, der eine Nacht alt ist,
+    // einfach weg.
+    dateien.ensureStartFolder(
+      { id: config.id, workspaceRoot: workspace.workspaceRoot },
+      PROJECT_ROOT,
+    );
+  }
+  const secrets = deleteLocked
+    ? { secretEnv: {}, secretSettings: {}, migrated: true }
+    : migrateSecrets(config);
+  const bot = {
     id: config.id,
     name: config.name,
     emoji: config.emoji || '🤖',
@@ -905,6 +1184,11 @@ const hydrate = (config) => {
       ],
     }),
   };
+  // Fehlgeschlagene Migration: die Legacy-Werte bleiben am Bot hängen und
+  // werden von toFile() zurück in bots.json geschrieben – nie in die API.
+  if (!secrets.migrated)
+    bot.pendingLegacySecrets = secrets.pendingLegacySecrets;
+  return bot;
 };
 
 /* ----------------------------- Prozesse ----------------------------- */
@@ -918,6 +1202,45 @@ const killTree = (child, signal) => {
     } catch {
       /* Prozess ist schon weg */
     }
+  }
+};
+
+/**
+ * P1-J: Eine lang laufende Installation hält den Lifecycle-Lock. DELETE und
+ * STOP dürfen nicht minutenlang auf ihr Ende warten – aber den Lock einfach
+ * freizugeben, während der Prozess noch in den Workspace schreibt, wäre der
+ * alte Delete-/Write-Race. Dieser Helfer terminiert den kind-Prozess erst mit
+ * SIGTERM, nach kurzer Gnadenfrist hart mit SIGKILL und wartet auf das
+ * tatsächliche Prozessende (`bot.busy` cleared der exit-Handler). Erst dann
+ * ist sicher, dass keine Operation mehr schreiben kann.
+ * Scheitert das Warten, wirft er 409: der Bot bleibt gesperrt, statt dass
+ * Cleanup unter einem laufenden Prozess abläuft.
+ */
+const abortActiveOperation = async (bot, { graceMs = 5000 } = {}) => {
+  const proc = bot.busy;
+  if (proc) {
+    pushLine(bot.id, 'system', 'Laufende Installation wird abgebrochen …');
+    killTree(proc, 'SIGTERM');
+  }
+  let until = Date.now() + graceMs;
+  while (bot.busy && Date.now() < until)
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  if (bot.busy) {
+    pushLine(
+      bot.id,
+      'system',
+      'ESKALATION: SIGTERM wirkte nicht, sende SIGKILL',
+    );
+    killTree(bot.busy, 'SIGKILL');
+    until = Date.now() + graceMs;
+    while (bot.busy && Date.now() < until)
+      await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  if (bot.busy) {
+    const error = lifecycleConflict();
+    error.message =
+      'Laufende Installation endet nicht – der Bot bleibt gesperrt, damit kein Cleanup unter einem schreibenden Prozess läuft.';
+    throw error;
   }
 };
 
@@ -980,7 +1303,65 @@ const depsFor = (bot) => {
   return { language, framework, deps, check, install, prepare, venv };
 };
 
-const botEnv = (
+/** Obergrenze für einzelne Werte aus der Bot-Konfiguration. */
+const MAX_BOT_ENV_VALUE = 32768;
+
+/**
+ * Schlüssel, die festlegen, wie ein Prozess Programme findet und lädt.
+ * Die setzt der Hub – niemals die Bot-Konfiguration: ein eigenes PATH,
+ * LD_PRELOAD, NODE_OPTIONS oder PYTHONSTARTUP macht aus jedem freige-
+ * gebenen Binary beliebigen Code und hebt die Allowlist der ausführba-
+ * ren Programme auf. `PATH` setzt der Hub später selbst (venv vor Sys-
+ * tem-PATH); hier geht es nur darum, dass der Bot ihn nicht setzt.
+ */
+const isHubControlledEnvKey = (key) => {
+  const normalized = String(key).toLowerCase();
+  return (
+    normalized === 'path' ||
+    normalized === 'home' ||
+    normalized === 'temp' ||
+    normalized.startsWith('tmp') ||
+    normalized.startsWith('ld_') ||
+    normalized === 'node_options' ||
+    normalized.startsWith('python') ||
+    normalized.startsWith('git_') ||
+    normalized.startsWith('npm_config')
+  );
+};
+
+/**
+ * Die Bot-Umgebung, bereinigt: blockierte Schlüssel und unbrauchbare
+ * Werte (kein String, überschnitten) fallen ersatzlos weg. Geloggt wird
+ * den Name, nie der Wert. exportiert für die Tests.
+ */
+const warnedEnvKeys = new Set();
+export const usableBotEnv = (bot) => {
+  const clean = {};
+  for (const [key, value] of Object.entries(bot.env ?? {})) {
+    const problem = isHubControlledEnvKey(key)
+      ? 'Schlüssel verwaltet der Hub'
+      : typeof value !== 'string'
+        ? 'Wert ist kein String'
+        : value.length > MAX_BOT_ENV_VALUE
+          ? `Wert länger als ${MAX_BOT_ENV_VALUE} Zeichen`
+          : '';
+    if (problem) {
+      if (warnedEnvKeys.size > 1000) warnedEnvKeys.clear();
+      const note = `${bot.id}:${key}`;
+      if (!warnedEnvKeys.has(note)) {
+        warnedEnvKeys.add(note);
+        console.warn(
+          `[hub] "${bot.id}": Bot-Umgebungsvariable "${key}" ignoriert (${problem}).`,
+        );
+      }
+      continue;
+    }
+    clean[key] = value;
+  }
+  return clean;
+};
+
+export const botEnv = (
   bot,
   dir,
   { runtime = false, includeSecrets = runtime, useVenv = true } = {},
@@ -1008,7 +1389,7 @@ const botEnv = (
   const currentPath = safeEnv[pathVar] ?? safeEnv.PATH ?? '';
   return {
     ...safeEnv,
-    ...bot.env,
+    ...usableBotEnv(bot),
     ...(binDirs.length
       ? { [pathVar]: [...binDirs, currentPath].join(delimiter) }
       : {}),
@@ -1179,7 +1560,13 @@ const commandSpec = (bot, command, dir, purpose = 'start') => {
 const runCommand = (
   bot,
   command,
-  { dir, silent = false, timeout = 120000, systemPython = false },
+  {
+    dir,
+    silent = false,
+    timeout = 120000,
+    systemPython = false,
+    dependencyInstall = false,
+  },
 ) =>
   new Promise((resolveRun) => {
     if (!silent) pushLine(bot.id, 'system', `$ ${command}`);
@@ -1191,51 +1578,91 @@ const runCommand = (
       resolveRun({ code: -1 });
       return;
     }
-    const env = botEnv(bot, dir, {
-      includeSecrets: false,
-      useVenv: !systemPython,
-    });
     const inContainer = containerRuntimeEnabled();
-    const child = spawn(
-      inContainer ? containerRuntimeName() : spec.executable,
-      inContainer ? execArgs(bot, PROJECT_ROOT, dir, spec, env) : spec.args,
-      {
-        cwd: inContainer ? PROJECT_ROOT : dir,
-        env: inContainer ? process.env : env,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      },
-    );
-    bot.busy = child;
+    const temporaryEgress =
+      dependencyInstall && inContainer && process.env.NODE_ENV === 'production';
+    (async () => {
+      let exec = null;
+      let child = null;
+      let killer = null;
+      let settled = false;
+      const finish = async (code) => {
+        if (settled) return;
+        settled = true;
+        if (killer) clearTimeout(killer);
+        if (bot.busy === child) bot.busy = null;
+        if (exec?.envFile) cleanupExecEnvFile(exec.envFile);
+        resolveRun({ code });
+      };
 
-    const outputReader = outputLineReader(bot.id, 'deps');
-    const errorReader = outputLineReader(bot.id, 'deps');
-    child.stdout.on('data', (data) => outputReader.write(data));
-    child.stderr.on('data', (data) => errorReader.write(data));
-
-    const killer = setTimeout(() => {
-      pushLine(
-        bot.id,
-        'system',
-        'Zeitüberschreitung – Befehl wird abgebrochen',
-      );
-      killTree(child, 'SIGTERM');
-    }, timeout);
-    killer.unref();
-
-    child.on('error', (error) => {
-      clearTimeout(killer);
-      if (bot.busy === child) bot.busy = null;
-      pushLine(bot.id, 'system', `Befehl fehlgeschlagen: ${error.message}`);
-      resolveRun({ code: -1 });
-    });
-
-    child.on('exit', (code) => {
-      clearTimeout(killer);
-      if (bot.busy === child) bot.busy = null;
-      outputReader.flush();
-      errorReader.flush();
-      resolveRun({ code: code ?? -1 });
-    });
+      try {
+        const env = botEnv(bot, dir, {
+          includeSecrets: false,
+          useVenv: !systemPython,
+        });
+        if (temporaryEgress) {
+          // User-Konfiguration kann Umgebungsvariablen enthalten, die zur
+          // Laufzeit gebraucht werden. Installationsskripte erhalten sie
+          // absichtlich nicht; private Registry-Credentials sind nicht erlaubt.
+          for (const key of Object.keys(bot.env ?? {})) delete env[key];
+          exec = dependencyRunArgs(bot, PROJECT_ROOT, dir, spec, env);
+        } else {
+          exec = inContainer
+            ? execArgs(bot, PROJECT_ROOT, dir, spec, env)
+            : null;
+        }
+        // detached + killTree: pip/npm lassen oft Enkelprozesse zurück. Ohne
+        // eigene Prozessgruppe trifft der Gruppen-Kill nur den Direktkind-Prozess.
+        child = spawn(
+          inContainer ? containerRuntimeName() : spec.executable,
+          inContainer ? exec.args : spec.args,
+          withBotCredentials({
+            cwd: inContainer ? PROJECT_ROOT : dir,
+            env: inContainer ? process.env : env,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            detached: true,
+          }),
+        );
+        bot.busy = child;
+        const outputReader = outputLineReader(bot.id, 'deps');
+        const errorReader = outputLineReader(bot.id, 'deps');
+        child.stdout.on('data', (data) => outputReader.write(data));
+        child.stderr.on('data', (data) => errorReader.write(data));
+        killer = setTimeout(() => {
+          pushLine(
+            bot.id,
+            'system',
+            'Zeitüberschreitung – Befehl wird abgebrochen',
+          );
+          if (exec?.containerName) {
+            const stopper = spawn(
+              containerRuntimeName(),
+              ['stop', '--time', '2', exec.containerName],
+              { stdio: 'ignore' },
+            );
+            stopper.once('error', () => killTree(child, 'SIGTERM'));
+            stopper.once('exit', (code) => {
+              if (code !== 0) killTree(child, 'SIGTERM');
+            });
+          } else {
+            killTree(child, 'SIGTERM');
+          }
+        }, timeout);
+        killer.unref();
+        child.on('error', (error) => {
+          pushLine(bot.id, 'system', `Befehl fehlgeschlagen: ${error.message}`);
+          void finish(-1);
+        });
+        child.on('exit', (code) => {
+          outputReader.flush();
+          errorReader.flush();
+          void finish(code ?? -1);
+        });
+      } catch (error) {
+        pushLine(bot.id, 'system', `Befehl fehlgeschlagen: ${error.message}`);
+        await finish(-1);
+      }
+    })();
   });
 
 /** Prüft, ob die gewählte Library schon installiert ist. */
@@ -1288,9 +1715,21 @@ const installDependencies = async (bot, dir, { state, force = false } = {}) => {
   );
 
   for (const step of plan) {
+    // P1-J: Ein Delete, das den Lock freibekommen will, hat Vorrang. Nach
+    // dem letzten Schritt schreibt dieser Prozess nicht mehr in den
+    // Workspace – erst dann darf der Cleanup Dateien und Container entfernen.
+    if (isDeleteLocked(bot)) {
+      pushLine(
+        bot.id,
+        'system',
+        'Installation abgebrochen – Löschvorgang hat Vorrang.',
+      );
+      return { ...info, installed: true, ok: false };
+    }
     const { code } = await runCommand(bot, step.join(' '), {
       dir,
       timeout: INSTALL_TIMEOUT,
+      dependencyInstall: true,
     });
     if (code !== 0) {
       pushLine(
@@ -1369,6 +1808,7 @@ const spawnBot = (bot, dir, language) => {
   ensurePanel(bot);
 
   let child;
+  let exec = null;
   try {
     const spec = commandSpec(bot, command, dir, 'start');
     const runtimeEnv = {
@@ -1376,24 +1816,26 @@ const spawnBot = (bot, dir, language) => {
       FORCE_COLOR: '1',
     };
     const inContainer = containerRuntimeEnabled();
-    const spawnOptions = {
+    const spawnOptions = withBotCredentials({
       cwd: inContainer ? PROJECT_ROOT : dir,
       env: inContainer ? process.env : runtimeEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: true,
-    };
-    const uid = Number(process.env.BOT_HUB_BOT_UID);
-    const gid = Number(process.env.BOT_HUB_BOT_GID);
-    if (Number.isInteger(uid) && uid > 0) spawnOptions.uid = uid;
-    if (Number.isInteger(gid) && gid > 0) spawnOptions.gid = gid;
+    });
+    exec = inContainer
+      ? execArgs(bot, PROJECT_ROOT, dir, spec, runtimeEnv)
+      : null;
     child = spawn(
       inContainer ? containerRuntimeName() : spec.executable,
-      inContainer
-        ? execArgs(bot, PROJECT_ROOT, dir, spec, runtimeEnv)
-        : spec.args,
+      inContainer ? exec.args : spec.args,
       spawnOptions,
     );
+    if (exec?.envFile) {
+      child.once('exit', () => cleanupExecEnvFile(exec.envFile));
+      child.once('error', () => cleanupExecEnvFile(exec.envFile));
+    }
   } catch (error) {
+    if (exec?.envFile) cleanupExecEnvFile(exec.envFile);
     setStatus(bot, 'error', { exitCode: -1 });
     pushLine(bot.id, 'system', `Start fehlgeschlagen: ${error.message}`);
     throw httpError(500, `Start fehlgeschlagen: ${error.message}`);
@@ -1625,6 +2067,75 @@ const stopAllBots = () => {
   }
 };
 
+/**
+ * Feldprüfung für Einträge aus bots.json. Die Datei wird zwar nur vom Hub
+ * geschrieben, bleibt aber ein angreifbarer Zustandsträger (korrupte Reste,
+ * lokale Manipulation, teilabgeschriebene Migrationen). Ungeprüfte Werte
+ * landen in Pfadkomponenten (`bots/<id>/workspace`, `data/secrets/<id>.env`,
+ * `rm -rf` beim Löschen) und im Spawn – deshalb: Typ, Länge und erlaubte
+ * Zeichen, bevor hydrate irgendetwas damit anfasst. Rückgabe: Ablehnungsgrund
+ * oder '' wenn der Eintrag übernehmbar ist.
+ */
+const ablehnungsgrund = (config) => {
+  if (!config || typeof config !== 'object' || Array.isArray(config))
+    return 'Eintrag ist kein Objekt';
+  if (typeof config.id !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(config.id))
+    return 'id fehlt oder ungültig';
+  if (
+    typeof config.name !== 'string' ||
+    !config.name.trim() ||
+    config.name.length > 200
+  )
+    return `name fehlt oder ungültig (id ${config.id})`;
+  for (const feld of [
+    'emoji',
+    'description',
+    'language',
+    'framework',
+    'entrypoint',
+    'command',
+    'commandResolved',
+    'guildId',
+    'depsCheck',
+    'depsInstall',
+    'cwd',
+    'workspaceRoot',
+  ]) {
+    const wert = config[feld];
+    if (wert === undefined) continue;
+    if (typeof wert !== 'string')
+      return `${feld} ist kein Text (id ${config.id})`;
+    if (wert.length > 4096) return `${feld} ist zu lang (id ${config.id})`;
+  }
+  // Pfadfelder dürfen den Hub-Rahmen nicht verlassen – absolut oder mit
+  // Ausstieg ist kein gültiger Workspace-Ausdruck, egal woher er stammt.
+  for (const feld of ['cwd', 'workspaceRoot']) {
+    const wert = config[feld];
+    if (typeof wert !== 'string' || !wert) continue;
+    if (
+      isAbsolute(wert) ||
+      wert.split(/[\\/]/).includes('..') ||
+      wert.startsWith('~')
+    )
+      return `${feld} verlässt den Workspace (id ${config.id})`;
+  }
+  for (const feld of ['env', 'secretEnv', 'panel']) {
+    const wert = config[feld];
+    if (wert === undefined) continue;
+    if (!wert || typeof wert !== 'object' || Array.isArray(wert))
+      return `${feld} ist kein Objekt (id ${config.id})`;
+  }
+  if (
+    config.secretKeys !== undefined &&
+    !(
+      Array.isArray(config.secretKeys) &&
+      config.secretKeys.every((key) => typeof key === 'string')
+    )
+  )
+    return `secretKeys ist keine Textliste (id ${config.id})`;
+  return '';
+};
+
 const load = () => {
   // Reste abgebrochener Schreibvorgänge enthalten vollständige Geheimnisse.
   cleanupTempEnvFiles(join(PROJECT_ROOT, 'data', 'secrets'));
@@ -1634,19 +2145,36 @@ const load = () => {
     if (!Array.isArray(parsed)) return;
     // Enthielt bots.json noch Geheimnisse, werden sie jetzt in data/secrets
     // gesichert und die Datei anschließend ohne Werte neu geschrieben.
-    const withSecrets = parsed.some(
-      (config) =>
-        Object.keys(config?.secretEnv ?? {}).length ||
-        Object.keys(config?.panel?.secretSettings ?? {}).length,
-    );
+    // Verschoben wird nur, was wirklich gesichert wurde (P0-A): ein Bot mit
+    // fehlgeschlagener Migration behält seine Legacy-Werte, sonst wären sie
+    // beim Umschreiben der Übersicht verloren.
+    let migratedAny = false;
+    let migrationFailed = false;
     for (const config of parsed.slice(0, MAX_BOTS)) {
-      if (!config?.id || !config?.name) continue;
+      const grund = ablehnungsgrund(config);
+      if (grund) {
+        // Ungültige Einträge werden übersprungen und gemeldet, statt den
+        // Start crashen zu lassen oder ungeprüfte Werte in Pfade zu schicken.
+        console.warn(`[hub] bots.json: Eintrag übersprungen – ${grund}`);
+        continue;
+      }
+      const hadLegacy =
+        Object.keys(config.secretEnv ?? {}).length > 0 ||
+        Object.keys(config.panel?.secretSettings ?? {}).length > 0;
       const bot = hydrate(config);
       bots.set(config.id, bot);
+      if (hadLegacy) {
+        if (bot.pendingLegacySecrets) migrationFailed = true;
+        else migratedAny = true;
+      }
       // Bestehende Bots ohne Webseite bekommen das Beispiel-Scaffold.
       // Idempotent: vorhandene bot-hub.json/panel-Dateien bleiben unangetastet.
       // Fehler werden geloggt, verhindern aber nie den Start (Verfügbarkeit
       // geht vor Beispielseite; der Bot selbst ist vollständig).
+      // P1-I: Bots im Delete-Recovery erhalten kein Scaffold und keine
+      // Dateiübernahme – sonst legt der Start neue Runtime-Dateien an, die
+      // der gleich anschließende Cleanup wegwerfen würde (oder die bleiben).
+      if (bot.deleteState !== 'active') continue;
       try {
         // Alte kaputte Hub-Scaffolds (V1) zuerst migrieren – nur eindeutig
         // Hub-generierte Dateien, niemals eigene Seiten. Danach erzeugt das
@@ -1668,12 +2196,19 @@ const load = () => {
         );
       }
     }
-    if (withSecrets) {
-      schedulePersist();
+    // Force-Persistenz: die Datenquelle ist migriert, aber kein Bot ist
+    // "dirty" – ohne force würde flush() die Bereinigung von bots.json
+    // überspringen und die Klartext-Secrets blieben stehen.
+    if (migratedAny) {
+      schedulePersist(true);
       console.warn(
         '[hub] Geheimnisse aus bots.json nach data/secrets verschoben.',
       );
     }
+    if (migrationFailed)
+      console.warn(
+        '[hub] Einige Secret-Migrationen waren nicht sicher abzuschließen; die betroffenen Werte bleiben bis zum Erfolg in bots.json erhalten.',
+      );
   } catch (error) {
     console.error('[hub] bots.json unlesbar:', error.message);
   }
@@ -1964,7 +2499,7 @@ const handleFileRoutes = async (req, res, url, bot) => {
   const pfad = rest
     .split('/')
     .filter(Boolean)
-    .map((teil) => decodeURIComponent(teil))
+    .map((teil) => safeDecode(teil))
     .join('/');
 
   /** Der Ordner, den eine Liste zeigen soll – aus der Anfrage, sonst die Wurzel. */
@@ -2027,7 +2562,10 @@ const handleFileRoutes = async (req, res, url, bot) => {
     return sendJson(res, 200, { pfad, ...datei });
   }
   if (req.method === 'PUT') {
+    // Bot-Dateien können durch eigene Startbefehle oder Paket-Skripte
+    // ausführbar sein. Quelltext ändern ist deshalb auch eine Laufzeitaktion.
     braucht('files.write');
+    braucht('bots.control');
     const slot = takeUploadSlot(req, url);
     if (slot instanceof Error) throw slot;
     // withBotLock serialisiert COUNT → prüfen → write (race-safe Quota).
@@ -2200,6 +2738,9 @@ const handleApi = async (req, res, url) => {
       res.__sseIp = ip;
       res.__sseSession = sessionMatch;
     }
+    // Die Anfrage bleibt am Client gespeichert: Log-Ereignisse werden pro Bot
+    // gegen die logs.read-Rechte genau dieses Clients gefiltert.
+    res.__sseReq = req;
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-store',
@@ -2258,53 +2799,88 @@ const handleApi = async (req, res, url) => {
         return sendJson(res, 200, { bots: [...bots.values()].map(publicBot) });
       if (req.method === 'POST') {
         permission('bots.manage');
-        if (bots.size >= MAX_BOTS)
-          throw httpError(429, `Maximal ${MAX_BOTS} Bots`);
+        // Body erst vollständig lesen und validieren, bevor ein Slot belegt
+        // wird. Ein langsamer oder ungültiger Request darf die Bot-Kapazität
+        // nicht während des gesamten Body-Uploads reservieren.
         const body = await readBody(req);
         const config = normaliseConfig(body, null);
-        const id = randomUUID();
-        if (process.env.BOT_HUB_TEST_MODE !== '1') {
-          const workspaceRoot = `bots/${id}/workspace`;
-          mkdirSync(resolve(PROJECT_ROOT, workspaceRoot), {
-            recursive: true,
-            mode: 0o700,
-          });
-          config.workspaceRoot = workspaceRoot;
-          if (!safeBotPath({ id, workspaceRoot }, config.cwd))
-            throw httpError(
-              400,
-              'Der Startordner muss im eigenen Workspace des Bots liegen',
-            );
-        }
-        const bot = hydrate({ ...config, id });
-        syncBotEnv(bot);
-        bots.set(id, bot);
-        // Neuer Bot: Beispiel-Webseite (bot-hub.json + panel/) anlegen,
-        // dann in den Workspace spiegeln. Bestehende Dateien bleiben.
-        // Fehler brechen das Anlegen nicht ab (der Bot ist auch ohne Beispiel
-        // vollständig), werden aber geloggt und in der Antwort gemeldet.
-        let scaffold = { created: [], skipped: [] };
+        // P1-H: Prüfen und Reserven in einem Synchronzug – zwischen `if` und
+        // `+=` darf kein await liegen, sonst sehen parallele Requests erneut
+        // dieselbe freie Kapazität.
+        if (bots.size + pendingBotCreations >= MAX_BOTS)
+          throw httpError(429, `Maximal ${MAX_BOTS} Bots`);
+        pendingBotCreations += 1;
+        let angelegterWorkspace = '';
         try {
-          scaffold = ensurePanelScaffold(bot, PROJECT_ROOT);
-          if (scaffold.error)
+          const id = randomUUID();
+          if (process.env.BOT_HUB_TEST_MODE !== '1') {
+            const workspaceRoot = `bots/${id}/workspace`;
+            mkdirSync(resolve(PROJECT_ROOT, workspaceRoot), {
+              recursive: true,
+              mode: 0o700,
+            });
+            angelegterWorkspace = workspaceRoot;
+            config.workspaceRoot = workspaceRoot;
+            if (!safeBotPath({ id, workspaceRoot }, config.cwd))
+              throw httpError(
+                400,
+                'Der Startordner muss im eigenen Workspace des Bots liegen',
+              );
+          }
+          const bot = hydrate({ ...config, id });
+          syncBotEnv(bot);
+          bots.set(id, bot);
+          // Ab hier zählt der Bot in `bots.size` mit – das Workspace gehört
+          // zum Bot und darf im Fehlerfall nicht mehr wegradiert werden.
+          angelegterWorkspace = '';
+          // Neuer Bot: Beispiel-Webseite (bot-hub.json + panel/) anlegen,
+          // dann in den Workspace spiegeln. Bestehende Dateien bleiben.
+          // Fehler brechen das Anlegen nicht ab (der Bot ist auch ohne Beispiel
+          // vollständig), werden aber geloggt und in der Antwort gemeldet.
+          let scaffold = { created: [], skipped: [] };
+          try {
+            scaffold = ensurePanelScaffold(bot, PROJECT_ROOT);
+            if (scaffold.error)
+              console.warn(
+                `[hub] Beispiel-Webseite für ${id} unvollständig: ${scaffold.error}`,
+              );
+          } catch (error) {
+            scaffold = {
+              created: [],
+              skipped: [],
+              error: error?.message ?? String(error),
+            };
             console.warn(
-              `[hub] Beispiel-Webseite für ${id} unvollständig: ${scaffold.error}`,
+              `[hub] Beispiel-Webseite für ${id} fehlgeschlagen: ${scaffold.error}`,
             );
+          }
+          uebernehmen(bot);
+          setStatus(bot, 'stopped');
+          const fresh = publicBot(bot);
+          broadcast('created', fresh);
+          return sendJson(res, 201, { bot: fresh, scaffold });
         } catch (error) {
-          scaffold = {
-            created: [],
-            skipped: [],
-            error: error?.message ?? String(error),
-          };
-          console.warn(
-            `[hub] Beispiel-Webseite für ${id} fehlgeschlagen: ${scaffold.error}`,
-          );
+          // Fehlgeschlagene Erstellung: das halbe Workspace wegräumen, damit
+          // kein verwaister Ordner ohne Bot-Eintrag zurückbleibt.
+          if (angelegterWorkspace) {
+            try {
+              rmSync(resolve(PROJECT_ROOT, angelegterWorkspace), {
+                recursive: true,
+                force: true,
+              });
+              rmSync(dirname(resolve(PROJECT_ROOT, angelegterWorkspace)), {
+                force: true,
+              });
+            } catch {
+              /* Aufräumen ist best-effort; der Slot wird trotzdem frei. */
+            }
+          }
+          throw error;
+        } finally {
+          // Der Slot wird in jedem Pfad freigegeben – nach bots.set zählt der
+          // Bot über die Map mit, vorher befreit der Fehlerfall die Reserve.
+          pendingBotCreations -= 1;
         }
-        uebernehmen(bot);
-        setStatus(bot, 'stopped');
-        const fresh = publicBot(bot);
-        broadcast('created', fresh);
-        return sendJson(res, 201, { bot: fresh, scaffold });
       }
       throw httpError(405, 'Methode nicht erlaubt');
     }
@@ -2346,13 +2922,23 @@ const handleApi = async (req, res, url) => {
     }
     if (!action && req.method === 'DELETE') {
       permission('bots.delete');
-      const result = await withBotLifecycleLock(bot.id, async () => {
-        assertNoDeleteInFlight(bot);
-        if (bots.get(bot.id) !== bot)
-          throw httpError(404, 'Bot nicht gefunden');
-        return deleteBotCompletely(bot, currentUser(req)?.id ?? null);
-      });
-      return sendJson(res, 200, result);
+      // P1-J: Vor dem Warten auf den Lifecycle-Lock die laufende Installation
+      // beenden und ihr Ende abfragen – sonst hängt DELETE hinter einer
+      // npm/pip-Installation, die Minuten laufen kann. deletePending sperrt
+      // derweil jede neue Installation und jeden weiteren Schritt.
+      deletePending.add(bot.id);
+      try {
+        await abortActiveOperation(bot);
+        const result = await withBotLifecycleLock(bot.id, async () => {
+          assertNoDeleteInFlight(bot);
+          if (bots.get(bot.id) !== bot)
+            throw httpError(404, 'Bot nicht gefunden');
+          return deleteBotCompletely(bot, currentUser(req)?.id ?? null);
+        });
+        return sendJson(res, 200, result);
+      } finally {
+        deletePending.delete(bot.id);
+      }
     }
     if (action === 'start' && req.method === 'POST') {
       permission('bots.control');
@@ -2385,6 +2971,10 @@ const handleApi = async (req, res, url) => {
 
     if (action === 'install' && req.method === 'POST') {
       permission('bots.manage');
+      // P1-J: Ein vorbereiteter oder laufender Delete blockiert neue
+      // Installationen schon vor der Antwort mit 202 – nicht erst in der
+      // Lock-Übernahme, die der Anfragende nie zu sehen bekäme.
+      assertNotDeleting(bot);
       const dir = safeBotPath(bot, bot.cwd);
       if (!dir)
         throw httpError(
@@ -2419,6 +3009,10 @@ const handleApi = async (req, res, url) => {
     }
     if (action === 'stop' && req.method === 'POST') {
       permission('bots.control');
+      // P1-J: Stop wartet nicht das Ende einer Installation ab – der
+      // Installationsprozess wird zuerst terminiert; der Lock wird dadurch
+      // in Sekunden frei, und stopBot räumt ohnehin final auf.
+      if (bot.busy) killTree(bot.busy, 'SIGTERM');
       const stopped = await withBotLifecycleLock(id, async () => {
         assertNotDeleting(bot);
         return stopBot(id);
@@ -2427,6 +3021,8 @@ const handleApi = async (req, res, url) => {
     }
     if (action === 'kill' && req.method === 'POST') {
       permission('bots.control');
+      // P1-J: wie stop, nur sofort hart.
+      if (bot.busy) killTree(bot.busy, 'SIGKILL');
       const stopped = await withBotLifecycleLock(id, async () => {
         assertNotDeleting(bot);
         return stopBot(id, { signal: 'SIGKILL' });
@@ -2524,7 +3120,20 @@ const handleApi = async (req, res, url) => {
         // Panel-API und Schreibzugriffe bleiben token-/sessiongeschützt.
         return handlePanelRoutes(bot, req, res, url, panelTokenAuth, true);
       }
-      if (panelTokenAuth) return handlePanelRoutes(bot, req, res, url, true);
+      if (panelTokenAuth)
+        // Das Panel-Token allein darf nur lesen sowie State und Meldungen
+        // senden. Einstellungen schreiben und Befehle ausführen verlangt
+        // zusätzlich die zentrale Hub-Sitzung mit panel.manage für
+        // diesen Bot; ohne sie antwortet die Panel-API mit 403.
+        return handlePanelRoutes(
+          bot,
+          req,
+          res,
+          url,
+          true,
+          false,
+          hasPermission(req, 'panel.manage', { botId: bot.id }),
+        );
       const panelLogout =
         req.method === 'POST' && /\/panel\/discord\/logout$/.test(url.pathname);
       permission(
@@ -2543,15 +3152,15 @@ const handleApi = async (req, res, url) => {
  * verhindert zusätzlich, dass eine fremde Seite das Dashboard einbettet und
  * dort Klicks auf Start, Stopp oder Löschen vortäuscht.
  */
-const APP_CSP = [
+export const APP_CSP = [
   "default-src 'none'",
   "script-src 'self'",
   "style-src 'self' 'unsafe-inline'",
-  "img-src 'self' data:",
+  "img-src 'self' data: blob:",
   "font-src 'self'",
   "connect-src 'self'",
   "form-action 'self'",
-  "base-uri 'none'",
+  "base-uri 'self'",
   "object-src 'none'",
   "frame-ancestors 'none'",
 ].join('; ');
@@ -2637,7 +3246,10 @@ const applyCors = (req, res, url) => {
     (isPanelStaticRoute(url.pathname) || isPanelApiRoute(url.pathname))
   ) {
     res.setHeader('access-control-allow-origin', 'null');
-    res.setHeader('access-control-allow-credentials', 'true');
+    // Kein allow-credentials: Die Bridge authentifiziert über die Header
+    // x-bot-hub-token und x-bot-hub-bootstrap, nie über Cookies. Mit
+    // Anmelde-Cookies wäre jede Sandbox-Seite beliebig vieler Herkunft
+    // ein Angreifer auf die Panel-API.
     res.setHeader(
       'access-control-allow-headers',
       'content-type, x-bot-hub-token, x-bot-hub-bootstrap',
@@ -2664,6 +3276,11 @@ export const createServer = () => {
       'camera=(), geolocation=(), microphone=(), payment=(), usb=()',
     );
     const url = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
+    // P1-G: Rate-Limit, Routing und Audit müssen denselben kanonischen Pfad
+    // sehen. Ein Request auf `/api//bots/` ist für alle drei genau `/api/bots`
+    // – nie ein zweiter, am Limit vorbeilaufender Pfad.
+    const canonical = canonicalPathname(url.pathname);
+    if (canonical !== url.pathname) url.pathname = canonical;
     if (!applyCors(req, res, url)) {
       res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' });
       return res.end(
@@ -2736,7 +3353,55 @@ configureAccess(ACCESS_FILE);
 
 export { stopAllBots };
 
+/**
+ * Beim sauberen Herunterfahren darf ein ausstehender Persistenz-Timer nicht
+ * verloren gehen: ein Delete oder eine Secret-Migration, deren Flush noch in
+ * den 250 ms wartete, wäre sonst weg. `strict` meldet einen Schreibfehler,
+ * damit der Betreiber ihn sieht, statt dass der Prozess ihn verschluckt.
+ */
+export const flushPersist = () => {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  flush(true);
+};
+
 /* Nur für Tests: die beiden Stellen, an denen ein Befehl oder eine
  * Installationsfolge entsteht. Beides entscheidet, was ein Bot ausführen darf,
  * und gehört damit in den Test statt nur in den Betrieb. */
-export const __testing = { commandSpec, resolveInstallPlan, installLabel };
+export const __testing = {
+  commandSpec,
+  resolveInstallPlan,
+  installLabel,
+  broadcast,
+  redactLogSecrets,
+  pushLine,
+  ablehnungsgrund,
+  sseListeners: listeners,
+  botMap: bots,
+  // P1-G/P1-H/P1-J: Helfer, deren Korrektheit direkt getestet wird, ohne sie
+  // über HTTP zu erraten. canonicalPathname beweist die Bucket-Kollaps,
+  // MAX_BOTS/creatingReserve die Obergrenze, isDeleteLocked den Abbruch.
+  canonicalPathname,
+  rateLimitPath,
+  MAX_BOTS,
+  // V25b: rein additive Test-Zugänge für Bucket-Verdrängung, Log-Rate-
+  // Klasse und Wert-Redaktion – kein Verhalten ändert sich dadurch.
+  takeRateBucket,
+  rateBuckets,
+  MAX_RATE_BUCKETS,
+  rateLimit,
+  redactKnownSecretValues,
+  // F-2: publicBot als Test-Zugang, damit die Serialisierung (kein
+  // runtimeToken-Leak) direkt geprüft werden kann – rein additiv.
+  publicBot,
+  isDeleteLocked,
+  deletePending,
+  deletingBots,
+  pendingCreations: () => pendingBotCreations,
+  flush,
+  schedulePersist,
+  dirtySet: dirty,
+  toFile,
+};

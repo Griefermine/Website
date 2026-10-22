@@ -1,0 +1,14 @@
+#!/usr/sbin/nft -f
+
+# Der interne Docker-Bridge-Gateway ist aus dem Bot-Netz erreichbar. Diese
+# Regel sperrt Verbindungen von Bots zu allen Diensten auf dem Host.
+add table inet bot_hub_guard
+add chain inet bot_hub_guard input { type filter hook input priority -10; policy accept; }
+add rule inet bot_hub_guard input iifname "br-bothubdisc" tcp dport 8788 accept
+add rule inet bot_hub_guard input iifname "br-bothubdisc" ip daddr 172.30.250.1 tcp dport 3128 accept
+add rule inet bot_hub_guard input iifname "br-bothubdisc" drop
+add rule inet bot_hub_guard input iifname "br-bothubdeps" ip daddr 172.30.251.1 tcp dport 3128 accept
+# Dependency runners may use Squid, but must never reach other host services.
+add rule inet bot_hub_guard input iifname "br-bothubdeps" drop
+# Squid and the Bot API must never be reachable through any other interface.
+add rule inet bot_hub_guard input iifname != "lo" tcp dport { 3128, 3129, 3130, 3131, 8788 } drop

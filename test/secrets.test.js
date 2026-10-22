@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import {
   existsSync,
@@ -112,11 +113,16 @@ describe('Migration der Geheimnisse aus bots.json', () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), 'bot-hub-secrets-'));
     mkdirSync(join(root, 'worker'), { recursive: true });
-    // Gibt das geheime Feld aus: so lässt sich prüfen, ob der Wert wirklich
-    // bis in den Prozess ankommt.
+    // Gibt einen Fingerabdruck (sha256, gekürzt) des geheimen Feldes aus:
+    // so lässt sich prüfen, ob der Wert wirklich bis in den Prozess
+    // ankommt, ohne ihn im Klartext in die Log-Pipeline zu schreiben. Seit
+    // V25b redigiert der Hub jeden bekannten Secret-Wert im Log (manager.js,
+    // „pushLine“; dokumentiert in documents/sicherheit.md) – der rohe Wert
+    // wäre dort nicht mehr auffindbar, und genau das soll hier auch nicht
+    // versucht werden.
     writeFileSync(
       join(root, 'worker', 'bot.sh'),
-      'printf "geheim=%s\\n" "$BOT_HUB_SETTING_API_KEY"\nsleep 30\n',
+      'printf "geheim-hash %s\\n" "$(printf "%s" "$BOT_HUB_SETTING_API_KEY" | sha256sum | cut -c1-16)"\nsleep 30\n',
     );
     // Manifest mit einem geheimen Feld – sonst kennt das Panel keinen Wert.
     writeFileSync(
@@ -132,6 +138,9 @@ describe('Migration der Geheimnisse aus bots.json', () => {
       }),
     );
     mkdirSync(join(root, 'data'), { recursive: true });
+    // Auch ein bereits vorhandener, zu offener Ordner muss beim Schreiben
+    // auf die vorgesehene Berechtigung 0700 zurückgesetzt werden.
+    mkdirSync(join(root, 'data', 'secrets'), { recursive: true, mode: 0o755 });
     writeFileSync(
       join(root, 'data', 'bots.json'),
       `${JSON.stringify(
@@ -181,6 +190,7 @@ describe('Migration der Geheimnisse aus bots.json', () => {
 
     // Die Datei mit 0600 führt beide Werte.
     const secretPath = join(root, 'data', 'secrets', `${botId}.env`);
+    assert.equal(statSync(join(root, 'data', 'secrets')).mode & 0o777, 0o700);
     assert.equal(statSync(secretPath).mode & 0o777, 0o600);
     const stored = readFileSync(secretPath, 'utf8');
     assert.match(stored, /DISCORD_BOT_TOKEN="MTIzNDU2/);
@@ -218,17 +228,132 @@ describe('Migration der Geheimnisse aus bots.json', () => {
       'neues Geheimnis in bots.json',
     );
 
-    // 3. Neustart: der Prozess muss den Wert wieder vorfinden.
+    // 3. Neustart: der Prozess muss den Wert wieder vorfinden. Nachgewiesen
+    //    wird das über den Fingerabdruck – der Klartextwert darf im Log gar
+    //    nicht erst auftauchen (V25b-Redaktion, siehe documents/sicherheit.md).
     const start = await startHub(root, 'start');
     assert.equal(start.code, 0, start.err);
     const lines = JSON.parse(start.out)
       .logs.lines.map((line) => line.text)
       .join('\n');
-    assert.match(
-      lines,
-      /neues-geheimnis/,
+    const fingerabdruck = createHash('sha256')
+      .update('neues-geheimnis')
+      .digest('hex')
+      .slice(0, 16);
+    assert.ok(
+      lines.includes(`geheim-hash ${fingerabdruck}`),
       'geheimes Panel-Feld kam beim Prozess nicht an',
     );
+    // Die Sicherheitsaussage bleibt ausdrücklich erhalten: Kein Klartext
+    // im Log – weder der rotierte Wert noch der alte aus der Migration.
+    assert.ok(
+      !lines.includes('neues-geheimnis'),
+      'roter Wert des neuen Geheimnisses im Log',
+    );
+    assert.ok(
+      !lines.includes('panel-geheimnis'),
+      'roter Wert des alten Geheimnisses im Log',
+    );
+
+    // 4. Zweiter vollständiger Neustart (P0-A): die Rotation bleibt kanonisch –
+    //    auch gegenüber etwaigen Legacy-Resten in bots.json.
+    assert.equal((await startHub(root, 'read')).code, 0);
+    const stored = readFileSync(
+      join(root, 'data', 'secrets', `${botId}.env`),
+      'utf8',
+    );
+    assert.match(stored, /API_KEY="neues-geheimnis"/);
+    assert.ok(
+      !stored.includes('panel-geheimnis'),
+      'alter Wert hat die Rotation zurückgesetzt',
+    );
+    const botsFile = readFileSync(join(root, 'data', 'bots.json'), 'utf8');
+    assert.ok(!botsFile.includes('neues-geheimnis'));
+    assert.ok(!botsFile.includes('panel-geheimnis'));
+    assert.ok(!botsFile.includes('altesGeheimnis'));
+  });
+
+  it('ein älterer Legacy-Wert überschreibt keinen neueren Datei-Wert', async () => {
+    // Szenario aus P0-A: Migration war schon einmal erfolgreich und das
+    // Panel-Geheimnis wurde rotiert, aber bots.json enthält noch den alten
+    // Legacy-Wert (z. B. weil die Bereinigung damals fehlschlug). Beim
+    // nächsten Start darf der ALTE Wert den NEUEN aus der Secret-Datei nie
+    // zurücksetzen.
+    mkdirSync(join(root, 'data', 'secrets'), { recursive: true, mode: 0o700 });
+    writeFileSync(
+      join(root, 'data', 'secrets', `${botId}.env`),
+      'DISCORD_BOT_TOKEN="neu-rotiert"\nAPI_KEY="panel-neu"\n',
+      { mode: 0o600 },
+    );
+    const { code, out, err } = await startHub(root);
+    assert.equal(code, 0, err);
+
+    const stored = readFileSync(
+      join(root, 'data', 'secrets', `${botId}.env`),
+      'utf8',
+    );
+    assert.match(stored, /DISCORD_BOT_TOKEN="neu-rotiert"/);
+    assert.match(stored, /API_KEY="panel-neu"/);
+    assert.ok(
+      !stored.includes('altesGeheimnis'),
+      'Legacy-Token hat die Rotation überschrieben',
+    );
+    assert.ok(
+      !stored.includes('panel-geheimnis'),
+      'Legacy-Panel-Wert hat die Rotation überschrieben',
+    );
+
+    // Die kanonischen Werte erreichen auch den Bot-Prozess, nicht die alten:
+    const { bots } = JSON.parse(out).list;
+    const bot = bots.find((item) => item.id === botId);
+    assert.ok(bot);
+    // Nach außen bleibt alles maskiert.
+    assert.equal(bot.secretEnv.DISCORD_BOT_TOKEN, '••••••••');
+    // und bots.json wird endgültig bereinigt.
+    const botsFile = readFileSync(join(root, 'data', 'bots.json'), 'utf8');
+    assert.ok(!botsFile.includes('altesGeheimnis'));
+    assert.ok(!botsFile.includes('panel-geheimnis'));
+  });
+
+  it('Schreibfehler in data/secrets lässt Werte erhalten und meldet keinen Erfolg', async () => {
+    // Das Secret-Verzeichnis ist durch eine reguläre Datei blockiert –
+    // storeSecretValues muss scheitern. Die Legacy-Werte dürfen dann weder
+    // aus bots.json verschwinden (Datenverlust!) noch darf eine erfolgreiche
+    // Migration behauptet werden.
+    rmSync(join(root, 'data', 'secrets'), { recursive: true, force: true });
+    writeFileSync(join(root, 'data', 'secrets'), 'blockiert\n');
+    const { code, out, err } = await startHub(root);
+    assert.equal(code, 0, err); // Der Hub startet trotz Fehler weiter
+    assert.match(err, /konnten nicht in data\/secrets gesichert werden/);
+    // Keine Erfolgsmeldung, kein Leak der Werte in Log oder API-Ausgabe.
+    assert.ok(
+      !out.includes('verschoben') &&
+        !err.includes('nach data/secrets verschoben'),
+      'Scanner meldet Erfolg, obwohl nichts gesichert wurde',
+    );
+    assert.ok(!out.includes('altesGeheimnis'), 'Token in API-Ausgabe');
+    assert.ok(!err.includes('altesGeheimnis'), 'Token im Log');
+    assert.ok(!err.includes('panel-geheimnis'), 'Panel-Wert im Log');
+
+    // Werteübernahme: bots.json behält die Legacy-Werte, bis die Migration
+    // gelingt – 400 ms warten, ob der Persistenz-Timer etwas kaputtschreibt.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const botsFile = readFileSync(join(root, 'data', 'bots.json'), 'utf8');
+    assert.ok(
+      botsFile.includes('altesGeheimnis'),
+      'Werte durch fehlgeschlagene Migration verloren',
+    );
+    assert.ok(
+      botsFile.includes('panel-geheimnis'),
+      'Panel-Wert durch fehlgeschlagene Migration verloren',
+    );
+
+    // Der Bot ist trotzdem nutzbar: Werte im Speicher, nach außen maskiert.
+    const { bots } = JSON.parse(out).list;
+    const bot = bots.find((item) => item.id === botId);
+    assert.equal(bot.secretEnv.DISCORD_BOT_TOKEN, '••••••••');
+    assert.equal(bot.panel.secrets.api_key, '••••••••');
+    assert.ok(!out.includes('pendingLegacySecrets'), 'interner Marker leakt');
   });
 });
 

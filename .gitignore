@@ -36,3 +36,5 @@ data/secrets/
 # Vom Bot erzeugter Bytecode
 __pycache__/
 *.pyc
+# Release-Ausgaben (P0-C): das Artefakt selbst gehört nicht ins Repo
+release/

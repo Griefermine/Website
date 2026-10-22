@@ -303,12 +303,26 @@ describe('Bot-Hub API', () => {
     });
 
     await call(`/bots/${bot.id}/start`, { method: 'POST' });
-    const running = await waitForStatus(bot.id, ['running', 'error']);
+    // Der Venv-Aufbau installiert discord.py samt aiohttp-Baum über PyPI.
+    // Das ist echter Netzwerkzugriff und läuft auf kühlem Cache schon mal
+    // Minuten; der Hub selbst gibt Installationen 15 Minuten. Nur das Warten
+    // ist hier großzügiger – geprüft wird weiterhin dasselbe Verhalten.
+    const running = await waitForStatus(bot.id, ['running', 'error'], 300_000);
     assert.equal(running.status, 'running');
     assert.ok(existsSync(join(root, cwd, '.venv', 'bin', 'python3')));
 
-    const { data: logs } = await call(`/bots/${bot.id}/logs?tail=60`);
-    const texts = logs.lines.map((line) => line.text);
+    // Der Status „running“ tritt beim Spawn ein; das Skript braucht unter Last
+    // einen Moment bis zur ersten Ausgabe. Ein einmaliges Log-Lesen wäre ein
+    // Wettlauf mit dem stdout – hier wird auf die Berichtzeilen gewartet,
+    // geprüft wird weiterhin mit exakt denselben Assertions.
+    let texts = [];
+    const wartestart = Date.now();
+    while (Date.now() - wartestart < 15_000) {
+      const { data: logs } = await call(`/bots/${bot.id}/logs?tail=60`);
+      texts = logs.lines.map((line) => line.text);
+      if (texts.some((text) => text.startsWith('executable='))) break;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
     assert.ok(
       texts.some((text) => text.includes('.venv bereit')),
       'venv wurde nicht angelegt',

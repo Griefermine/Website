@@ -30,7 +30,26 @@ Arbeitsverzeichnis ist über `.gitignore` ausgeschlossen und würde nie
 committet, sie zu melden hieße, immer dasselbe zu melden. Findet der Scan
 etwas, bricht er mit Exit-Code 1 ab und nennt Datei und Zeile – nie den Wert
 selbst. Ein Geheimnis, das einmal committet wurde, bleibt in der Historie und
-ist durch Löschen der Datei nicht weg; es gehört rotiert.
+ist durch Löschen der Datei nicht weg; es gehört rotiert. Für diese Frage gibt es
+`npm run release:scan:history`: geprüft wird jeder Blob, den die Historie kennt,
+mit den Pfaden aus `ls-tree` je Commit – nicht aus der Objektliste, die Inhalte
+dem falschen Dateinamen zuordnen würde. Grenzen und Ablauf stehen in
+`release.md`.
+
+Der Repo-Scan beantwortet aber nicht die Frage, was in einem Archiv landet.
+Dafür ist `npm run release:build` da: es kopiert nach der Liste
+`scripts/release-manifest.json` in ein leeres Verzeichnis, legt daraus
+`release/bot-hub-release.tar.gz` und scannt genau dieses Archiv, bevor es als
+freigegeben gilt (`node scripts/release-scan.mjs --artifact <pfad>` für ein
+vorhandenes). Artefakt-Modus heißt: **nur was in der Liste steht, ist erlaubt** –
+nicht „alles außer bekannten Gefahren“. Ablauf, Inhalt und Prüfsumme stehen in
+`release.md`. Zusätzlich geprüft werden Pfade, die
+nach der Normalisierung aus dem Zielverzeichnis ausbrechen (`..`,
+absolut, Symlinks, harte Links), verschachtelte Archive, die ein Entpacken
+aufblähen würden, und Geheimnisse in den Dateien selbst. Der Scanner liest ZIP
+und `tar.gz` selbst im Speicher; es wird nichts ausgepackt. Exit-Codes: 0
+freigegeben, 1 Findings, 2 bedienter Fehler (fehlende Datei, kein Leserecht) –
+ein Abbruch wegen eigener Schäden ist nie ein „grün“.
 
 ```dotenv
 DISCORD_BOT_TOKEN="…"
@@ -56,6 +75,22 @@ Speicher ein. Frühere Stände, bei denen die Werte noch in `bots.json` standen,
 wird er beim ersten Start einmalig umgezogen: erst in die Datei mit `0600`,
 danach wird `bots.json` ohne Werte neu geschrieben. An der API ändert sich
 nichts – dort waren die Werte schon vorher maskiert (`••••••••`).
+
+Die Datei in `data/secrets/` ist dabei die **einzige Wahrheit**. Ein alter Wert
+in `bots.json` kann sie nicht überdecken: beim Umzug gewinnt immer, was schon in
+der Datei steht, die Legacy-Werte dienen nur dem ersten Anlegen. Schlägt der
+Umzug fehl (Platte voll, Rechte falsch), bleiben die Werte erhalten: der Bot
+behält sie so lange in `bots.json`, wie seine Secret-Datei nicht geschrieben ist,
+und erst der erfolgreiche Schreibvorgang nimmt sie heraus. Etwas anderes wäre
+verkehrt – Werte, die nur im RAM lägen, wären nach dem nächsten Neustart weg,
+und ein verlorener Bot-Token ist nicht wiederherstellbar. Nach außen ändert sich
+dadurch nichts: die API maskiert auch diese Werte, und die Logs redigieren sie.
+Die Redaktion der Logs ist zweistufig: Muster (`KEY=…`, `Bearer …`) werden
+überdeckt, und zusätzlich wird jeder konkrete Secret-Wert des Bots ersetzt, den
+der Hub kennt (`secretEnv`, geheime Panel-Felder, das Runtime-Token des Panels,
+ab acht Zeichen Länge, längste zuerst) – druckt ein Bot seinen Token roh in die
+Ausgabe, steht er nicht im Log. Das Runtime-Token selbst verlässt den Prozess
+nie: es steht nicht in `bots.json` und nicht in einer API-Antwort.
 
 Nach außen gilt unverändert: ein Geheimnis verlässt den Server nur maskiert
 (`••••••••`). Die echten Werte bekommt ausschließlich der Prozess des Bots:
@@ -270,12 +305,75 @@ Zwei weitere Prüfungen können den Start verhindern:
   Grundeinstellung bleibt veränderlich, damit ein Betrieb nicht an einem fehlenden
   Digest-Pin stehen bleibt. Ein ausgedachter Digest wäre schlimmer als keiner:
   er lässt jeden Pull scheitern, ohne erkennbar zu sein, warum.
+- **`data/secrets/` mit fremden Rechten.** Secret-Dateien werden mit `0600`
+  angelegt; das nützt nichts, wenn das Verzeichnis sie offen hält. In Produktion
+  ist ein `data/secrets/`, das andere Benutzer lesen **oder die Gruppe schreiben**
+  darf, ein Abbruch („Bitte auf 700 setzen“), nicht mehr nur ein Hinweis. Ebenso
+  abgelehnt: ein Symlink anstelle des Verzeichnisses (gemessen würde das Ziel,
+  schützen will man den Pfad) und ein Verzeichnis, das nicht dem Benutzer des
+  Hub-Prozesses gehört. Außerhalb der Produktion bleibt beides eine Warnung, damit
+  eine Entwicklungsmaschine mit ungewöhnlichen Rechten nicht steht. Geprüft werden
+  auch `data/` und `data/db/` – dort liegen Bot-Speicher und `bots.json`; für sie
+  gibt es in Produktion eine Warnung, keinen Abbruch. Was der Hub nicht sehen
+  kann, prüft der Host: POSIX-ACLs (`getfacl data/secrets`), die Gruppen des
+  Servicekontos (`id -Gn`), Backup-Ziele derselben Dateien und die Frage, wer
+  außerhalb dieses Kontos auf den Pfad schreiben darf. Die Kommandos dafür stehen
+  in `release.md`.
+
+Der Standard-Bind ist in **allen** Modi `127.0.0.1`. `HOST` verschiebt ihn:
+außerhalb von Tests mit einer Warnung, in Produktion als Abbruch – der Hub
+spricht HTTP und gehört vor einen TLS-Reverse-Proxy, der selbst nur auf
+`127.0.0.1` lauscht. Ein Hub, der „nur zum Testen“ auf `0.0.0.0` hängt, ist im
+eigenen Netz dasselbe Risiko wie in Produktion: Anmeldung und Panel sind für
+jede Person dort erreichbar.
+
+Alle diese Regeln stehen in `server/preflight.js`. Der Test
+`test/preflight.test.js` prüft die Entscheidungen, `test/startup.test.js` den
+Weg durch einen echten Start.
 
 Vor dem Start kommen noch Warnungen, die den Betrieb nicht aufhalten: belegte
 Geheimnisse in `.env`, ein für andere Benutzer lesbares `data/secrets/`, ein
 vorhandener Docker-Socket. Sie messen am Projekt-Root (`BOT_DASHBOARD_ROOT`),
 nicht am Arbeitsverzeichnis – eine Prüfung am falschen Verzeichnis hält eine
 Fehlkonfiguration für eine richtige.
+
+## Ratenbegrenzung und ein Pfad, eine Zählung
+
+Der Hub zählt pro Minute und nach zwei Achsen: der Adresse des Anfragenden und,
+wenn angemeldet, zusätzlich der Person. Eine Antwort mit `429` nennt in
+`retry-after`, wann es weitergeht.
+
+| Bereich                                               | Grenze |
+| ----------------------------------------------------- | -----: |
+| Discord-Anmeldung (`/api/auth/discord/…`)             |     30 |
+| Panel-Anmeldung (Login und Callback im Bot-Panel)     |     10 |
+| Aktionen (Panel-Befehle, `start`/`restart`/`install`) |     60 |
+| Bot-API (`/api/hub/…`)                                |    120 |
+| Dateiendpunkte                                        |     60 |
+| Bots anlegen (`POST /api/bots`)                       |     10 |
+| Bots löschen (`DELETE /api/bots/<id>`)                |     20 |
+| Bot ändern (`PATCH /api/bots/<id>`)                   |     60 |
+| Rechte ändern (`/api/access/…`)                       |     30 |
+| Log-Endpunkte (`/api/logs`, `/api/bots/<id>/logs`)    |    300 |
+
+Entscheidend ist, **welcher Pfad gezählt wird**. Gezählt wird dieselbe Form, die
+auch das Routing sieht: doppelte und abschließende Schrägstriche werden
+zusammengefasst, und jedes Segment genau **einmal** prozent-dekodiert. Ohne das wäre
+`/api/%62ots` für den Limiter ein unbekannter Pfad (grenzenlos) und für den
+Router `bots` – ein Encoder-Trick als Freifahrtschein. Doppelte Kodierung
+(`%2562…`) löst beim Limiter zu `%62…` auf und bleibt damit ein anderer Pfad: er
+trifft keinen fremden Bucket und wird später ohnehin abgewiesen.
+
+Zwei weitere Grenzen halten die Begrenzer selbst klein: höchstens 10 000 Eimer.
+Ist die Tabelle voll, werden zuerst abgelaufene Eimer eingesammelt und, wenn das
+nicht reicht, der am längsten unbeachtete Eimer verdrängt – so sperrt ein einziger
+fleißiger Nutzer nicht alle Neuen aus. Erst wenn danach immer noch kein Platz
+ist, gibt es `429` (abgewiesen statt Speicher fressend); bestehende Eimer behalten
+ihren Zähler. Und `BOT_HUB_MAX_BOTS` (Standard 24) begrenzt, wie
+viele Bots ein Hub verwaltet. Die Obergrenze wird **vor** dem ersten Warten
+reserviert, nicht danach: sonst legen acht gleichzeitige Anfragen acht Bots an, weil
+sieben von ihnen die Zahl noch unbesetzt sehen. Ein Anlegen, das später
+scheitert, gibt seinen Platz wieder frei.
 
 ## Callback-Adressen
 
@@ -295,14 +393,30 @@ beliebige Adressen aus:
   Eintrag in der Antwort würde sonst genügen, um die Schranke zu umgehen;
 - geprüft wird wieder bei jedem Aufruf, nicht nur bei der Anmeldung. Zwischen
   beiden Zeitpunkten kann sich ein DNS-Eintrag geändert haben;
+- die Verbindung wird auf genau die Adresse festgelegt (gepinnt), die vorher
+  geprüft wurde. Ohne das wäre zwischen Prüfung und Socket ein Fenster für
+  DNS-Rebinding: die Prüfung sähe eine öffentliche Adresse, der Socket verbände
+  sich mit `127.0.0.1`. Nur wenn der Produktions-Egress-Proxy aktiv ist, entfällt
+  der Pin – dort prüft Squid die Zieladresse beim Verbinden selbst. Bei
+  Zweifel an der Proxysituation wird immer gepinnt;
+- im Container-Betrieb sind Loopback-Ziele komplett abgelehnt (Registrierung
+  wie Aufruf). Der Loopback eines Containers ist nicht der Loopback des Hosts –
+  der Umweg über den Hub wäre ein Lesekanal auf die lokalen Dienste des Hosts;
 - Redirects werden nicht verfolgt. Sonst hebt ein Callback auf dem localhost die
   Schranke auf und der Hub ruft das eigentliche Ziel doch auf.
 
-Für Container, deren Loopback der Hub nicht teilt, gibt es
-`BOT_HUB_CALLBACK_ALLOW=host:port,host`. Der Eintrag ist eine bewusste
-Ausnahme: Der Hub ruft dann auch Ziele außerhalb des eigenen Rechners auf, und
-der Betreiber trägt diese Verantwortung. Eine angemeldete Adresse gilt eine
-Stunde und ist an die Bot-ID gebunden; 30 Aufrufe je Bot und Minute.
+Für Container, deren Loopback der Hub nicht teilt, sind externe Ziele eine
+bewusste Ausnahme. In Entwicklung dient `BOT_HUB_CALLBACK_ALLOW`; Produktion
+verwendet ausschließlich die root-eigene Datei
+`/etc/bot-hub/callback-egress.allow`, die mit `--callback-host` im UFW-Setup
+gepflegt wird. Hub und Squid nutzen dieselbe Allowlist. Externe Ziele müssen
+exakte DNS-Namen sein und HTTPS auf Port 443 verwenden. Private Ziele sind nur
+über einen ausdrücklich freigegebenen Callback-Namen erreichbar; Loopback,
+Link-Local, bekannte Cloud-Metadaten-Adressen, das Well-Known-NAT64-Netz
+(`64:ff9b::/96`, das Metadaten-Adressen übersetzen kann) und das
+Discard-Netz (`100::/64`) bleiben gesperrt. Eine
+angemeldete Adresse gilt eine Stunde und ist an die Bot-ID gebunden; 30 Aufrufe
+je Bot und Minute.
 
 ## Startordner
 
@@ -333,7 +447,100 @@ der Betreiber pflegt, `bots/<id>/workspace/` ist die Kopie, die als
   entfernt wird. Der Bot sieht sie nicht; sie ist kein Geheimnis, sondern eine
   Liste von Pfaden.
 
+## Löschen, das aufräumt
+
+Ein Bot-Löschvorgang ist ein Zustand, kein Ereignis: `deleteState` steht in
+`bots.json`, bevor der erste Ordner verschwindet, und das Löschen ist
+idempotent – es kann beliebig oft wiederholt werden.
+
+- **Löschen wartet nicht auf eine Installation.** Eine laufende Installation hält
+  das Workspace-Schloss. Würde das Löschen darauf warten, hinge die Oberfläche
+  Minuten (eine `pip install`-Sperre kann Stunden dauern). Stattdessen: Delete
+  markiert den Bot als „Löschen vorbereitet“, beendet den Installationsprozess
+  (`SIGTERM`, nach fünf Sekunden `SIGKILL`), wartet auf sein Ende und übernimmt
+  erst dann das Schloss. Zwischen zwei Installationsschritten wird dieselbe
+  Markierung geprüft; eine Installation, die während des Löschens weiterlaufen
+  wollte, gibt auf. Endet der Prozess auch nach `SIGKILL` nicht, wird das
+  Löschen abgelehnt (409) statt aufzuräumen: ein Cleanup unter einem noch
+  schreibenden Prozess würde einen halben Workspace hinterlassen.
+- **Nach dem endgültigen Löschen schreibt nichts mehr.** Ist der Bot entfernt,
+  prüfen Start, Neustart, Installation und Dateiendpunkte die Markierung und
+  lehnen ab. Ein Prozess, der nach dem Entfernen noch Dateien anlegt, würde einen
+  Bot wieder zum Leben erwecken, den niemand mehr hat.
+- **Recovery läuft vor der Initialisierung.** Ein Bot, der beim Start im Zustand
+  `deleting` oder `cleanup_failed` aus `bots.json` kommt, bekommt **keinen**
+  Startordner, kein Panel-Scaffold, keine Dateiübernahme und keine
+  Secret-Datei. Er bekommt nur seine validierte Identität – und wird aufgeräumt.
+  Die Reihenfolge ist der eigentliche Punkt: würde erst normal initialisiert,
+  entstünde genau das Verzeichnis wieder, das das Recovery löschen will, und ein
+  Absturz mitten im Scaffold ließe einen halbfertigen Bot mit fremden Dateien
+  stehen (`cleanup_failed` mit Inhalt, der nie gelöscht werden kann).
+- **Ein abgebrochenes Löschen ist sichtbar.** Scheitert das Aufräumen (Platte,
+  Rechte, ein Prozess, der nicht weicht), bleibt `cleanup_failed` stehen und der
+  Hub räumt beim nächsten Start erneut auf. Ein Bot, der „gelöscht“ gemeldet
+  wurde, dessen Ordner aber noch da sind, ist kein gelöschter Bot – deshalb wird
+  der Zustand protokolliert statt vergessen.
+
+## Der Docker-Daemon ist der Host
+
+Der Hub startet Container, indem er die `docker`-Kommandozeile aufruft – ohne
+`DOCKER_HOST`, also am Standard-Socket des Rechners. Das hat eine Konsequenz,
+die nicht verhandelbar ist: **Zugriff auf den Daemon ist Zugriff auf den Host.**
+Ein Container mit `/var/run/docker.sock` setzt sich selbst Host-Rechte, mountet
+`/` und ist damit außerhalb jeder Grenze, die der Hub gezogen hat. Dass der
+Node-Prozess nicht als `root` läuft, ändert daran nichts – die Schranke ist die
+Socket-Berechtigung, nicht die Benutzerkennung des Hub-Prozesses.
+
+Daraus folgt, was beim Betrieb gilt:
+
+- **Kein Bot-Container bekommt den Socket.** Keine Volume-Angabe, kein Mount,
+  kein `-v /var/run/docker.sock:...`. Die Prüfung darauf ist Teil der
+  Container-Argumente (`test/containers.test.js` prüft Bot-Start UND den
+  Paket-Runner, ohne Docker zu brauchen).
+- **Keine erreichbar gemachte Docker-API.** Kein `DOCKER_HOST=tcp://…`, kein
+  Port 2375/2376, keine Fernsteuerung des Daemons. Der Daemon bleibt ein
+  lokaler Unix-Socket.
+- **Socket-Besitz und Rechte.** Gruppe des Sockets ist meist `docker`; jede
+  Person in dieser Gruppe ist faktisch Host-`root`. Mitgliederzahl klein halten,
+  keine Bot-Benutzer, keine automatischen Wartungsskripte mit dieser Gruppe.
+- **Empfohlener Betrieb: rootless.** Rootless Docker oder Podman in der
+  Rootless-Kurve verkleinern den Schaden eines entkommenen Prozesses erheblich.
+  Kompatibilität ist geprüft für: Netzwerke (selbst angelegte Bridge-Netze, keine
+  `--privileged`-Wege), Mounts (nur Workspace und geteilte Bibliothek),
+  Ressourcen (`--memory`, `--cpus`, `--pids-limit`), Benutzerabbild
+  (`--user <uid>:<gid>`). **Eingeschränkt** ist Dateisystem-Kontingent je
+  Workspace – das ist unabhängig vom Daemon offen (siehe unten).
+- **Der Hub ist ein einzelner Prozess mit drei Aufgaben.** Oberfläche,
+  Autorisierung und Container-Steuerung sitzen zusammen. Eine getrennte
+  Orchestrierungsschicht (kleiner Dienst mit festem Operationskatalog, eigene
+  Socket-ACL, eigene Benutzer) ist die saubere Trennung und hier **nicht**
+  umgesetzt – sie wäre eine Architekturänderung ohne Testgrundlage. Bis dahin:
+  der Hub-Prozess selbst ist das Angriffsziel, und er ist so gebaut, dass er
+  keine ungeprüften Argumente weiterreicht (Programm-Listen je Sprache,
+  Workspace-Pflicht für eigene Programme, kein Shell-Aufruf, keine
+  Evaluations-Flags).
+
+Was zusätzlich fehlt und als Risiko zählt: **keine Alarmierung auf unerwartete
+Container** und keine Audit-Spur für `docker`-Aufrufe außerhalb des Hubs. Der Hub
+protokollisiert seine eigenen Aktionen; was ein anderer Prozess über den Socket
+tut, sieht er nicht. Backups von `data/`, `bots/` und der Host-Konfiguration
+sind Sache des Betriebs – siehe `container-bots.md`.
+
 ## Was nicht abgesichert ist
+
+- **Der freie Platz auf der Platte wird nicht geprüft.** Der Hub prüft beim Anlegen, wie viele
+  Bots es werden (`BOT_HUB_MAX_BOTS`), aber nicht, wie viel Platz ihr Workspace
+  noch bekommt. Zwei Bots, die mit `pip` oder `npm` ihre Abhängigkeiten in den
+  Workspace holen, füllen die Platte des Hosts – und eine volle Platte legt nicht
+  nur diesen Hub lahm, sondern alles darauf. Eine harte Kontingentgrenze
+  (Quota je Workspace) ist bewusst nicht eingebaut: sie wäre nur mit
+  Dateisystem-Quota (`btrfs`/`xfs`-Projekte, `dm-setup`) tragfähig, und das ist
+  Sache des Betriebs, nicht des Hubs. Was der Hub tut, begrenzt den Schaden im Einzelfall:
+  Installationen laufen im Container mit Speicher- und Prozessgrenzen, und ein
+  voller Datenträger bricht die Installation mit einer deutlichen Meldung ab,
+  statt den Hub halbfertig zurückzulassen. **Wer fremde Bots
+  betreibt, muss das Kontingent außerhalb setzen** (eigenes Loop-Device oder
+  Dateisystem-Quota für `bots/`) – siehe `documents/container-bots.md`.
 
 - **Container ohne Netzwerk-Firewall.** Die Grenzen sind Benutzer, Rechte,
   Prozesse, Ressourcen und Mounts (siehe `container-bots.md`). Docker kann
@@ -367,18 +574,16 @@ der Betreiber pflegt, `bots/<id>/workspace/` ist die Kopie, die als
   Absenders. Für den Rückweg gilt weiter: ein Callback in einem fremden Browser
   wird abgewiesen, und die Autorisierung gilt nur für `guildId` plus
   Administrator/**Server verwalten**. Details in `discord-login.md`.
-- **`BOT_HUB_CALLBACK_ALLOW`.** Jeder Eintrag nimmt die Loopback-Schranke für
-  dieses Ziel aus. Damit ruft der Hub auch Adressen außerhalb des eigenen
-  Rechners auf, und ein Bot, der den Hub-Rechner kontrolliert, kann darüber
-  interne Dienste erreichen, die er sonst nicht sieht. Nur setzen, wenn das der
-  eigene Aufbau ist – ein Loopback, das beide Seiten teilen, braucht es nicht.
-- **`BOT_HUB_CONTAINER_URL`.** Der Eintrag `host.docker.internal` ist eine
-  bewusste Öffnung und gehört nur gesetzt, wenn ein Bot den Hub braucht.
-  Ohne diese Variable erreicht ein Bot-Prozess den Hub nicht: `127.0.0.1` ist im
-  Container der Container selbst. Der Hub weist beim Start darauf hin. Für
-  Meldungen aus einem Bot heraus (`/api/hub/state`, `/api/hub/notify`) ist also
-  entweder `BOT_HUB_CONTAINER_URL` zu setzen oder in `BOT_HUB_URL` eine Adresse
-  einzutragen, die auch aus dem Container erreichbar ist.
+- **Externe Callbacks.** Jeder Eintrag in der Produktions-Allowlist nimmt die
+  Loopback-Schranke für dieses Ziel aus. Hub und Squid begrenzen den Aufruf auf
+  den freigegebenen Host und HTTPS/443. Eine Kompromittierung des rootful
+  Docker-Daemons bleibt eine Host-Root-Vertrauensgrenze und kann die
+  Container-Isolation unterlaufen.
+- **`BOT_HUB_CONTAINER_URL`.** In Entwicklung kann `host.docker.internal` einem
+  Bot Zugriff auf Host-Dienste geben. In Produktion wird die Variable
+  abgelehnt. Dort gibt es einen getrennten, auf Port `8788` begrenzten Listener
+  für Bot-API-Aufrufe; nftables blockiert aus dem Bot-Netz alle anderen
+  Host-Ports.
 - **Das Admin-Passwort ist in `docker inspect` sichtbar.** Der MySQL-Container
   bekommt es über `--env-file`, und Docker legt den Inhalt solcher Dateien in
   die Konfiguration des Containers. Wer den Docker-Socket bedienen darf, liest
@@ -446,3 +651,17 @@ im Entwicklungsbetrieb ohne `--watch`. Nach dem Neustart gelten zusätzlich:
   Nach diesem Neustart meldet sich ein Bot, dessen Aktionen auf einem Callback
   laufen, bei Bedarf einmal neu an – ein Aufruf meldet „Callback abgelaufen“
   statt ins Leere zu gehen.
+- **Der Bind ist jetzt standardmäßig `127.0.0.1`.** Wer bisher ohne `HOST`
+  gestartet ist und von anderen Rechnern an die Oberfläche kam, kann das nicht
+  mehr. Wer bewusst extern binden will, setzt `HOST=0.0.0.0` (in Produktion
+  zusätzlich den Reverse-Proxy davor), und der Hub sagt beim Start, was er tut.
+- **Alte Secret-Werte in `bots.json` überdecken nichts mehr.** Der erste Start
+  nach diesem Stand schreibt Werte, die schon in `data/secrets/` liegen, nicht
+  zurück. Wer vor dem Update beide Stände hatte, behält den Stand der Datei.
+- **Bots im Löschzustand werden vor allem anderen abgearbeitet.** Ein Start mit
+  einem Bot, dessen Löschen abgebrochen war, legt deshalb keine Ordner mehr an,
+  sondern räumt auf. Wer so einen Bot versehentlich „retten“ wollte, indem er
+  `deleteState` aus `bots.json` entfernt, muss die Ordner von Hand prüfen: sie
+  können Scaffold-Dateien enthalten, die der Hub nie geschrieben haben dürfte.
+- `BOT_HUB_MAX_BOTS` (Standard 24) ist neu und setzt die alte feste Obergrenze
+  als Konfiguration fort.

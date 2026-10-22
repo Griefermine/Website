@@ -377,8 +377,12 @@ describe('Dateien im Startordner verwalten', () => {
   it('nimmt beim Löschen eines Ordners auch .env und .git mit', () => {
     // Die Ausnahme beim Spiegeln gilt dem Inhalt, den der Bot bekommen soll –
     // nicht dem Recht des Betreibers, seine eigenen Ordner zu leeren.
-    dateien.write(bot, root, 'mitgeheimnis/.env', 'GEHEIM=1');
-    dateien.write(bot, root, 'mitgeheimnis/.git/config', '[core]');
+    // `.env`/`.git` liegen jetzt direkt auf der Platte: Die Datei-API sperrt
+    // diese Namen aus (L1), als Fixture müssen sie aber trotzdem da sein.
+    mkdirSync(quelle(root, 'mitgeheimnis'), { recursive: true });
+    writeFileSync(quelle(root, 'mitgeheimnis/.env'), 'GEHEIM=1');
+    mkdirSync(quelle(root, 'mitgeheimnis/.git'), { recursive: true });
+    writeFileSync(quelle(root, 'mitgeheimnis/.git/config'), '[core]');
     assert.equal(dateien.remove(bot, root, 'mitgeheimnis').ordner, true);
     assert.ok(!existsSync(quelle(root, 'mitgeheimnis')));
   });
@@ -440,7 +444,9 @@ describe('Den Startordner auflisten', () => {
     // nicht verschwiegen.
     dateien.write(bot, root, 'a.py', '1');
     dateien.write(bot, root, 'src/b.py', '2');
-    dateien.write(bot, root, '.env', 'GEHEIM=1');
+    // `.env` direkt angelegt: Die Datei-API schreibt solche Namen nicht mehr
+    // (L1), die Liste soll sie aber weiterhin als Geheimnis melden.
+    writeFileSync(quelle(root, '.env'), 'GEHEIM=1');
 
     const wurzel = dateien.list(bot, root);
     assert.deepEqual(

@@ -92,15 +92,18 @@ ein Bot darin, bleibt der Container stehen; er wird erst danach ersetzt.
 
 - Docker Engine (oder ein kompatibler CLI-Ersatz wie Podman)
 - Der Benutzer des Bot-Hubs darf Container erstellen und starten.
-- Der Hub muss für Container erreichbar sein. Deshalb bindet der mitgelieferte
-  Server standardmäßig an `0.0.0.0`.
+- Der Hub muss für Container erreichbar sein. In der Entwicklung bindet der
+  Server standardmäßig an `0.0.0.0`; in `production` ist der Standard
+  `127.0.0.1` und andere Bind-Adressen werden abgelehnt.
 
 Die Laufzeit lässt sich über `.env` konfigurieren:
 
 ```dotenv
 BOT_HUB_CONTAINER_RUNTIME=docker
 BOT_HUB_CONTAINER_PREFIX=bot-hub
-BOT_HUB_CONTAINER_URL=http://host.docker.internal:8787
+# Nur wenn Bots den Hub erreichen müssen; dies gibt ihnen einen Weg zu allen
+# Diensten auf dem Host.
+# BOT_HUB_CONTAINER_URL=http://host.docker.internal:8787
 ```
 
 Pro Sprache wird ein passendes offizielles Image verwendet (unter anderem
@@ -113,23 +116,98 @@ kompatible lokale Entwicklungs- oder Diagnosefälle abgeschaltet werden.
 
 Was der Hub beim Erstellen festlegt:
 
-| Grenze     | Wert                                                              |
-| ---------- | ----------------------------------------------------------------- |
-| Rechte     | kein `--privileged`, `--cap-drop ALL`, `no-new-privileges:true`   |
-| Prozesse   | `--init`, `--pids-limit 256`                                      |
-| Ressourcen | `--memory 512m`, `--cpus 2` (überschreibbar)                      |
-| Netzwerk   | nur das Docker-Netz des Projekts, kein `host`, kein Docker-Socket |
-| Mounts     | `<workspace>:/workspace`, `bots/shared:/shared:ro`                |
+| Grenze     | Wert                                                                                                   |
+| ---------- | ------------------------------------------------------------------------------------------------------ |
+| Rechte     | kein `--privileged`, `--cap-drop ALL`, `no-new-privileges:true`                                        |
+| Prozesse   | `--init`, `--pids-limit 256`                                                                           |
+| Ressourcen | `--memory 512m`, `--cpus 2` (überschreibbar)                                                           |
+| Netzwerk   | `bridge` in Entwicklung, in Produktion internes `bot-hub-discord` mit Peer-Isolation und Discord-Proxy |
+| Mounts     | `<workspace>:/workspace`, `bots/shared:/shared:ro`                                                     |
 
-Was Docker von sich aus nicht kann: eine Firewall je Container, eine
-Ausgangs-Filterung oder die Trennung zweier Container, die auf demselben Hub
-laufen. Das sind keine Lücken dieser Konfiguration, sondern Grenzen der
-Laufzeit – entscheidend ist deshalb, wem du einen Workspace gibst.
+Docker filtert im Standard-`bridge`-Netz den ausgehenden Verkehr nicht. Dort
+können Bots Dienste im LAN und Internet erreichen. In Produktion ist deshalb
+ausschließlich das interne Netz `bot-hub-discord` zugelassen. Es hat keinen
+direkten Internetweg; der einzige externe Weg ist Squid unter
+`http://172.30.250.1:3128`. Die Bridge blockiert direkte Verbindungen zwischen
+Bots; Host-Firewall und Squid erlauben ihnen ausschließlich den gefilterten
+Proxy sowie die token-geschützte Hub-API. Squid erlaubt HTTPS-CONNECT auf TCP 443 nur zu
+`discord.com` und `discord.gg` und verwirft lokale/private Zieladressen. Der
+Proxy hat keinen veröffentlichten Host-Port; er lauscht nur auf den privaten
+Docker-Gateways. Ein Start ohne korrekt laufenden Proxy oder ohne
+`internal=true` und deaktivierte Inter-Container-Kommunikation wird vom Hub
+abgelehnt.
 
-`BOT_HUB_CONTAINER_URL` schaltet zusätzlich `host.docker.internal` frei. Der
-Eintrag erlaubt einem Bot jeden Dienst auf dem Host, auch SSH und alles, was
-sonst dort läuft. Er wird deshalb nur gesetzt, wenn ein Bot den Hub wirklich
-braucht – ohne diese Variable bekommt kein Container einen Weg zum Host.
+Vor dem Hub-Start auf einem Ubuntu-/Debian-Host mit UFW die Regeln vorbereiten:
+
+```sh
+sudo ./deploy/discord-egress/setup-ubuntu-debian.sh
+```
+
+Das Skript richtet UFW ein und startet den Proxy, sobald UFW aktiv ist. Für
+den ersten Start einer inaktiven Firewall muss `--enable` ausdrücklich
+angegeben werden. Vorher `sudo ufw status numbered` prüfen und einen sicheren
+SSH-Zugang mit `--ssh-cidr` konfigurieren; bei einer laufenden SSH-Sitzung wird
+die aktuelle Gegenstelle beim Aktivieren automatisch freigegeben. Ohne
+`--enable` bleibt eine inaktive UFW ausgeschaltet. Beispiel und Prüfung:
+
+```sh
+sudo ./deploy/discord-egress/setup-ubuntu-debian.sh --enable --ssh-cidr 192.168.1.0/24 --ssh-port 22
+sudo ./deploy/discord-egress/check-ubuntu-debian.sh
+```
+
+UFW sperrt Zugriffe aus dem Bot-Netz auf Host-Dienste bis auf die eigene
+Hub-API an `172.30.250.1:8788`. Zusätzlich verweigert es direkten Host-Egress;
+Hub, Caddy, Docker-Image-Downloads und APT nutzen getrennte Loopback-Proxys mit
+Domain-Allowlist. Docker-Bridge-Container können weder neue Verbindungen ins
+Internet starten noch über veröffentlichte Docker-Ports neue eingehende
+Verbindungen annehmen. Das Setup verweigert die Aktivierung bei zusätzlichen
+eingehenden UFW-ALLOW-Regeln. Docker wird beim Anwenden der Proxy-Konfiguration
+neu gestartet, danach den Hub-Dienst erneut starten. Bei Aufruf des Setups mit
+`sudo` erhält der aufrufende Benutzer nur die Berechtigung, den root-eigenen
+Firewall-Prüfer auszuführen. Für ein anderes Hub-Konto `--hub-user BENUTZER`
+angeben.
+
+`host-firewall.nft` enthält nur die Bridge-INPUT-Regeln und ist keine
+vollständige Ausgangs- oder Docker-Forward-Sperre. Sie reicht nicht für den
+Produktionsbetrieb; dafür die UFW-Variante verwenden.
+
+Wenn
+`172.30.250.0/24` bei dir bereits vergeben ist, ändere das Subnetz in
+`compose.yaml`, `squid.conf`, `server/containers.js`, `host-firewall.nft` und
+`update-ufw-rules.py` gemeinsam.
+Für `172.30.251.0/24` gilt dasselbe; zusätzlich muss die Prüfung in
+`server/containers.js` angepasst werden.
+
+Der Hub setzt beim Produktionsstart seinen eigenen globalen HTTP-Proxy auf
+`127.0.0.1:3129`. Externe Bot-Callbacks müssen zusätzlich in
+`/etc/bot-hub/callback-egress.allow` stehen und HTTPS/443 verwenden. Der Hub
+setzt in Produktions-Bot-Befehlen `HTTPS_PROXY`, `HTTP_PROXY`,
+`BOT_HUB_DISCORD_PROXY` und `NODE_USE_ENV_PROXY=1`. Das interne Netz blockiert
+den Direktweg auch dann, wenn eine Bot-Bibliothek Proxy-Variablen ignoriert.
+Eine Bibliothek muss den Proxy trotzdem verwenden, damit Discord funktioniert.
+Node.js 22.21+ kann die Proxy-Variablen für seine Standard-HTTP(S)-Agents
+verwenden; REST-Bibliotheken mit eigenem Dispatcher brauchen eine explizite
+Proxy-Konfiguration. Das Beispiel `bots/javascript-echo` konfiguriert den
+discord.js-REST-Agenten. Discord.js Gateway-WebSockets nutzen in Node den
+HTTPS-Agenten. Für Python, Java und andere SDKs ist die jeweilige
+Proxy-Einstellung der Bibliothek nötig.
+
+Paketmanager laufen beim Einrichten in einem kurzlebigen Installations-Container
+mit separatem internem Netz. Nur der Paket-Proxy erreicht eine Domain-Allowlist
+für npm, PyPI, Maven/Gradle, Go, crates.io und NuGet. Der Installer erhält nur
+den Workspace, keine Bot-Secrets und keinen Weg zu Host-Diensten. Der dauerhafte
+Bot-Container bleibt ausschließlich im Discord-Netz. Nicht freigegebene
+Paket-CDNs und Git-Repositories sind gesperrt. Allgemeine Webseiten,
+Discord-CDN und UDP-Sprachverbindungen bleiben für laufende Bots gesperrt.
+Voice-Bots sind mit dieser engen Laufzeitregel absichtlich nicht abgedeckt.
+Paketinstallationen können fremde Lifecycle- und Build-Skripte ausführen.
+Deshalb erhält der Installer keine Bot-Secrets; installierte Pakete sollten
+trotzdem geprüft und nur aus vertrauenswürdigen Quellen bezogen werden.
+
+`BOT_HUB_CONTAINER_URL` schaltet in der Entwicklung `host.docker.internal`
+frei. Der Eintrag kann einem Bot Zugriff auf Dienste am Host geben. In
+Produktion wird diese Variable abgelehnt; stattdessen erhalten Bots
+automatisch die lokale, auf Port `8788` begrenzte Hub-API-Adresse.
 
 ### Container im Produktivbetrieb
 
@@ -142,6 +220,14 @@ Unterschied zwischen einem Konfigurationsfehler und einem Vorfall:
 ```
 
 Außerhalb der Produktion warnt der Hub laut, statt den Start zu verweigern.
+
+Der Produktionsstandard ist `bot-hub-discord`; ein anderes Netz, einschließlich
+`bridge`, wird abgelehnt. Die Netz- und Proxy-Konfiguration liegt unter
+`deploy/discord-egress/`. `BOT_HUB_CONTAINER_NETWORK` muss normalerweise nicht
+gesetzt werden.
+
+Docker-Netzwerknamen werden in die Container-Signatur aufgenommen; Container
+mit einer anderen Netzwerkkonfiguration werden beim nächsten Start ersetzt.
 
 ### Images festnageln
 

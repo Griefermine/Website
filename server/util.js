@@ -25,6 +25,18 @@ export const httpError = (status, message) =>
   Object.assign(new Error(message), { status });
 
 /**
+ * URL-Decoding ohne 500 bei ungültigen Prozent-Folgen: eine kaputte Kodierung
+ * ist eine fehlerhafte Anfrage (400), kein Hub-Absturz.
+ */
+export const safeDecode = (value, message = 'Ungültiger Pfad') => {
+  try {
+    return decodeURIComponent(String(value ?? ''));
+  } catch {
+    throw httpError(400, message);
+  }
+};
+
+/**
  * Liest eine .env-Datei. Bewusst tolerant: unbekannte Zeilen werden
  * übersprungen, quoted Werte werden aufgelöst. Wird an zwei Stellen
  * gebraucht – für die Bot-OAuth-Konfiguration und für den Secret-Speicher –
@@ -128,4 +140,21 @@ export const sendJson = (res, status, payload, headers = {}) => {
     ...headers,
   });
   res.end(body);
+};
+
+/**
+ * Senkt die Rechte eines Spawns auf BOT_HUB_BOT_UID/BOT_HUB_BOT_GID ab –
+ * einheitlich für jeden Prozess, den der Hub im Namen eines Bots startet
+ * (Bot-Prozess, Abhängigkeits-Kommandos, Panel-Skripte). Der Betreiber
+ * härtet den Host einmal, und es gilt danach überall; ein Vergessen an
+ * einer einzigen Stelle war der Einfallsweg für Codeausführung als
+ * Hub-Benutzer. Ohne gesetzte Werte (oder 0) bleiben die Rechte des
+ * Hub-Prozesses unverändert. Gibt dieselben Optionen zurück.
+ */
+export const withBotCredentials = (options = {}) => {
+  const uid = Number(process.env.BOT_HUB_BOT_UID);
+  const gid = Number(process.env.BOT_HUB_BOT_GID);
+  if (Number.isInteger(uid) && uid > 0) options.uid = uid;
+  if (Number.isInteger(gid) && gid > 0) options.gid = gid;
+  return options;
 };

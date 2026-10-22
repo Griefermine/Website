@@ -688,14 +688,31 @@ export const createProvisioner = (deps = {}) => {
   };
 
   const ensureNetwork = async () => {
-    if (await networkExists()) return;
+    const networkState = async () =>
+      inspect('network', config.networkName, '{{.Driver}}|{{.Internal}}');
+    const existing = await networkState();
+    if (existing.present) {
+      if (existing.value !== 'bridge|true')
+        throw new Error(
+          `Netzwerk ${config.networkName} ist nicht als internes Docker-Bridge-Netz isoliert. Stoppe und entferne die verwalteten MySQL/phpMyAdmin-Container, entferne das Netz und starte den Hub erneut. Die Daten bleiben im getrennten Datenverzeichnis erhalten.`,
+        );
+      return;
+    }
     const created = await run(
-      ['network', 'create', '--driver', 'bridge', config.networkName],
+      [
+        'network',
+        'create',
+        '--driver',
+        'bridge',
+        '--internal',
+        config.networkName,
+      ],
       { capture: true },
     );
-    if (created.code !== 0 && !(await networkExists()))
+    const verified = await networkState();
+    if (!verified.present || verified.value !== 'bridge|true')
       throw new Error(
-        `Netzwerk ${config.networkName} konnte nicht angelegt werden: ${created.stderr.trim() || `Exit-Code ${created.code}`}`,
+        `Internes Netzwerk ${config.networkName} konnte nicht sicher angelegt werden: ${created.stderr.trim() || verified.error || `Exit-Code ${created.code}`}`,
       );
   };
 

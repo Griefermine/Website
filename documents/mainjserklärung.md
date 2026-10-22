@@ -152,8 +152,8 @@ Diese Funktionen zeichnen die jeweiligen Bereiche neu:
 
 ```js
 renderStats(); // Statistik-Karten
-renderBots();  // Bot-Karten
-renderLogs();  // Log-Zeilen
+renderBots(); // Bot-Karten
+renderLogs(); // Log-Zeilen
 ```
 
 Weitere Importe:
@@ -209,9 +209,7 @@ const button = $('#new-bot');
 Damit wird das HTML-Element gesucht, das so aussieht:
 
 ```html
-<button id="new-bot">
-  + Bot anlegen
-</button>
+<button id="new-bot">+ Bot anlegen</button>
 ```
 
 ---
@@ -313,9 +311,7 @@ const run = (id, action, button) =>
     const { bot } = await api[action](id);
     if (bot) upsertBot(bot);
 
-    const checking =
-      bot?.status === 'checking' ||
-      bot?.status === 'installing';
+    const checking = bot?.status === 'checking' || bot?.status === 'installing';
 
     const verb = {
       start: checking ? 'startet (prüft Bibliotheken)' : 'gestartet',
@@ -394,9 +390,7 @@ Wenn das Backend einen aktualisierten Bot zurückgibt, wird dieser gespeichert. 
 ### Status prüfen
 
 ```js
-const checking =
-  bot?.status === 'checking' ||
-  bot?.status === 'installing';
+const checking = bot?.status === 'checking' || bot?.status === 'installing';
 ```
 
 Das Zeichen `?.` heißt optionales Verkettungszeichen. Es verhindert einen Fehler, wenn `bot` nicht existiert. In diesem Fall ergibt der Ausdruck einfach `undefined`.
@@ -494,7 +488,7 @@ const state = getState();
 Danach bekommt das Formular die verfügbaren Sprachen:
 
 ```js
-languages: state.languages
+languages: state.languages;
 ```
 
 Dadurch kann es beispielsweise diese Auswahl anzeigen:
@@ -649,7 +643,7 @@ Das HTML enthält:
 Bei jeder Eingabe wird der Text gelesen:
 
 ```js
-event.target.value
+event.target.value;
 ```
 
 Wenn der Benutzer `python` eingibt, wird gespeichert:
@@ -749,17 +743,13 @@ if (!button) return;
 Die dynamisch erzeugten Buttons besitzen beispielsweise:
 
 ```html
-<button data-action="toggle" data-id="123">
-  Starten
-</button>
+<button data-action="toggle" data-id="123">Starten</button>
 ```
 
 oder:
 
 ```html
-<button data-action="logs" data-id="123">
-  Logs
-</button>
+<button data-action="logs" data-id="123">Logs</button>
 ```
 
 ### Aktion und ID lesen
@@ -771,7 +761,7 @@ const { action, id } = button.dataset;
 Aus:
 
 ```html
-<button data-action="restart" data-id="123">
+<button data-action="restart" data-id="123"></button>
 ```
 
 werden:
@@ -797,17 +787,13 @@ In der gespeicherten Bot-Liste wird der Bot mit der passenden ID gesucht. Wenn k
 
 ```js
 if (action === 'toggle')
-  return run(
-    id,
-    bot.status === 'running' ? 'stop' : 'start',
-    button,
-  );
+  return run(id, bot.status === 'running' ? 'stop' : 'start', button);
 ```
 
 Der Button hat immer die Aktion `toggle`, entscheidet aber abhängig vom Status:
 
 ```js
-bot.status === 'running' ? 'stop' : 'start'
+bot.status === 'running' ? 'stop' : 'start';
 ```
 
 Das ist kurz geschrieben für:
@@ -920,12 +906,10 @@ if (action === 'logs') {
     selectedBotId: state.selectedBotId === id ? null : id,
   });
 
-  document
-    .getElementById('log-panel')
-    ?.scrollIntoView({
-      behavior: 'smooth',
-      block: 'center',
-    });
+  document.getElementById('log-panel')?.scrollIntoView({
+    behavior: 'smooth',
+    block: 'center',
+  });
 
   return undefined;
 }
@@ -934,7 +918,7 @@ if (action === 'logs') {
 ### Bot auswählen oder Auswahl entfernen
 
 ```js
-state.selectedBotId === id ? null : id
+state.selectedBotId === id ? null : id;
 ```
 
 Das bedeutet:
@@ -952,12 +936,10 @@ Klick erneut auf Bot A → Logs aller Bots
 ### Zum Log-Bereich scrollen
 
 ```js
-document
-  .getElementById('log-panel')
-  ?.scrollIntoView({
-    behavior: 'smooth',
-    block: 'center',
-  });
+document.getElementById('log-panel')?.scrollIntoView({
+  behavior: 'smooth',
+  block: 'center',
+});
 ```
 
 Die Webseite scrollt weich zum Log-Bereich. `block: 'center'` versucht, den Bereich in der Mitte des Fensters anzuzeigen.
@@ -1095,13 +1077,13 @@ Das Auswahlfeld enthält später beispielsweise:
 Wenn `Alle Bots` ausgewählt wird, ist der Wert leer. Dann wird `null` gespeichert:
 
 ```js
-selectedBotId: null
+selectedBotId: null;
 ```
 
 Bei einem bestimmten Bot wird dessen ID gespeichert:
 
 ```js
-selectedBotId: '123'
+selectedBotId: '123';
 ```
 
 ---
@@ -1130,7 +1112,7 @@ System
 Wählt der Benutzer `Fehler`, wird gespeichert:
 
 ```js
-logLevelFilter: 'error'
+logLevelFilter: 'error';
 ```
 
 Anschließend zeigt `renderLogs()` nur noch Fehler-Logs an.
@@ -1158,22 +1140,15 @@ Das leert die Anzeige in dieser Sitzung. Es ist nicht automatisch dasselbe wie d
 ```js
 $('#start-all').addEventListener('click', (event) =>
   withBusy(event.target, async () => {
-    const stopped = getState().bots.filter(
-      (bot) => bot.status !== 'running',
-    );
+    const stopped = getState().bots.filter((bot) => bot.status !== 'running');
 
     const results = await Promise.allSettled(
       stopped.map((bot) => api.start(bot.id)),
     );
 
-    const ok = results.filter(
-      (result) => result.status === 'fulfilled',
-    ).length;
+    const ok = results.filter((result) => result.status === 'fulfilled').length;
 
-    toast(
-      `${ok}/${stopped.length} Bot(s) gestartet`,
-      ok ? 'success' : 'error',
-    );
+    toast(`${ok}/${stopped.length} Bot(s) gestartet`, ok ? 'success' : 'error');
   }),
 );
 ```
@@ -1181,9 +1156,7 @@ $('#start-all').addEventListener('click', (event) =>
 ### Nicht laufende Bots finden
 
 ```js
-const stopped = getState().bots.filter(
-  (bot) => bot.status !== 'running',
-);
+const stopped = getState().bots.filter((bot) => bot.status !== 'running');
 ```
 
 Es werden alle Bots herausgesucht, die gerade nicht laufen.
@@ -1191,7 +1164,7 @@ Es werden alle Bots herausgesucht, die gerade nicht laufen.
 ### Startanfragen gleichzeitig senden
 
 ```js
-stopped.map((bot) => api.start(bot.id))
+stopped.map((bot) => api.start(bot.id));
 ```
 
 Für jeden gefundenen Bot wird eine Startanfrage erstellt.
@@ -1205,9 +1178,7 @@ const results = await Promise.allSettled(...);
 ### Erfolgreiche Anfragen zählen
 
 ```js
-const ok = results.filter(
-  (result) => result.status === 'fulfilled',
-).length;
+const ok = results.filter((result) => result.status === 'fulfilled').length;
 ```
 
 Gezählt werden nur die erfolgreich beendeten Anfragen.
@@ -1225,17 +1196,13 @@ Beispiel:
 ```js
 $('#stop-all').addEventListener('click', (event) =>
   withBusy(event.target, async () => {
-    const running = getState().bots.filter(
-      (bot) => bot.status === 'running',
-    );
+    const running = getState().bots.filter((bot) => bot.status === 'running');
 
     const results = await Promise.allSettled(
       running.map((bot) => api.stop(bot.id)),
     );
 
-    const ok = results.filter(
-      (result) => result.status === 'fulfilled',
-    ).length;
+    const ok = results.filter((result) => result.status === 'fulfilled').length;
 
     toast(`${ok}/${running.length} Bot(s) gestoppt`, 'success');
   }),
@@ -1260,9 +1227,7 @@ const renderScopeOptions = () => {
 
   select.replaceChildren(
     new Option('Alle Bots', ''),
-    ...state.bots.map(
-      (bot) => new Option(`${bot.emoji} ${bot.name}`, bot.id),
-    ),
+    ...state.bots.map((bot) => new Option(`${bot.emoji} ${bot.name}`, bot.id)),
   );
 
   select.value = state.selectedBotId ?? '';
@@ -1280,7 +1245,7 @@ Alle bisherigen Optionen des Auswahlfeldes werden entfernt.
 ### Option für alle Bots hinzufügen
 
 ```js
-new Option('Alle Bots', '')
+new Option('Alle Bots', '');
 ```
 
 Das erzeugt sinngemäß:
@@ -1292,9 +1257,7 @@ Das erzeugt sinngemäß:
 ### Für jeden Bot eine Option erzeugen
 
 ```js
-state.bots.map(
-  (bot) => new Option(`${bot.emoji} ${bot.name}`, bot.id),
-)
+state.bots.map((bot) => new Option(`${bot.emoji} ${bot.name}`, bot.id));
 ```
 
 Aus:
@@ -1330,22 +1293,16 @@ const renderConnection = () => {
   const pill = $('#connection');
   const connected = getState().connected;
 
-  pill.textContent = connected
-    ? 'Verbunden'
-    : 'Verbindung prüfen …';
+  pill.textContent = connected ? 'Verbunden' : 'Verbindung prüfen …';
 
-  pill.className = `pill ${
-    connected ? 'pill--ok' : 'pill--danger'
-  }`;
+  pill.className = `pill ${connected ? 'pill--ok' : 'pill--danger'}`;
 };
 ```
 
 Im HTML gibt es:
 
 ```html
-<span id="connection" class="pill pill--idle">
-  Verbinde …
-</span>
+<span id="connection" class="pill pill--idle"> Verbinde … </span>
 ```
 
 Die Funktion ändert Text und CSS-Klasse:
@@ -1648,7 +1605,7 @@ else if (type === 'log') {
 Das Backend sendet eine einzelne neue Log-Zeile. Sie wird in ein Array verpackt:
 
 ```js
-[payload]
+[payload];
 ```
 
 und mit `prependLogs` vorne in die Log-Liste eingefügt. Anschließend wird der Log-Bereich neu gezeichnet.

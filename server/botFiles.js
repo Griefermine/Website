@@ -33,12 +33,15 @@
  * als ein Hinweis im Protokoll.
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
+  closeSync,
   copyFileSync,
   existsSync,
+  fchmodSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -90,6 +93,20 @@ const SKIPPED = new Set([
   '.aws',
   '.kube',
 ]);
+
+/**
+ * Gemeinsame Sperrliste für Listing, Lesen und Schreiben: `.env`/`.env.*`
+ * (Geheimnisse) und die Ordner aus SKIPPED. Was die Liste nicht zeigt, darf
+ * über die Datei-API auch nicht gelesen oder überschrieben werden – sonst
+ * liest `files.read` einfach das aus, was das Listing ausblendet.
+ */
+const istGespuert = (pfad) =>
+  String(pfad ?? '')
+    .split(/[\\/]/)
+    .some(
+      (teil) =>
+        teil === '.env' || teil.startsWith('.env.') || SKIPPED.has(teil),
+    );
 
 /**
  * Mutierende Datei-Operationen pro Bot serialisieren (einfache Async-Mutex
@@ -363,11 +380,27 @@ const merklisteLesen = (bot, projectRoot) => {
 
 const merklisteSchreiben = (bot, projectRoot, dateien) => {
   const datei = manifestPath(bot, projectRoot);
-  const temp = `${datei}.${process.pid}.tmp`;
-  writeFileSync(temp, JSON.stringify({ stand: Date.now(), dateien }), {
-    mode: 0o600,
-  });
-  renameSync(temp, datei);
+  const tmp = join(
+    dirname(datei),
+    `.merkliste.${randomBytes(8).toString('hex')}.tmp`,
+  );
+  let fd;
+  try {
+    mkdirSync(dirname(datei), { recursive: true, mode: 0o700 });
+    fd = openSync(tmp, 'wx', 0o600);
+    fchmodSync(fd, 0o600);
+    writeFileSync(fd, JSON.stringify({ stand: Date.now(), dateien }));
+    renameSync(tmp, datei);
+  } catch (error) {
+    try {
+      if (existsSync(tmp)) unlinkSync(tmp);
+    } catch {
+      /* der ursprüngliche Fehler zählt */
+    }
+    throw error;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 };
 
 const hashOf = (datei) =>
@@ -577,7 +610,7 @@ export const list = (bot, projectRoot, pfad = '') => {
       uebersprungen.add(`${voll} (keine Datei)`);
       continue;
     }
-    if (name === '.env' || name.startsWith('.env.')) {
+    if (istGespuert(name)) {
       uebersprungen.add(`${voll} (Geheimnis)`);
       continue;
     }
@@ -594,6 +627,7 @@ export const list = (bot, projectRoot, pfad = '') => {
 };
 
 export const read = (bot, projectRoot, pfad) => {
+  if (istGespuert(pfad)) return null;
   const ziel = safeStartPath(bot, projectRoot, pfad);
   if (!ziel) return null;
   try {
@@ -611,10 +645,38 @@ export const read = (bot, projectRoot, pfad) => {
 };
 
 /**
+ * Atomar schreiben: zufällig benannte Temp-Datei (`wx`, Modus 0600), danach
+ * `renameSync`. Vorhersagbare Namen wie `<ziel>.<pid>.tmp` sind für lokale
+ * Nutzer erratbar und laden zu Symlink-Angriffen ein; `wx` läuft garantiert
+ * auf einer eigenen Datei ein. Bei Fehlern wird die Temp-Leiche entfernt.
+ */
+const schreibeAtomar = (ziel, inhalt) => {
+  const tmp = join(dirname(ziel), `.hubtmp-${randomBytes(8).toString('hex')}`);
+  let fd;
+  try {
+    fd = openSync(tmp, 'wx', 0o600);
+    fchmodSync(fd, 0o600);
+    writeFileSync(fd, inhalt);
+    renameSync(tmp, ziel);
+    return true;
+  } catch {
+    try {
+      if (existsSync(tmp)) unlinkSync(tmp);
+    } catch {
+      /* die Leiche ist harmlos, die Ablehnung zählt */
+    }
+    return false;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+};
+
+/**
  * Eine Datei schreiben. Gibt `false` zurück, wenn der Pfad nicht in den
  * Startordner gehört – die Route macht daraus eine 400 mit lesbarer Meldung.
  */
 export const write = (bot, projectRoot, pfad, inhalt) => {
+  if (istGespuert(pfad)) return false;
   const ziel = safeStartPath(bot, projectRoot, pfad);
   if (!ziel) return false;
   const incoming = Buffer.byteLength(inhalt, 'utf8');
@@ -647,17 +709,7 @@ export const write = (bot, projectRoot, pfad, inhalt) => {
       }
       // Atomar schreiben: tmp + rename, kein halb geschriebenes File.
       mkdirSync(join(ziel, '..'), { recursive: true, mode: 0o700 });
-      const tmp = `${ziel}.${process.pid}.${Date.now()}.tmp`;
-      try {
-        writeFileSync(tmp, inhalt, { mode: 0o600 });
-        renameSync(tmp, ziel);
-      } catch {
-        try {
-          if (existsSync(tmp)) unlinkSync(tmp);
-        } catch {}
-        return false;
-      }
-      return true;
+      return schreibeAtomar(ziel, inhalt);
     }
   } catch {
     return false;
@@ -665,17 +717,7 @@ export const write = (bot, projectRoot, pfad, inhalt) => {
   // Neue Datei: pre-write Quota (bytes + count). KEIN Schreiben bei Ablehnung.
   if (!quotaAllows(bot, projectRoot, incoming, 1)) return false;
   mkdirSync(join(ziel, '..'), { recursive: true, mode: 0o700 });
-  const tmp = `${ziel}.${process.pid}.${Date.now()}.tmp`;
-  try {
-    writeFileSync(tmp, inhalt, { mode: 0o600 });
-    renameSync(tmp, ziel);
-  } catch {
-    try {
-      if (existsSync(tmp)) unlinkSync(tmp);
-    } catch {}
-    return false;
-  }
-  return true;
+  return schreibeAtomar(ziel, inhalt);
 };
 
 /**

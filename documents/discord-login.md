@@ -110,18 +110,19 @@ nicht an den Browser ausgeliefert.
 `HOST` und `BOT_HUB_URL` beantworten zwei verschiedene Fragen und dürfen nicht
 verwechselt werden:
 
-- `HOST` – Adresse, auf der der Hub **lauscht**. `0.0.0.0` nimmt Verbindungen
-  auf allen Interfaces an. Das ist nötig, weil die Bots im Container den Hub
-  über `host.docker.internal` (siehe `BOT_HUB_CONTAINER_URL`) erreichen und ein
-  Zugriff auf `127.0.0.1` von außen nicht möglich wäre.
-- `BOT_HUB_URL` – Adresse, die der Hub **ausgibt**: Discord-Redirect, Panel-Links
-  und die Hub-URL für die Bots. Der Hub bildet sie ausschließlich aus dieser
+- `HOST` – Adresse, auf der der Hub **lauscht**. Im Internetbetrieb bleibt der
+  öffentliche HTTP-Listener auf `127.0.0.1`; ein TLS-Proxy nimmt externe
+  Anfragen an. Produktions-Bots erreichen ihre Hub-API über einen separaten
+  Listener auf dem internen Docker-Gateway.
+- `BOT_HUB_URL` – öffentliche Adresse, die der Hub **ausgibt**: Discord-Redirect
+  und Panel-Links. Die interne Bot-API nutzt in Produktion das private
+  Docker-Gateway. Der Hub bildet die öffentliche Adresse ausschließlich aus dieser
   Variablen, nicht aus dem `Host`-Header der Anfrage.
 
 ### Lokale Entwicklung
 
 ```dotenv
-HOST=0.0.0.0
+HOST=127.0.0.1
 BOT_HUB_URL=http://127.0.0.1:8787
 ```
 
@@ -132,8 +133,8 @@ unverschlüsselte URLs ausschließlich für Loopback-Adressen.
 
 ### Später auf einer Domain
 
-1. TLS davor setzen (Caddy/nginx). Der Hub selbst spricht weiter nur HTTP und
-   darf auf `0.0.0.0` bleiben, damit die Container ihn erreichen.
+1. TLS davor setzen (Caddy/nginx). Der öffentliche Hub-Listener spricht weiter
+   HTTP, bleibt aber auf `127.0.0.1` gebunden.
 2. In `.env` die öffentliche Adresse eintragen:
 
    ```dotenv
@@ -143,8 +144,8 @@ unverschlüsselte URLs ausschließlich für Loopback-Adressen.
    NODE_ENV=production
    ```
 
-   `BOT_HUB_CONTAINER_URL` bleibt unverändert, damit die Bots im Container den
-   Hub weiter über `host.docker.internal` erreichen.
+   Der Hub stellt für Produktions-Bots automatisch einen lokalen API-Listener
+   bereit; `BOT_HUB_CONTAINER_URL` darf dafür nicht gesetzt werden.
 
 3. Im Discord-Entwicklerportal unter _OAuth2 → Redirects_ genau
    `https://hub.example.de/api/auth/discord/callback` eintragen. Discord

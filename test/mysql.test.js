@@ -62,6 +62,7 @@ const fail = (stderr) => ({ code: 1, stdout: '', stderr });
 const fakeDocker = (initial = {}) => {
   const state = {
     network: initial.network ?? false,
+    networkInternal: initial.networkInternal ?? true,
     /** name -> { running, label } */
     containers: new Map(initial.containers ?? []),
   };
@@ -72,10 +73,18 @@ const fakeDocker = (initial = {}) => {
     calls.push(args);
 
     if (args[0] === 'network') {
-      if (args[1] === 'inspect')
-        return state.network ? ok('[]') : fail(`network not found`);
+      if (args[1] === 'inspect') {
+        if (!state.network) return fail(`network not found`);
+        const format = args.includes('--format')
+          ? args[args.indexOf('--format') + 1]
+          : null;
+        if (format === '{{.Driver}}|{{.Internal}}')
+          return ok(`bridge|${state.networkInternal}`);
+        return ok('[]');
+      }
       if (args[1] === 'create') {
         state.network = true;
+        state.networkInternal = args.includes('--internal');
         return ok('netzwerkid');
       }
       if (args[1] === 'rm') {
@@ -630,6 +639,13 @@ describe('Das Einrichten', () => {
 
     assert.equal(ergebnis.status, 'eingerichtet');
     assert.ok(docker.state.network, 'das Netz fehlt');
+    const netzAnlage = docker.calls.find(
+      (args) => args[0] === 'network' && args[1] === 'create',
+    );
+    assert.ok(
+      netzAnlage?.includes('--internal'),
+      'das SQL-Netz ist nicht intern',
+    );
     assert.ok(
       docker.state.containers.has('bot-hub-mysql'),
       'der Container fehlt',
@@ -650,6 +666,22 @@ describe('Das Einrichten', () => {
     assert.equal(my.has('bot_hub'), true);
     assert.equal(readDbSecret(dir).BOT_HUB_DB_BOOTSTRAPPED, '1');
     assert.ok(readDbSecret(dir).BOT_HUB_DB_PASSWORD.length >= MIN);
+  });
+
+  it('verweigert ein bestehendes SQL-Netz ohne interne Bridge-Isolation', async () => {
+    const dir = makeRoot();
+    const docker = fakeDocker({ network: true, networkInternal: false });
+    const { provisioner } = setup({ dir, docker });
+
+    await assert.rejects(
+      () => provisioner.provision(),
+      /nicht als internes Docker-Bridge-Netz isoliert/,
+    );
+    assert.equal(
+      docker.calls.some((args) => args[0] === 'create'),
+      false,
+      'MySQL darf nicht mit einem unsicheren bestehenden Netz starten',
+    );
   });
 
   it('löscht das Admin-Passwort von der Platte, sobald der Durchlauf fertig ist', async () => {

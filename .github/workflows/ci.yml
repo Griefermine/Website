@@ -1,0 +1,200 @@
+name: CI
+
+# Der Weg zur Veröffentlichung ist ein Build, kein Gefühl. Was hier grün ist,
+# ist dasselbe, was `npm run release:build` später als Artefakt ablegt – inklusive
+# des Scans, der Geheimnisse und Laufzeitdaten fernhält.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Der Historien-Scan ist keine Pfortenprüfung für einen einzelnen Commit: was
+  # einmal in der Historie liegt, ist durch einen grünen Push nicht erledigt.
+  # Er läuft deshalb wöchentlich und auf Knopfdruck.
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pruefen:
+    name: Format, Tests und Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # Die Lockdatei ist verbindlich: `npm ci` installiert exakt das, was
+      # geprüft wird – `npm install` würde still aktualisieren.
+      - name: Abhängigkeiten installieren
+        run: npm ci
+
+      # Was genau geprüft wurde, gehört in den Bericht: Versionen, Lockfile-Hash,
+      # Datum. Ohne das ist „grün“ nur eine Behauptung über einen unbekannten Stand.
+      - name: Geprüften Stand protokollieren
+        run: |
+          {
+            echo "Zeitpunkt (UTC):  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Node:             $(node -v)"
+            echo "npm:              $(npm -v)"
+            echo "Commit:           ${GITHUB_SHA}"
+            echo "Lockfile-SHA256:  $(sha256sum package-lock.json | cut -d' ' -f1)"
+            echo "Paket:            $(node -p "require('./package.json').name + '@' + require('./package.json').version")"
+          } | tee stand.txt
+
+      # Erreichbarkeit VOR dem Audit: eine nicht erreichbare Registry ist ein
+      # „nicht abgeschlossen“, niemals ein „keine Schwachstellen“.
+      - name: Registry-Erreichbarkeit prüfen
+        run: |
+          if ! npm ping 2>&1 | tee npm-ping.txt; then
+            echo '::error::Registry nicht erreichbar – Schwachstellenprüfung nicht abgeschlossen.'
+            exit 1
+          fi
+
+      # Der Formatprüfung unterliegt der gepflegte Quelltext. `bots/**` (Ordner,
+      # die der Hub für Bot-Benutzer schreibt) und `data/` stehen in
+      # `.prettierignore`: ihr Inhalt gehört den Benutzern, nicht dem Formatter.
+      - name: Formatprüfung
+        run: npm run format:check
+
+      # Ein einziger Lauf: node --test meldet jeden Fehlschlag, statt nach dem
+      # ersten abubrechen. `set -o pipefail` verhindert, dass der Fehler im
+      # Pipe-Ende (tee) den Testfehlschlag verschluckt.
+      - name: Tests
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee testbericht.txt
+
+      - name: Oberfläche bauen
+        run: npm run build
+
+      # Produktionsabhängigkeiten sind die, die im Betrieb laufen. Ein Fund hier
+      # blockiert.
+      - name: Schwachstellen (Produktion)
+        run: npm audit --omit=dev --audit-level=high | tee audit-produktion.txt
+
+      # Nur informativ: Entwicklungsabhängigkeiten erreichen keine Installation.
+      - name: Schwachstellen (Entwicklung, informatierend)
+        run: npm audit --audit-level=high | tee audit-entwicklung.txt
+        continue-on-error: true
+
+      # Verzeichnis aller Abhängigkeiten inkl. Transitivität. `npm sbom` gibt es
+      # erst ab neueren npm-Versionen; wo es fehlt, ist das Inventar die
+      # beste Aussage ohne zusätzliche Baustein-Lieferkette.
+      - name: Abhängigkeitsverzeichnis (SBOM)
+        run: |
+          set -o pipefail
+          npm ls --all --json | tee abhaengigkeiten.json >/dev/null
+          if npm help sbom >/dev/null 2>&1; then
+            npm sbom --sbom-format cyclonedx | tee sbom.cdx.json >/dev/null
+          else
+            echo "npm sbom ist in dieser npm-Version nicht verfügbar – abhaengigkeiten.json ist das Inventar."
+          fi
+
+      # Selbstprüfung des Release-Wegs: der Scanner muss den Arbeitsbaum
+      # freigeben, ohne dass etwas daraus gelöscht wurde.
+      - name: Release-Scanner (Arbeitsbaum)
+        run: npm run release:scan
+
+      # Baut das Artefakt und scannt es in einem Schritt; Fehler hier bedeuten:
+      # etwas aus data/, bots/ oder .env würde mit ausgeliefert.
+      - name: Release-Artefakt bauen und scannen
+        run: npm run release:build
+
+      - name: Prüfsumme ablegen
+        run: sha256sum release/*.tar.gz | tee release-sha256.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bot-hub-release
+          path: |
+            release/*.tar.gz
+            release-sha256.txt
+            stand.txt
+            testbericht.txt
+            audit-produktion.txt
+            audit-entwicklung.txt
+            abhaengigkeiten.json
+            sbom.cdx.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Die MySQL-Prüfungen stellen sich ihre Instanz selbst (über denselben
+  # Provisionierer wie im Betrieb) und brauchen deshalb nur Docker, das auf dem
+  # Runner vorhanden ist. Ohne diesen Job wäre `npm test` eine Aussage über
+  # SQLite – und die Datenbank ist der Teil, der Geheimnisse hält.
+  datenbank:
+    name: Datenbank-Integration (MySQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Abhängigkeiten installieren
+        run: npm ci
+
+      # Die Suite überspringt ihre Prüfungen still, wenn sie keine MySQL erreicht.
+      # Ein grüner Node-Lauf wäre dann eine falsche Aussage, also wird genau das
+      # hier geprüft und der Job danach rot gemacht.
+      - name: Datenbank-Tests
+        run: |
+          set -o pipefail
+          npm run test:mysql 2>&1 | tee mysql.log
+          if grep -qE 'MySQL nicht erreichbar|Hub-MySQL konnte nicht gestartet werden' mysql.log; then
+            echo '::error::Keine MySQL erreicht – die Datenbankprüfungen haben nicht stattgefunden.'
+            exit 1
+          fi
+
+  # Geheimnisse in der Historie: der Repo-Scan prüft den aktuellen Stand, dieser
+  # Job prüft jeden Blob, den die Historie kennt. Ein Fund heißt: widerrufen oder
+  # rotieren – erst danach die Historie bereinigen.
+  #
+  # `fetch-depth: 0` ist der Punkt des Jobs: der Default-Checkout ist tiefen-
+  # reduziert, und eine Prüfung auf einem Stumpf wäre eine falsche Freibefahrung.
+  historien-scan:
+    name: Geheimnisse in der Git-Historie
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Historie vollständig machen
+        run: |
+          set -o pipefail
+          git fetch --all --tags --unshallow 2>&1 | tail -2 || git fetch --all --tags
+          echo "Commits in der Prüfung: $(git rev-list --all --count)"
+
+      # Der eigene Scanner: ohne Netz, ohne Zusatze, meldet ohne Wert.
+      - name: Historien-Scan (eigener Scanner)
+        run: |
+          set -o pipefail
+          node scripts/history-scan.mjs | tee historien-scan.txt
+
+      # Zusätzlich ein gepflegtes Tool: Mustererkennung im eigenen Code beweist
+      # keine Secret-Freiheit, weil die eigene Musterliste das ist, was man
+      # zufällig schon kannte.
+      - name: Historien-Scan (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: historien-scan
+          path: historien-scan.txt
+          if-no-files-found: warn
+          retention-days: 30

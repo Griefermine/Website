@@ -286,6 +286,12 @@ an einem eigenen Netz, an dem kein Bot-Container hängt: Bot-Container laufen au
 der Default-Bridge und haben dorthin keine Route. Ein Bot erreicht die Datenbank
 also weder direkt noch über `host.docker.internal`, selbst wenn
 `BOT_HUB_CONTAINER_URL` gesetzt ist – getestet in `test/mysql-container.test.js`.
+Das Docker-Netz ist zusätzlich `internal`: MySQL und phpMyAdmin können darüber
+keine beliebigen Internetverbindungen aufbauen. Beim Start prüft der Hub diese
+Eigenschaft auch für ein bereits vorhandenes Netz und startet mit einem alten,
+extern routbaren Netz nicht. Für ein bestehendes Setup müssen die verwalteten
+MySQL/phpMyAdmin-Container und das Netz einmal gestoppt/entfernt werden; das
+separate Datenverzeichnis bleibt dabei erhalten.
 
 `BOT_HUB_DB_HOST`, `BOT_HUB_DB_SOCKET` und `BOT_HUB_DB_PASSWORD` werden bei
 diesem Treiberwert **abgelehnt**, nicht ignoriert. Wer eines davon setzt,

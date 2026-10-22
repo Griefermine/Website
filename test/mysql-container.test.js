@@ -145,6 +145,17 @@ describe('Der verwaltete MySQL-Container in echt', () => {
   it('richtet die Datenbank beim ersten Start ein', { skip }, async () => {
     assert.ok(adminPassword, 'kein Admin-Passwort abgefangen');
     assert.ok(appPassword?.length >= 30, 'kein Arbeitspasswort');
+    const network = await docker(
+      [
+        'network',
+        'inspect',
+        '--format',
+        '{{.Driver}}|{{.Internal}}',
+        config.networkName,
+      ],
+      { capture: true },
+    );
+    assert.equal(network.stdout.trim(), 'bridge|true');
     const connect = async (user, password, database) => {
       const client = await import('mysql2/promise');
       return client.createConnection({

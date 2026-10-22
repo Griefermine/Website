@@ -276,18 +276,20 @@ export const openAccess = async () => {
               if (allowed.has(input.value)) perms.push(input.value);
             }
             const botsPatch = {};
-            botPermsWrap.querySelectorAll('.access-bot-block').forEach((block) => {
-              const inputs = block.querySelectorAll('input[type="checkbox"]');
-              if (inputs.length === 0) return;
-              const first = inputs[0];
-              const bid = first?.dataset.botId;
-              if (!bid) return;
-              const list = [];
-              for (const cb of inputs) {
-                if (cb.checked && allowed.has(cb.value)) list.push(cb.value);
-              }
-              botsPatch[bid] = { permissions: [...new Set(list)] };
-            });
+            botPermsWrap
+              .querySelectorAll('.access-bot-block')
+              .forEach((block) => {
+                const inputs = block.querySelectorAll('input[type="checkbox"]');
+                if (inputs.length === 0) return;
+                const first = inputs[0];
+                const bid = first?.dataset.botId;
+                if (!bid) return;
+                const list = [];
+                for (const cb of inputs) {
+                  if (cb.checked && allowed.has(cb.value)) list.push(cb.value);
+                }
+                botsPatch[bid] = { permissions: [...new Set(list)] };
+              });
             try {
               await api.updateAccess(user.id, {
                 role,
@@ -343,7 +345,11 @@ export const openAccess = async () => {
         ),
         el('h4', { class: 'access-subtitle' }, 'Globale Berechtigungen'),
         globalPerms,
-        el('h4', { class: 'access-subtitle' }, 'Bot-spezifische Berechtigungen'),
+        el(
+          'h4',
+          { class: 'access-subtitle' },
+          'Bot-spezifische Berechtigungen',
+        ),
         botPermsWrap,
         botAddRow,
         el('div', { class: 'access-actions' }, saveBtn, removeBtn),

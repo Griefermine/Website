@@ -1,4 +1,5 @@
 # SECURITY_FIXES_V9.md
+
 # Bot-Hub – Sicherheits-Härtung für GitHub Copilot / WebStorm
 
 ## Ziel
@@ -151,7 +152,7 @@ bots/<anderer-bot>/subdir/
 Es muss geprüft werden:
 
 ```js
-isPathInside(currentBotWorkspace, candidatePath)
+isPathInside(currentBotWorkspace, candidatePath);
 ```
 
 mit dem kanonischen Pfad.
@@ -161,7 +162,7 @@ mit dem kanonischen Pfad.
 Vor Zugriffen auf existierende Dateien:
 
 ```js
-realpath()
+realpath();
 ```
 
 verwenden und danach erneut prüfen.
@@ -209,7 +210,7 @@ ist verboten.
 In der Bot-Start-/Installationslogik existieren weiterhin Konstruktionen wie:
 
 ```js
-spawn('/bin/sh', ['-c', command])
+spawn('/bin/sh', ['-c', command]);
 ```
 
 Das betrifft insbesondere:
@@ -230,7 +231,7 @@ Programm und Argumente immer getrennt behandeln.
 NICHT:
 
 ```js
-spawn('/bin/sh', ['-c', command])
+spawn('/bin/sh', ['-c', command]);
 ```
 
 BESSER:
@@ -238,8 +239,8 @@ BESSER:
 ```js
 spawn(executable, args, {
   cwd: botWorkspace,
-  env: sanitizedEnvironment
-})
+  env: sanitizedEnvironment,
+});
 ```
 
 ## Manifest-Format
@@ -356,7 +357,7 @@ Beispielprinzip:
 Ein URL-Fragment wird zwar normalerweise nicht als HTTP-Request übertragen, aber JavaScript der geladenen Seite kann:
 
 ```js
-location.hash
+location.hash;
 ```
 
 lesen.
