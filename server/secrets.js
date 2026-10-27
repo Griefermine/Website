@@ -26,7 +26,13 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { parseDotenv } from './util.js';
-import { decryptValue, encryptValue, isVaultValue, vaultEnabled } from './vault.js';
+import {
+  decryptValue,
+  encryptValue,
+  isLegacyVaultValue,
+  isVaultValue,
+  vaultEnabled,
+} from './vault.js';
 
 /** Verzeichnis 0700, Datei 0600 – mit Absicht, nicht mit Vorgabe. */
 const directoryOf = (projectRoot) => join(projectRoot, 'data', 'secrets');
@@ -117,7 +123,7 @@ export const readSecretValues = (projectRoot, id) => {
   }
   const values = {};
   for (const [key, value] of Object.entries(parsed))
-    values[key] = decryptValue(key, value, projectRoot);
+    values[key] = decryptValue(id, key, value, projectRoot);
   return values;
 };
 
@@ -141,7 +147,7 @@ export const storeSecretValues = (
   const sealed = Object.fromEntries(
     Object.entries(merged).map(([key, value]) => [
       key,
-      encryptValue(key, value, projectRoot),
+      encryptValue(id, key, value, projectRoot),
     ]),
   );
   const directory = directoryOf(projectRoot);
@@ -250,9 +256,11 @@ export const bootstrapSecretVault = (projectRoot, env = process.env) => {
     const openValues = Object.values(parsed).filter(
       (value) => String(value ?? '').trim() !== '' && !isVaultValue(value),
     );
-    if (!openValues.length) continue;
+    // v1-Umschläge sind lesbar, aber ohne Datei-Bindung – hochziehen auf v2.
+    const legacy = Object.values(parsed).filter(isLegacyVaultValue);
+    if (!openValues.length && !legacy.length) continue;
     if (!enabled) {
-      if (env.BOT_HUB_TEST_MODE !== '1')
+      if (openValues.length && env.BOT_HUB_TEST_MODE !== '1')
         console.warn(
           '[hub] Hinweis: Secret-Dateien liegen im Klartext und es ist kein ' +
             'Vault-Key vorhanden. Für AES-256-GCM-Verschlüsselung ' +

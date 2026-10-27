@@ -202,6 +202,28 @@ docker exec -d bot-hub-vm bash -c \
      wer Hub-Prozess + Key-Datei komplett lesen kann, kommt weiter (dagegen
      hilft nur Festplattenverschlüsselung). Tests: `secrets-vault.test.js`.
 
+ 24. **Vault v2 + Session-Vault nach Red-Team-Runde**: Die Durchspiele-Runde
+     fand zwei echte Schwachstellen (beide empirisch demonstriert, dann
+     behoben): (a) v1-Umschläge banden als AAD nur den Schlüsselnamen – ein
+     Umschlag aus `botA.env` ließ sich nach `botB.env` kopieren und entschlüsselte
+     dort. v2 bindet Dateiname UND Schlüsselname (`vault:v2:`, AAD
+     `id\u0000key`); v1 bleibt lesbar, `bootstrapSecretVault` hebt alle
+     v1-Dateien beim Start auf v2. (b) `data/sessions.json` lag als Klartext
+     in `data/` – eine Datenordner-Kopie war ein Login-Vorrat. Jetzt schreibt
+     `auth.js` die Datei als einzelnen Vault-Umschlag (Altbestand wird beim
+     ersten Load hochgezogen). Drittens dokumentiert: Das Simulations-VM
+     nutzt Laptop-Swap (dm-2 + zram) – Seiten des Hub-Prozesses (Key-Material!)
+     können unverschlüsselt den Datenträger erreichen; auf echtem VPS Swap
+     deaktivieren oder verschlüsseln, Laptop: Full-DiskEncryption.
+     Firewall-Prüfsummen: Key 0640 root:bot-hub, Gruppe leer; bot-hub darf
+     Key weder überschreiben noch löschen noch den Ordner anzapfen
+     (root:root 0755); www-data liest weder Key noch `.env` noch sessions
+     noch Secrets; Bot-Container hat keine Host-Mounts, kein docker.sock,
+     kein `/opt/bot-hub`; HTTP-Traversierung auf `master.key`/`.env` bleibt
+     400/404/SPA-Fallback ohne Inhalt; Lateral-Tests mit echtem
+     BOT_HUB_TOKEN: eigene Routes 200, fremde Bot-Ids 401, Rate-Feedback
+     einheitlich 401.
+
 ### Betriebslehre
 
 * **Startordner schlägt Datei-Editor**: Hat ein Bot einen Startordner,
@@ -267,7 +289,7 @@ Prüfen, dass nichts mehr im Klartext liegt (die Datei darf den Token nicht
 mehr enthalten, `vault:v1:` muss drinstehen):
 
 ```
-docker exec bot-hub-vm grep -c vault:v1 /opt/bot-hub/data/secrets/*.env
+docker exec bot-hub-vm grep -cE "vault:v[12]:" /opt/bot-hub/data/secrets/*.env
 ```
 
 **Pflicht: Master-Key sichern.** Ohne `/etc/bot-hub/master.key` sind alle Vault-Umschläge unwiederbringlich verloren (AES, kein Backdoor-Zugang). Backup: `docker exec bot-hub-vm cat /etc/bot-hub/master.key` in einen Passwortmanager (außerhalb der VM) legen; niemals ins Repo (`*.key` ist gitignoret). Danach aufräumen: Nach dem Umzug können `DISCORD_CLIENT_SECRET` (und `DISCORD_CLIENT_ID`, `DISCORD_REDIRECT_URI`) aus `/opt/bot-hub/.env` gelöscht werden – der Hub liest sie jetzt aus `data/secrets/hub.env`. Funktionstest danach: `curl -sk -o /dev/null -w "%{http_code}" https://127.0.0.1/api/auth/discord/login` muss 302 liefern (beide Werte aus dem Vault aufgelöst).

@@ -12,6 +12,7 @@ import {
   unlinkSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { decryptValue, encryptValue, vaultEnabled } from './vault.js';
 
 const DISCORD_API = 'https://discord.com/api/v10';
 // Nur bekannte Discord-Codes zurückgeben, niemals den Parameterwert spiegeln.
@@ -254,10 +255,13 @@ const saveAccess = (strict = false) => {
 };
 
 /* Sessions leben im Speicher, überleben aber einen Neustart: Sie werden in
- * `data/sessions.json` (Mode 0600) ausgelagert. Die Datei enthält gültige
- * Session-Tokens und wird daher genauso streng behandelt wie access.json;
- * der Ordner data/ ist ohnehin git-ignoriert. */
+ * `data/sessions.json` ausgelagert (Mode 0600). Die Datei enthält gültige
+ * Session-Tokens – wer den data/-Ordner kopiert, wäre sonst angemeldet. Mit
+ * Vault-Key liegt die Datei deshalb als ein einziger AES-256-GCM-Umschlag
+ * (v2, fest an Dateiname+Schlüsselname gebunden) auf der Platte; ohne Key
+ * bleibt das alte Klartext-Verhalten. */
 let sessionFile = null;
+const projectRootOfSessionFile = () => dirname(dirname(sessionFile));
 const saveSessions = () => {
   if (!sessionFile) return;
   const temporary = `${sessionFile}.${process.pid}.tmp`;
@@ -268,9 +272,10 @@ const saveSessions = () => {
     for (const [key, value] of sessions) {
       if (value.expiresAt > now) persistent[key] = value;
     }
-    writeFileSync(temporary, `${JSON.stringify(persistent, null, 2)}\n`, {
-      mode: 0o600,
-    });
+    let content = `${JSON.stringify(persistent, null, 2)}\n`;
+    if (vaultEnabled(projectRootOfSessionFile()))
+      content = `${encryptValue('sessions', 'file', content, projectRootOfSessionFile())}\n`;
+    writeFileSync(temporary, content, { mode: 0o600 });
     chmodSync(temporary, 0o600);
     const fd = openSync(temporary, 'r');
     try {
@@ -291,7 +296,12 @@ const saveSessions = () => {
 const loadSessions = () => {
   if (!sessionFile || !existsSync(sessionFile)) return;
   try {
-    const parsed = JSON.parse(readFileSync(sessionFile, 'utf8'));
+    const raw = readFileSync(sessionFile, 'utf8');
+    let content = raw;
+    if (raw.trim().startsWith('vault:')) {
+      content = decryptValue('sessions', 'file', raw.trim(), projectRootOfSessionFile());
+    }
+    const parsed = JSON.parse(content);
     const now = Date.now();
     for (const [key, value] of Object.entries(parsed ?? {})) {
       if (
@@ -302,6 +312,9 @@ const loadSessions = () => {
       )
         sessions.set(key, value);
     }
+    // Klartext-Altbestand einmalig in den Umschlag hochziehen.
+    if (!raw.trim().startsWith('vault:') && vaultEnabled(projectRootOfSessionFile()))
+      saveSessions();
   } catch (error) {
     console.error('[hub] Sessions konnten nicht geladen werden:', error.message);
   }

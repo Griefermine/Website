@@ -4,7 +4,13 @@
  * Ist ein Vault-Key vorhanden, schreibt `secrets.js` Werte nicht mehr als
  * Klartext, sondern als selbstbeschreibenden Umschlag:
  *
- *     KEY="vault:v1:<iv-b64>:<tag-b64>:<chiffre-text-b64>"
+ *     KEY="vault:v2:<iv-b64>:<tag-b64>:<chiffre-text-b64>"
+ *
+ * v2 bindet als Additional-Authenticated-Data (AAD) Dateiname UND
+ * Schlüsselname ein: ein Umschlag lässt sich weder zwischen Einträgen noch
+ * zwischen Secret-Dateien verschieben, ohne dass die GCM-Prüfung ihn wirft.
+ * v1-Umschläge (nur Schlüsselname) bleiben lesbar und werden beim nächsten
+ * Schreiben hochgezogen (`bootstrapSecretVault` tut das beim Hub-Start).
  *
  * Woher der Key kommt:
  *   - Produktion: `BOT_HUB_KEY_FILE` (Datei AUSSERHALB von data/, z. B.
@@ -24,8 +30,9 @@
  * an den Key – er sieht nur sein eigenes /workspace.
  *
  * GCM gibt Integrität: veränderte Umschläge oder ein falscher Key werfen
- * einen Fehler statt still Müll zu liefern. AAD ist der SchlüsselNAME, ein
- * Umschlag lässt sich also nicht zwischen Einträgen hin- und herschieben.
+ * einen Fehler statt still Müll zu liefern. Das Umschichten eines Umschlags
+ * (auf einen anderen Eintrag oder in eine andere Datei) scheitert an der
+ * AAD-Bindung.
  */
 
 import {
@@ -44,10 +51,17 @@ import {
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-const PREFIX = 'vault:v1:';
+const PREFIX_V1 = 'vault:v1:';
+const PREFIX = 'vault:v2:';
 
-export const isVaultValue = (value) =>
-  String(value ?? '').startsWith(PREFIX);
+export const isVaultValue = (value) => {
+  const text = String(value ?? '');
+  return text.startsWith(PREFIX) || text.startsWith(PREFIX_V1);
+};
+
+/** v1-Umschläge (nur Schlüsselname als AAD) – zum Hochziehen beim Start. */
+export const isLegacyVaultValue = (value) =>
+  String(value ?? '').startsWith(PREFIX_V1);
 
 /** Pfad, an dem der Hub seinen Vault-Key sucht (ohne ihn zu erzeugen). */
 export const vaultKeyPath = (projectRoot, env = process.env) =>
@@ -116,39 +130,79 @@ export const vaultEnabled = (projectRoot, env = process.env) => {
   }
 };
 
+/** v2-AAD: Dateiname + Schlüsselname, getrennt durch ein Zeichen, das kein Name enthält. */
+const aad = (vaultId, keyName) =>
+  Buffer.from(`${vaultId}\u0000${keyName}`, 'utf8');
+
 /**
  * Verschlüsselt, wenn ein Key vorhanden ist; sonst Klartext (alter Modus).
- * Leere Werte und bereits umgeschlagene bleiben unverändert.
+ * Leere Werte und bereits umgeschlagene bleiben unverändert. `vaultId` ist
+ * der Name der Secret-Datei (Bot-Id, 'hub', …) und wandert – wie `keyName` –
+ * als AAD in die Integritätsprüfung: ein Umschlag aus Datei A entschüsselt
+ * in Datei B nicht mehr.
  */
-export const encryptValue = (keyName, value, projectRoot, env = process.env) => {
+export const encryptValue = (
+  vaultId,
+  keyName,
+  value,
+  projectRoot,
+  env = process.env,
+) => {
   const text = String(value ?? '');
   if (!text || isVaultValue(text)) return text;
   if (!vaultEnabled(projectRoot, env)) return text;
   const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', loadVaultKey(projectRoot, env), iv);
-  cipher.setAAD(Buffer.from(String(keyName), 'utf8'));
+  const cipher = createCipheriv(
+    'aes-256-gcm',
+    loadVaultKey(projectRoot, env),
+    iv,
+  );
+  cipher.setAAD(aad(vaultId, keyName));
   const ct = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]);
   return `${PREFIX}${iv.toString('base64')}:${cipher
     .getAuthTag()
     .toString('base64')}:${ct.toString('base64')}`;
 };
 
-/**
- * Entschlüsselt umgeschlagene Werte; Klartext (Altbestand) kommt unverändert
- * durch. Fehlt der Key für einen vorhandenen Umschlag, wirft es – lieber
- * laut als einen scheinbar leeren Secret-Vorrat.
- */
-export const decryptValue = (keyName, stored, projectRoot, env = process.env) => {
-  const text = String(stored ?? '');
-  if (!isVaultValue(text)) return text;
-  const parts = text.slice(PREFIX.length).split(':');
+const openEnvelope = (vaultId, keyName, envelope, projectRoot, env) => {
+  const legacy = envelope.startsWith(PREFIX_V1);
+  const body = envelope.slice((legacy ? PREFIX_V1 : PREFIX).length);
+  const parts = body.split(':');
   if (parts.length !== 3)
     throw new Error(`Vault-Umschlag für "${keyName}" ist fehlerhaft gebaut.`);
   const [iv, tag, ct] = parts.map((part) => Buffer.from(part, 'base64'));
-  const decipher = createDecipheriv('aes-256-gcm', loadVaultKey(projectRoot, env), iv);
-  decipher.setAAD(Buffer.from(String(keyName), 'utf8'));
+  const decipher = createDecipheriv(
+    'aes-256-gcm',
+    loadVaultKey(projectRoot, env),
+    iv,
+  );
+  decipher.setAAD(
+    legacy
+      ? Buffer.from(String(keyName), 'utf8') // v1 kannte nur den Schlüsselnamen
+      : aad(vaultId, keyName),
+  );
   decipher.setAuthTag(tag);
-  return Buffer.concat([decipher.update(ct), decipher.final()]).toString('utf8');
+  return Buffer.concat([decipher.update(ct), decipher.final()]).toString(
+    'utf8',
+  );
+};
+
+/**
+ * Entschlüsselt umschlagene Werte; Klartext (Altbestand) kommt unverändert
+ * durch, v1-Umschläge mit ihrem alten AAD. Fehlt der Key für einen
+ * vorhandenen Umschlag, wirft es – lieber laut als einen scheinbar leeren
+ * Secret-Vorrat.
+ */
+export const decryptValue = (
+  vaultId,
+  keyName,
+  stored,
+  projectRoot,
+  env = process.env,
+) => {
+  const text = String(stored ?? '');
+  if (!isVaultValue(text)) return text;
+  return openEnvelope(vaultId, keyName, text, projectRoot, env);
 };
 
 /** Nur für Tests: Schlüssel-Cache leeren (Key-Wechsel im selben Prozess). */
