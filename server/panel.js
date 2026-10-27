@@ -2657,7 +2657,12 @@ const request = async (url, method, body) => {
         ? { 'x-bot-hub-bootstrap': bootstrapToken }
         : {}),
     },
-    credentials: 'include',
+    // Authentifizierung läuft ausschließlich über die Header x-bot-hub-token
+    // und x-bot-hub-bootstrap. Credentials:'include' wäre überflüssig und
+    // würde den Preflight brechen: Der Hub sendet bewusst kein
+    // access-control-allow-credentials (siehe applyCors), sonst wäre jede
+    // Sandbox-Seite beliebiger Herkunft ein Angreifer auf die Panel-API.
+    credentials: 'omit',
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const raw = await response.text();

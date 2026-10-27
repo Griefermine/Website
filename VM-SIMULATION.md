@@ -170,6 +170,14 @@ docker exec -d bot-hub-vm bash -c \
      freigegebene HTTPS-Ziele (`--callback-host` beim UFW-Setup, keine
      IPs/Loopback/privat). Das Template registriert den Loopback-Callback
      jetzt nur noch außerhalb des Container-Betriebs.
+ 22. **Panel-Brücke „Failed to fetch" (Preflight)**: Der ausgelieferte
+     Bridge-Code (`BRIDGE_SOURCE` in `panel.js`) sendete
+     `credentials: 'include'`; die Panel-Route antwortet wegen
+     Null-Origin-Sandbox aber bewusst ohne `access-control-allow-credentials`
+     (Header-Token-Auth, keine Cookies – siehe `applyCors`). Brave blockte
+     daher jede Panel-API-Last. Fix: `credentials: 'omit'` in der Bridge.
+     Achtung bei Änderungen an `BRIDGE_SOURCE`: Es ist ein Template-Literal –
+     Backticks im Text zerstücken den String (erst `node --check`!).
 
 ### Betriebslehre
 
