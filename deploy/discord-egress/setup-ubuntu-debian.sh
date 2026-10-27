@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Absoluter Pfad zum Skriptverzeichnis, einmal aufgelöst. Wird unten per `cd`
+# das Arbeitsverzeichnis gewechselt, sonst würden relative `$(dirname "$0")`-
+# Pfade ins Leere laufen (Bug: `install: cannot stat './apply-docker-egress.py'`).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 usage() {
   cat <<'EOF'
 Bot-Hub Discord-Egress und Host-Firewall-Prüfung auf Ubuntu/Debian einrichten.
@@ -123,13 +128,13 @@ fi
 
 # Build before enforcing default-deny egress (fresh installations need the
 # package mirrors). The final runtime build/pulls are then constrained below.
-cd "$(dirname "$0")/../.."
+cd "$SCRIPT_DIR/../.."
 docker compose -f deploy/discord-egress/compose.yaml build
 
 # Package management and Docker image pulls use separate loopback-only Squid
 # listeners with separate domain ACLs. Docker is deliberately restarted when
 # egress policy changes; existing containers will be interrupted.
-install -o root -g root -m 0755 "$(dirname "$0")/apply-docker-egress.py" /usr/local/sbin/bot-hub-docker-egress
+install -o root -g root -m 0755 "$SCRIPT_DIR/apply-docker-egress.py" /usr/local/sbin/bot-hub-docker-egress
 APT_PROXY=/etc/apt/apt.conf.d/90bot-hub-egress
 if [[ -e "$APT_PROXY" ]] && ! grep -Fq '# BOT-HUB MANAGED EGRESS PROXY' "$APT_PROXY"; then
   echo "$APT_PROXY existiert ohne Bot-Hub-Markierung; breche ohne Überschreiben ab." >&2
@@ -186,11 +191,11 @@ ufw default deny incoming
 ufw default deny outgoing
 ufw allow in 80/tcp comment 'Bot-Hub HTTPS redirect and ACME'
 ufw allow in 443/tcp comment 'Bot-Hub HTTPS reverse proxy'
-python3 "$(dirname "$0")/update-ufw-rules.py"
+python3 "$SCRIPT_DIR/update-ufw-rules.py"
 
 # Install a root-owned, read-only checker. The Hub calls only this fixed
 # command via sudo -n; it cannot pass arguments or run arbitrary root commands.
-install -o root -g root -m 0755 "$(dirname "$0")/check-host-firewall.py" \
+install -o root -g root -m 0755 "$SCRIPT_DIR/check-host-firewall.py" \
   /usr/local/sbin/bot-hub-host-firewall-check
 if [[ -n "$HUB_USER" && "$HUB_USER" != root ]]; then
   SUDOERS_FILE=/etc/sudoers.d/bot-hub-host-firewall-check

@@ -213,7 +213,7 @@ systemctl stop bot-hub
 ```bash
 cd /opt/bot-hub
 git pull
-sudo -u bot-hub npm ci --production
+sudo -u bot-hub npm ci --include=dev
 sudo -u bot-hub npm run build
 systemctl restart bot-hub
 ```
@@ -373,7 +373,7 @@ sudo nginx -t && sudo systemctl reload nginx
 ```bash
 cd /opt/bot-hub-test
 git pull
-sudo -u bot-hub npm ci --production
+sudo -u bot-hub npm ci --include=dev
 sudo -u bot-hub npm run build
 systemctl restart bot-hub-test
 ```
@@ -389,7 +389,7 @@ systemctl restart bot-hub-test
 ```bash
 cd /opt/bot-hub
 git pull
-sudo -u bot-hub npm ci --production
+sudo -u bot-hub npm ci --include=dev
 sudo -u bot-hub npm run build
 systemctl restart bot-hub
 systemctl status bot-hub

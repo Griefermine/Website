@@ -298,7 +298,7 @@ systemctl restart bot-hub
 ```bash
 cd /opt/bot-hub
 git pull
-sudo -u bot-hub npm ci --production
+sudo -u bot-hub npm ci --include=dev
 sudo -u bot-hub npm run build
 systemctl restart bot-hub
 ```

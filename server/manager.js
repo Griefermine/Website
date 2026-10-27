@@ -66,6 +66,7 @@ import {
 import {
   accessState,
   configureAccess,
+  configureSessionStore,
   currentUser,
   handleAuthRoutes,
   hasPermission,
@@ -91,6 +92,7 @@ import { ensurePanelScaffold, migrateScaffold } from './panelScaffold.js';
 const PROJECT_ROOT = resolve(process.env.BOT_DASHBOARD_ROOT || process.cwd());
 const DATA_FILE = join(PROJECT_ROOT, 'data', 'bots.json');
 const ACCESS_FILE = join(PROJECT_ROOT, 'data', 'access.json');
+const SESSIONS_FILE = join(PROJECT_ROOT, 'data', 'sessions.json');
 const MAX_LOG_LINES = 800;
 // Untergrenze für Bot-Slots. In Tests wird sie über BOT_HUB_MAX_BOTS gesenkt,
 // um Parallelität gegen die Obergrenze zu prüfen, ohne 24 Bots anlegen zu
@@ -3350,6 +3352,7 @@ configurePanel({
 });
 
 configureAccess(ACCESS_FILE);
+configureSessionStore(SESSIONS_FILE);
 
 export { stopAllBots };
 

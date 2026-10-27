@@ -173,9 +173,15 @@ warnAboutUrl();
  * (host.docker.internal erlaubt einem Bot jeden Dienst auf diesem Rechner).
  * Beides zusammen führt zu Verbindungsfehlern im Bot, die dort sehr schwer
  * zu deuten sind – deshalb dieser Hinweis.
+ *
+ * Im Produktionsmodus ist der Hinweis fehl am Platz: Dort erhalten Bots
+ * automatisch die private Hub-API-Adresse, und ein gesetztes
+ * `BOT_HUB_CONTAINER_URL` würde den Hub-Start sogar abbrechen lassen
+ * (siehe `validateProductionBotNetwork`).
  */
 if (
   containerRuntimeEnabled() &&
+  process.env.NODE_ENV !== 'production' &&
   !String(process.env.BOT_HUB_CONTAINER_URL ?? '').trim()
 )
   console.warn(

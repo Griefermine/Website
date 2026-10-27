@@ -145,6 +145,7 @@ const session = (req) => {
   if (!current) return null;
   if (current.expiresAt <= Date.now()) {
     sessions.delete(value);
+    saveSessions();
     return null;
   }
   return current;
@@ -172,9 +173,14 @@ const cleanup = () => {
   for (const [key, value] of states) {
     if (value.expiresAt <= now) states.delete(key);
   }
+  let expired = false;
   for (const [key, value] of sessions) {
-    if (value.expiresAt <= now) sessions.delete(key);
+    if (value.expiresAt <= now) {
+      sessions.delete(key);
+      expired = true;
+    }
   }
+  if (expired) saveSessions();
 };
 const cleanupTimer = setInterval(cleanup, 60_000);
 cleanupTimer.unref();
@@ -220,6 +226,65 @@ const saveAccess = (strict = false) => {
     // verschlucken, sondern melden sie als Teilfehler.
     if (strict) throw error;
   }
+};
+
+/* Sessions leben im Speicher, überleben aber einen Neustart: Sie werden in
+ * `data/sessions.json` (Mode 0600) ausgelagert. Die Datei enthält gültige
+ * Session-Tokens und wird daher genauso streng behandelt wie access.json;
+ * der Ordner data/ ist ohnehin git-ignoriert. */
+let sessionFile = null;
+const saveSessions = () => {
+  if (!sessionFile) return;
+  const temporary = `${sessionFile}.${process.pid}.tmp`;
+  try {
+    mkdirSync(dirname(sessionFile), { recursive: true });
+    const now = Date.now();
+    const persistent = {};
+    for (const [key, value] of sessions) {
+      if (value.expiresAt > now) persistent[key] = value;
+    }
+    writeFileSync(temporary, `${JSON.stringify(persistent, null, 2)}\n`, {
+      mode: 0o600,
+    });
+    chmodSync(temporary, 0o600);
+    const fd = openSync(temporary, 'r');
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporary, sessionFile);
+  } catch (error) {
+    try {
+      unlinkSync(temporary);
+    } catch {
+      /* Ein TempFile-Rest ist harmlos; der Schreibfehler wird gemeldet. */
+    }
+    console.error('[hub] Sessions konnten nicht gespeichert werden:', error.message);
+  }
+};
+const loadSessions = () => {
+  if (!sessionFile || !existsSync(sessionFile)) return;
+  try {
+    const parsed = JSON.parse(readFileSync(sessionFile, 'utf8'));
+    const now = Date.now();
+    for (const [key, value] of Object.entries(parsed ?? {})) {
+      if (
+        value &&
+        typeof value.expiresAt === 'number' &&
+        value.expiresAt > now &&
+        value.user?.id
+      )
+        sessions.set(key, value);
+    }
+  } catch (error) {
+    console.error('[hub] Sessions konnten nicht geladen werden:', error.message);
+  }
+};
+export const configureSessionStore = (file) => {
+  sessionFile = file;
+  sessions.clear();
+  loadSessions();
 };
 
 const loadAccess = () => {
@@ -578,6 +643,7 @@ export const handleAuthRoutes = async (req, res, url, sendJson, httpError) => {
       })),
       expiresAt: Date.now() + SESSION_TTL,
     });
+    saveSessions();
     res.writeHead(302, {
       location: '/',
       'set-cookie': [
@@ -591,6 +657,7 @@ export const handleAuthRoutes = async (req, res, url, sendJson, httpError) => {
 
   if (url.pathname === '/api/auth/logout' && req.method === 'POST') {
     sessions.delete(cookieValue(req, SESSION_COOKIE));
+    saveSessions();
     res.setHeader('set-cookie', cookie('', 0));
     return sendJson(res, 200, { ok: true });
   }

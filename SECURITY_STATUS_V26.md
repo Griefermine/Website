@@ -281,7 +281,7 @@ docker compose up -d
 
 ```bash
 cd /opt/bot-hub
-npm ci --production
+npm ci --include=dev
 npm run build
 ```
 
@@ -345,6 +345,8 @@ WantedBy=multi-user.target
 
 ```bash
 sudo useradd -r -s /bin/false bot-hub
+# npm braucht ~/.npm als Cache – System-Accounts bekommen kein Home:
+sudo mkdir -p /home/bot-hub && sudo chown bot-hub:bot-hub /home/bot-hub
 sudo chown -R bot-hub:bot-hub /opt/bot-hub
 sudo systemctl daemon-reload
 sudo systemctl enable bot-hub
