@@ -34,6 +34,7 @@ import {
   dotenvKey,
   readSecretValues,
   removeSecretValues,
+  bootstrapSecretVault,
   storeSecretValues,
 } from './secrets.js';
 import {
@@ -3353,6 +3354,10 @@ configurePanel({
 
 configureAccess(ACCESS_FILE);
 configureSessionStore(SESSIONS_FILE);
+// Vault-Bootstrap: Klartext-Reste versiegeln + OAuth-Werte aus .env in den
+// verschlüsselten hub.env umziehen lassen. Vor dem ersten Listen, damit
+// keine Anfrage Klartext-Umgebungswerte sieht, nachdem der Umzug geplant ist.
+bootstrapSecretVault(PROJECT_ROOT);
 
 export { stopAllBots };
 

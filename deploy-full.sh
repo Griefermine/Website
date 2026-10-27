@@ -190,6 +190,24 @@ else
     log_info ".env existiert bereits"
 fi
 
+# Vault-Master-Key für die Verschlüsselung von data/secrets/*.env (AES-256-GCM).
+# Absichtlich AUSSERHALB von data/ und des Projektordners: ein Backup oder Git-
+# Unfall, der nur den Datenordner erwischt, gibt dann nichts mehr her. Der Hub
+# liest den Pfad über BOT_HUB_KEY_FILE (aus der .env via EnvironmentFile).
+mkdir -p /etc/bot-hub
+if [ ! -f /etc/bot-hub/master.key ]; then
+    umask 077
+    node -e 'process.stdout.write(require("crypto").randomBytes(32).toString("hex")+"\n")' > /tmp/master.key.$$
+    mv /tmp/master.key.$$ /etc/bot-hub/master.key
+    chmod 640 /etc/bot-hub/master.key
+    chown root:bot-hub /etc/bot-hub/master.key
+    log_success "Vault-Key /etc/bot-hub/master.key erzeugt (root:bot-hub 0640)"
+else
+    log_info "Vault-Key existiert bereits"
+fi
+grep -q '^BOT_HUB_KEY_FILE=' .env || printf '\nBOT_HUB_KEY_FILE=/etc/bot-hub/master.key\n' >> .env
+grep -q '^BOT_HUB_KEY_FILE=' .env && log_info "BOT_HUB_KEY_FILE in .env eingetragen"
+
 # ============================================
 # 6. Docker-Netzwerk einrichten
 # ============================================

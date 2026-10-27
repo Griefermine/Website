@@ -26,6 +26,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { parseDotenv } from './util.js';
+import { decryptValue, encryptValue, isVaultValue, vaultEnabled } from './vault.js';
 
 /** Verzeichnis 0700, Datei 0600 – mit Absicht, nicht mit Vorgabe. */
 const directoryOf = (projectRoot) => join(projectRoot, 'data', 'secrets');
@@ -99,13 +100,25 @@ export const formatDotenv = (values) =>
     .map(([key, value]) => `${key}=${dotenvValue(value)}`)
     .join('\n')}\n`;
 
-/** Inhalt der Secret-Datei; fehlende oder unlesbare Datei ergibt `{}`. */
+/**
+ * Inhalt der Secret-Datei; fehlende oder unlesbare Datei ergibt `{}`.
+ * Liegt ein Vault-Key an, werden umschlagene Werte transparent entschlüsselt –
+ * alle Aufrufer sehen immer Klartext. Klartext-Altbestand (vor der Umstellung
+ * geschrieben) bleibt lesbar. `decryptValue` wirft bei Manipulation oder
+ * fehlendem Key zu einem Umschlag – das ist Absicht (lieber laut als ein
+ * vermeintlich leerer Secret-Bestand).
+ */
 export const readSecretValues = (projectRoot, id) => {
+  let parsed;
   try {
-    return parseDotenv(readFileSync(fileOf(projectRoot, id), 'utf8'));
+    parsed = parseDotenv(readFileSync(fileOf(projectRoot, id), 'utf8'));
   } catch {
     return {};
   }
+  const values = {};
+  for (const [key, value] of Object.entries(parsed))
+    values[key] = decryptValue(key, value, projectRoot);
+  return values;
 };
 
 /**
@@ -123,6 +136,14 @@ export const storeSecretValues = (
     ? { ...readSecretValues(projectRoot, id), ...values }
     : Object.fromEntries(Object.entries(values));
   if (!Object.keys(merged).length) return fileOf(projectRoot, id);
+  // Liegt ein Vault-Key an, wandert jeder Wert umgeschlagen in die Datei;
+  // ohne Key bleibt das alte Klartext-Verhalten (Tests, Entwickler).
+  const sealed = Object.fromEntries(
+    Object.entries(merged).map(([key, value]) => [
+      key,
+      encryptValue(key, value, projectRoot),
+    ]),
+  );
   const directory = directoryOf(projectRoot);
   // Zufällig benannt + `wx`: ein erratbarer Temp-Pfad (pid/Zeit/Math.random)
   // wäre ein Symlink-Ziel; `wx` öffnet garantiert eine frische Datei.
@@ -139,7 +160,7 @@ export const storeSecretValues = (
   try {
     fd = openSync(temp, 'wx', 0o600);
     fchmodSync(fd, 0o600);
-    writeFileSync(fd, formatDotenv(Object.entries(merged)), {
+    writeFileSync(fd, formatDotenv(Object.entries(sealed)), {
       encoding: 'utf8',
     });
     // fsync VOR dem Rename: erst wenn der Inhalt auf der Platte steht, darf
@@ -177,4 +198,95 @@ export const removeSecretValues = (projectRoot, id) => {
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
   }
+};
+
+/**
+ * Eigene Secret-Datei des Hubs: `data/secrets/hub.env`. Sie enthält die
+ * OAuth-Werte, die bisher offen in `.env` standen – genau die Datei, vor der
+ * die Warnung des Hubs beim Start zu Recht warnt ("landet leicht im Git").
+ */
+export const HUB_SECRET_ID = 'hub';
+const HUB_ENV_KEYS = [
+  'DISCORD_CLIENT_ID',
+  'DISCORD_CLIENT_SECRET',
+  'DISCORD_REDIRECT_URI',
+];
+
+/**
+ * Läuft einmal beim Hub-Start und macht zwei Dinge:
+ *
+ * 1. Nachverschlüsselung: Hat ein älterer Hub Secret-Dateien im Klartext
+ *    geschrieben, wandern sie jetzt in Vault-Umschläge. Das ist rein
+ *    konservativ – gelesen werden beide Formen immer.
+ * 2. OAuth-Umzug: Werte aus der Prozessumgebung (`.env`) ziehen in
+ *    `data/secrets/hub.env` um und der Vault-Wert gewinnt ab sofort gegen
+ *    die Umgebung. `auth.js` liest die Umgebung erst pro Anfrage, daher
+ *    wirkt die Überschreibung sofort. Danach kann der Betreiber die
+ *    `.env`-Zeilen löschen.
+ *
+ * Ohne Vault-Key passiert nichts (Klartext-Modus wie bisher), es sei denn,
+ * es liegt Klartext herum – dann gibt es genau einen Hinweis. Für `_FILE`-
+ * Schlüssel wird nicht umgezogen: die Datei-Indirektion gewinnt in `auth.js`
+ * und ein Vault-Duplikat wäre nur ein zweiter Ort, den man pflegen muss.
+ */
+export const bootstrapSecretVault = (projectRoot, env = process.env) => {
+  const enabled = vaultEnabled(projectRoot, env);
+  const directory = directoryOf(projectRoot);
+  const sealed = [];
+  let entries = [];
+  try {
+    entries = readdirSync(directory).filter((name) => name.endsWith('.env'));
+  } catch {
+    /* Noch gar kein Secret-Verzeichnis – gibt nichts zu versiegeln. */
+  }
+  for (const name of entries) {
+    const id = name.slice(0, -'.env'.length);
+    let parsed;
+    try {
+      parsed = parseDotenv(readFileSync(join(directory, name), 'utf8'));
+    } catch {
+      continue;
+    }
+    const openValues = Object.values(parsed).filter(
+      (value) => String(value ?? '').trim() !== '' && !isVaultValue(value),
+    );
+    if (!openValues.length) continue;
+    if (!enabled) {
+      if (env.BOT_HUB_TEST_MODE !== '1')
+        console.warn(
+          '[hub] Hinweis: Secret-Dateien liegen im Klartext und es ist kein ' +
+            'Vault-Key vorhanden. Für AES-256-GCM-Verschlüsselung ' +
+            'BOT_HUB_KEY_FILE setzen (siehe server/vault.js).',
+        );
+      break;
+    }
+    storeSecretValues(projectRoot, id, readSecretValues(projectRoot, id), {
+      merge: false,
+    });
+    sealed.push(id);
+  }
+  if (sealed.length)
+    console.warn(
+      `[hub] ${sealed.length} Secret-Datei(en) in den Vault verschlüsselt.`,
+    );
+
+  const stored = enabled ? readSecretValues(projectRoot, HUB_SECRET_ID) : {};
+  const migrated = {};
+  for (const key of HUB_ENV_KEYS) {
+    if (enabled && stored[key]) env[key] = stored[key];
+    const fromEnv = String(env[key] ?? '').trim();
+    const viaFile = String(env[`${key}_FILE`] ?? '').trim();
+    if (!enabled || !fromEnv || stored[key] || viaFile) continue;
+    migrated[key] = fromEnv;
+  }
+  if (Object.keys(migrated).length) {
+    storeSecretValues(projectRoot, HUB_SECRET_ID, migrated);
+    for (const key of Object.keys(migrated)) env[key] = migrated[key];
+    console.warn(
+      `[hub] Auth-Werte (${Object.keys(migrated).join(', ')}) in den ` +
+        `verschlüsselten data/secrets/${HUB_SECRET_ID}.env umgezogen – ` +
+        'die Zeilen können aus .env gelöscht werden.',
+    );
+  }
+  return { enabled, sealed, migrated: Object.keys(migrated) };
 };

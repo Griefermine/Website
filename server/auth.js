@@ -103,10 +103,35 @@ const cookieValue = (req, name) =>
     .map((part) => part.trim().split('='))
     .find(([key]) => key === name)?.[1] ?? '';
 
+/**
+ * Wert einer Auth-Konfiguration. `_FILE` gewinnt: Zeigt
+ * `DISCORD_CLIENT_SECRET_FILE` auf eine Datei, wird deren Inhalt benutzt.
+ * So kann das Client-Secret in einer root-eigenen, 0440-geschützten Datei
+ * AUSSERHALB von Projekt-Root und `data/` liegen (systemd-Credential,
+ * Docker-Secret) und muss nicht mehr in der `.env` stehen, die leicht im Git
+ * landet – genau die Warnung, die der Hub beim Start ausgibt.
+ * Lese-/Parsing-Fehler führen zum Env-Wert, nicht zum Abbruch.
+ */
+const configValue = (name) => {
+  const filePath = String(process.env[`${name}_FILE`] ?? '').trim();
+  if (filePath) {
+    try {
+      const content = readFileSync(filePath, 'utf8');
+      const value = content.trim();
+      if (value) return value;
+    } catch (error) {
+      console.error(
+        `[hub] ${name}_FILE konnte nicht gelesen werden (${error.code ?? error.message}) – falle auf ${name} zurück.`,
+      );
+    }
+  }
+  return String(process.env[name] ?? '').trim();
+};
+
 const config = () => ({
-  clientId: String(process.env.DISCORD_CLIENT_ID ?? '').trim(),
-  clientSecret: String(process.env.DISCORD_CLIENT_SECRET ?? '').trim(),
-  redirectUri: String(process.env.DISCORD_REDIRECT_URI ?? '').trim(),
+  clientId: configValue('DISCORD_CLIENT_ID'),
+  clientSecret: configValue('DISCORD_CLIENT_SECRET'),
+  redirectUri: configValue('DISCORD_REDIRECT_URI'),
 });
 
 const origin = () => {

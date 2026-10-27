@@ -178,6 +178,29 @@ docker exec -d bot-hub-vm bash -c \
      daher jede Panel-API-Last. Fix: `credentials: 'omit'` in der Bridge.
      Achtung bei Änderungen an `BRIDGE_SOURCE`: Es ist ein Template-Literal –
      Backticks im Text zerstücken den String (erst `node --check`!).
+ 23. **Secrets nur noch verschlüsselt at-rest (Vault-Maßnahme)**:
+     `data/secrets/*.env` (Bot-Discord-Tokens, DB-Passwörter) lagen im
+     Klartext auf der Platte; das OAuth-Client-Secret stand in der `.env`,
+     wovor der Hub beim Start selbst warnt. Neu: `server/vault.js`
+     (AES-256-GCM-Umschläge `vault:v1:<iv>:<tag>:<ct>`, AAD = Schlüssel-
+     name → kein Umschichten zwischen Einträgen; GCM-Tag → Manipulation
+     wirft laut statt leer zu sein). `secrets.js` versiegelt beim Schreiben
+     und entschlüsselt beim Lesen transparent – alle Aufrufer sehen wie
+     bisher Klartext, alter Klartext bleibt lesbar. `bootstrapSecretVault`
+     (Aufruf in `manager.js`) versiegelt beim Start alle Klartext-Reste und
+     zieht `DISCORD_CLIENT_*` aus der Umgebung in den verschlüsselten
+     `data/secrets/hub.env` um (Vault-Wert gewinnt gegen die Umgebung,
+     `_FILE`-Indirektion in `auth.js` gewinnt gegen beides und verhindert
+     Duplikate). Master-Key AUSSERHALB von `data/`: Produktion
+     `BOT_HUB_KEY_FILE=/etc/bot-hub/master.key` (root:bot-hub 0640,
+     deploy-full.sh erzeugt ihn), Entwicklung fällt auf
+     `<projectRoot>/.secrets.key` zurück – existiert kein Key, bleibt das
+     alte Klartext-Verhalten (Tests, Entwickler). Der Bot-Container sieht
+     weiterhin nur seine gespritzten Umgebungsvariablen (Angriffskette
+     „kompromittierter Bot liest data/" bleibt wirkungslos); ehrliche
+     Grenze: Der Bot-Prozess muss sein eigenes Token nutzen können, und
+     wer Hub-Prozess + Key-Datei komplett lesen kann, kommt weiter (dagegen
+     hilft nur Festplattenverschlüsselung). Tests: `secrets-vault.test.js`.
 
 ### Betriebslehre
 
@@ -224,3 +247,30 @@ docker exec bot-hub-vm systemctl restart live-watch    # Log zurücksetzen
 ```
 
 (Fingerabdruck des letzten Events ist der Zeitstempel im Eintrag.)
+
+## Secrets-Vault betreiben (Maßnahme 23)
+
+Aktivierung in der VM (einmalig, als root im Container):
+
+```
+docker exec bot-hub-vm bash -c '
+  umask 077
+  node -e "process.stdout.write(require(\"crypto\").randomBytes(32).toString(\"hex\")+\"\n\")" > /etc/bot-hub/master.key
+  chmod 640 /etc/bot-hub/master.key && chown root:bot-hub /etc/bot-hub/master.key
+  grep -q "^BOT_HUB_KEY_FILE=" /opt/bot-hub/.env || printf "\nBOT_HUB_KEY_FILE=/etc/bot-hub/master.key\n" >> /opt/bot-hub/.env
+  systemctl restart bot-hub'
+```
+
+Danach beim Hub-Start im Journal (`journalctl -u bot-hub -b | grep vault`):
+„Secret-Datei(en) in den Vault verschlüsselt" und „Auth-Werte … umgezogen".
+Prüfen, dass nichts mehr im Klartext liegt (die Datei darf den Token nicht
+mehr enthalten, `vault:v1:` muss drinstehen):
+
+```
+docker exec bot-hub-vm grep -c vault:v1 /opt/bot-hub/data/secrets/*.env
+```
+
+**Pflicht: Master-Key sichern.** Ohne `/etc/bot-hub/master.key` sind alle Vault-Umschläge unwiederbringlich verloren (AES, kein Backdoor-Zugang). Backup: `docker exec bot-hub-vm cat /etc/bot-hub/master.key` in einen Passwortmanager (außerhalb der VM) legen; niemals ins Repo (`*.key` ist gitignoret). Danach aufräumen: Nach dem Umzug können `DISCORD_CLIENT_SECRET` (und `DISCORD_CLIENT_ID`, `DISCORD_REDIRECT_URI`) aus `/opt/bot-hub/.env` gelöscht werden – der Hub liest sie jetzt aus `data/secrets/hub.env`. Funktionstest danach: `curl -sk -o /dev/null -w "%{http_code}" https://127.0.0.1/api/auth/discord/login` muss 302 liefern (beide Werte aus dem Vault aufgelöst).
+
+Rollback: Die `BOT_HUB_KEY_FILE`-Zeile kann nur entfernt werden, solange noch keine Umschläge geschrieben wurden – sobald Werte versiegelt sind, ist der Key zum Lesen zwingend nötig.
+
