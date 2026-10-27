@@ -144,15 +144,30 @@ else
     log_info "Bot-Hub Benutzer existiert bereits"
 fi
 
+# `useradd -r` legt kein Home an, aber npm braucht ~/.npm als Cache – sonst
+# scheitert `npm ci` mit EACCES beim Anlegen von /home/bot-hub.
+BOT_HUB_HOME="$(getent passwd bot-hub | cut -d: -f6)"
+if [ -n "$BOT_HUB_HOME" ] && [ ! -d "$BOT_HUB_HOME" ]; then
+    log_info "Home-Verzeichnis für npm-Cache anlegen: $BOT_HUB_HOME"
+    mkdir -p "$BOT_HUB_HOME"
+    chown bot-hub:bot-hub "$BOT_HUB_HOME"
+fi
+
 # Projektverzeichnis berechtigen
 chown -R bot-hub:bot-hub "$PROJECT_DIR"
+
+# Der Hub steuert Bot-Container über den Socket und validiert in Produktion
+# die Egress-Netzwerke per `docker network inspect` – ohne Gruppenmitglied-
+# schaft bricht der Produktionsstart mit "Discord-Ausgangsfilter: Docker-Netz
+# fehlt", weil der Dienst den Socket nicht lesen darf.
+usermod -aG docker bot-hub
 
 # In Projektverzeichnis wechseln
 cd "$PROJECT_DIR"
 
 # Abhängigkeiten installieren
 log_info "Node.js Abhängigkeiten installieren..."
-sudo -u bot-hub npm ci --production
+sudo -u bot-hub npm ci --include=dev
 log_success "Abhängigkeiten installiert"
 
 # Frontend bauen
@@ -175,6 +190,24 @@ else
     log_info ".env existiert bereits"
 fi
 
+# Vault-Master-Key für die Verschlüsselung von data/secrets/*.env (AES-256-GCM).
+# Absichtlich AUSSERHALB von data/ und des Projektordners: ein Backup oder Git-
+# Unfall, der nur den Datenordner erwischt, gibt dann nichts mehr her. Der Hub
+# liest den Pfad über BOT_HUB_KEY_FILE (aus der .env via EnvironmentFile).
+mkdir -p /etc/bot-hub
+if [ ! -f /etc/bot-hub/master.key ]; then
+    umask 077
+    node -e 'process.stdout.write(require("crypto").randomBytes(32).toString("hex")+"\n")' > /tmp/master.key.$$
+    mv /tmp/master.key.$$ /etc/bot-hub/master.key
+    chmod 640 /etc/bot-hub/master.key
+    chown root:bot-hub /etc/bot-hub/master.key
+    log_success "Vault-Key /etc/bot-hub/master.key erzeugt (root:bot-hub 0640)"
+else
+    log_info "Vault-Key existiert bereits"
+fi
+grep -q '^BOT_HUB_KEY_FILE=' .env || printf '\nBOT_HUB_KEY_FILE=/etc/bot-hub/master.key\n' >> .env
+grep -q '^BOT_HUB_KEY_FILE=' .env && log_info "BOT_HUB_KEY_FILE in .env eingetragen"
+
 # ============================================
 # 6. Docker-Netzwerk einrichten
 # ============================================
@@ -186,7 +219,12 @@ if [ -d "deploy/discord-egress" ]; then
     # Host-Firewall-Setup ausführen
     if [ -f "setup-ubuntu-debian.sh" ]; then
         log_info "Host-Firewall einrichten..."
-        bash setup-ubuntu-debian.sh
+        # --enable ist Pflicht: ohne Aktivierung bricht das Setup bewusst vor
+        # den Bot-Netzwerken ab (exit 0), und der Hub findet in Produktion
+        # kein `bot-hub-discord`-Netz. --hub-user schreibt die sudoers-Regel,
+        # damit der Dienst-User den Root-Prüfer des Firewall-Audits aufrufen
+        # darf – ohne ihn verweigert der Hub in Produktion den Start.
+        bash setup-ubuntu-debian.sh --enable --hub-user bot-hub
         log_success "Host-Firewall eingerichtet"
     else
         log_warn "setup-ubuntu-debian.sh nicht gefunden"
@@ -218,6 +256,12 @@ Type=simple
 User=bot-hub
 WorkingDirectory=$PROJECT_DIR
 Environment="NODE_ENV=production"
+# Ohne EnvironmentFile liest der Hub-Prozess die .env nie – Discord-Credentials,
+# BOT_HUB_URL und Digest-Pins bleiben sonst wirkungslos (der Server lädt kein
+# dotenv selbst). Das "-" Präfix macht die Datei optional. Werte mit
+# Sonderzeichen (z. B. JSON in BOT_HUB_CONTAINER_IMAGES) in der .env einfach
+# in einfache Hochkommata setzen: KEY='{"a":"b"}'
+EnvironmentFile=-$PROJECT_DIR/.env
 ExecStart=/usr/bin/node server/index.js
 Restart=always
 RestartSec=10
@@ -244,31 +288,24 @@ chmod 600 data/bots.json data/access.json 2>/dev/null || true
 log_success "Verzeichnisse und Rechte eingerichtet"
 
 # ============================================
-# 9. Firewall konfigurieren (UFW)
+# 9. Firewall verifizieren (UFW gehört zum Egress-Setup)
 # ============================================
-log_info "Step 9: Firewall konfigurieren..."
+log_info "Step 9: Firewall prüfen..."
 
-# UFW Status prüfen
+# Die Firewall-Hoheit liegt bei setup-ubuntu-debian.sh (Step 6): das Skript
+# aktiviert UFW und lässt gezielt nur Hub-HTTPS (80/443) sowie SSH aus der
+# erkannten Admin-Gegenstelle zu. Eine pauschale `ufw allow 22/tcp`-Regel von
+# "Anywhere" würde die Eingangs-Prüfung des Egress-Setups brechen, deshalb
+# wird UFW hier nur verifiziert und nicht eigenmädig neu bepackt.
 if ufw status | grep -q "Status: active"; then
-    log_info "UFW ist bereits aktiv"
+    # Der Eingangsaudit des Egress-Setups erlaubt exakt 80/tcp und 443/tcp
+    # (Hub-HTTPS) plus SSH aus der erkannten Admin-Gegenstelle – nur diese
+    # beiden Ports öffnen wir hier nach, wenn sie fehlen.
+    ufw status | grep -q "80/tcp" || ufw allow 80/tcp
+    ufw status | grep -q "443/tcp" || ufw allow 443/tcp
+    log_success "UFW aktiv; Hub-Ports 80/443 freigehalten"
 else
-    log_info "UFW wird aktiviert..."
-    
-    # Standardregeln
-    ufw default deny incoming
-    ufw default allow outgoing
-    
-    # SSH erlauben (wichtig!)
-    ufw allow 22/tcp
-    
-    # HTTP und HTTPS erlauben
-    ufw allow 80/tcp
-    ufw allow 443/tcp
-    
-    # UFW aktivieren (ohne Prompt)
-    ufw --force enable
-    
-    log_success "UFW aktiviert"
+    log_warn "UFW ist nicht aktiv. Starte 'bash deploy/discord-egress/setup-ubuntu-debian.sh --enable' (Schritt 6) und prüfe 'sudo ufw status numbered'."
 fi
 
 # ============================================
@@ -295,7 +332,7 @@ server {
     # Temporary redirect to HTTPS (wird später konfiguriert)
     location / {
         proxy_pass http://127.0.0.1:8787;
-        proxy_set_header Host $host;
+        proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;

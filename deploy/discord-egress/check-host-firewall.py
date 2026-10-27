@@ -78,6 +78,28 @@ def check_configured_inbound() -> bool:
     return True
 
 
+def normalize_rule(rule: list[str]) -> list[str]:
+    """Vergleichbare Form einer iptables-Regel.
+
+    Das nft-Backend (Standard ab Ubuntu 22.04) gibt Optionen in eigener
+    kanonischer Reihenfolge aus und wiederholt den Protokollmatch
+    (`-p tcp -m tcp`). Token-Reihenfolge innerhalb einer Regel ist ohne
+    Aussage, die Reihenfolge der Regeln untereinander ist es nicht –
+    deshalb werden nur die Token einer Regel normalisiert sortiert.
+    """
+    implied = ("tcp", "udp")
+    out: list[str] = []
+    index = 0
+    while index < len(rule):
+        token = rule[index]
+        if token == "-m" and index + 1 < len(rule) and rule[index + 1] in implied:
+            index += 2
+            continue
+        out.append(token)
+        index += 1
+    return sorted(out)
+
+
 def check_ufw() -> bool:
     status = run(["ufw", "status"])
     if status.returncode or not status.stdout.startswith("Status: active"):
@@ -86,31 +108,31 @@ def check_ufw() -> bool:
     if rules.returncode:
         return False
     actual = [shlex.split(line) for line in rules.stdout.splitlines() if line.startswith("-A ufw-before-input ")]
-    # iptables may print the implicit TCP match explicitly; normalize that
-    # representation before comparing the exact top-of-chain sequence.
-    actual = [
-        [token for index, token in enumerate(rule) if not (token == "-m" and rule[index + 1 : index + 2] == ["tcp"]) and not (index > 0 and rule[index - 1] == "-m" and token == "tcp")]
-        for rule in actual
-    ]
-    input_ok = actual[: len(EXPECTED_UFW_RULES)] == EXPECTED_UFW_RULES
+    actual = [normalize_rule(rule) for rule in actual]
+    expected_input = [normalize_rule(rule) for rule in EXPECTED_UFW_RULES]
+    input_ok = actual[: len(expected_input)] == expected_input
     def output_guard(binary: str) -> bool:
-        output = run([binary, "-S", "ufw-before-output"])
+        # ip6tables führt die Kette unter dem Namen ufw6-before-output; mit
+        # dem hartcodierten v4-Namen wäre die v6-Prüfung immer gescheitert.
+        chain = "ufw6-before-output" if binary == "ip6tables" else "ufw-before-output"
+        output = run([binary, "-S", chain])
         if output.returncode:
             return False
-        outgoing = [shlex.split(line) for line in output.stdout.splitlines() if line.startswith("-A ufw-before-output ")]
-        outgoing = [
-            [token for index, token in enumerate(rule) if not (token == "-m" and rule[index + 1 : index + 2] == ["tcp"]) and not (index > 0 and rule[index - 1] == "-m" and token == "tcp")]
-            for rule in outgoing
+        outgoing = [shlex.split(line) for line in output.stdout.splitlines() if line.startswith(f"-A {chain} ")]
+        outgoing = [normalize_rule(rule) for rule in outgoing]
+        expected_prefix = [
+            normalize_rule([token.replace("ufw-before-output", chain) for token in rule])
+            for rule in EXPECTED_OUTPUT_PREFIX
         ]
-        if outgoing[: len(EXPECTED_OUTPUT_PREFIX)] != EXPECTED_OUTPUT_PREFIX:
+        if outgoing[: len(expected_prefix)] != expected_prefix:
             return False
         tail = [
-            ["-A", "ufw-before-output", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
-            ["-A", "ufw-before-output", "-j", "DROP"],
+            normalize_rule(["-A", chain, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"]),
+            normalize_rule(["-A", chain, "-j", "DROP"]),
         ]
         return any(
             outgoing[index : index + len(tail)] == tail
-            for index in range(len(EXPECTED_OUTPUT_PREFIX), len(outgoing) - len(tail) + 1)
+            for index in range(len(expected_prefix), len(outgoing) - len(tail) + 1)
         )
 
     output_ok = output_guard("iptables")
@@ -123,7 +145,10 @@ def check_ufw() -> bool:
     inbound_ok = numbered.returncode == 0
     ssh_allow = pathlib.Path("/etc/bot-hub/ssh-management.allow")
     expected_ssh = configured_ssh_allow()
-    if ssh_allow.exists() and expected_ssh is None:
+    # Eine leere Datei bedeutet bewusst "keine Admin-SSH-Freigabe"
+    # (Konsolen-Installation) – nur eine nicht lesebare Datei mit Inhalt ist
+    # ein Zustand, dem der Audit nicht trauen darf.
+    if ssh_allow.exists() and ssh_allow.read_text(encoding="utf-8").split() and expected_ssh is None:
         inbound_ok = False
     for line in numbered.stdout.splitlines():
         if "ALLOW IN" not in line:

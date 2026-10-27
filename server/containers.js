@@ -273,10 +273,11 @@ export const containerCreateArgs = (bot, projectRoot) => [
   '--volume',
   `${workspacePath(bot, projectRoot)}:/workspace`,
   ...sharedVolume(projectRoot),
+  // Wichtiger Fix: vorher lief hier `tail tail -f /dev/null` (ein 'tail' zu
+  // viel als Argument) -> "tail: cannot open 'tail'" im Bot-Container-Log.
   '--entrypoint',
   'tail',
   imageOf(bot),
-  'tail',
   '-f',
   '/dev/null',
 ];
@@ -442,9 +443,12 @@ export const validateProductionBotNetwork = async () => {
 
   const firewallChecker = '/usr/local/sbin/bot-hub-host-firewall-check';
   const firewallCheck = await new Promise((resolve) => {
-    const command =
-      process.getuid?.() === 0 ? firewallChecker : '/usr/bin/sudo';
-    const args = command === 'sudo' ? ['-n', firewallChecker] : [];
+    // Vorher verglich `command === 'sudo'` mit dem absoluten Pfad
+    // '/usr/bin/sudo' – das matchte nie, Argumente blieben leer und das
+    // nackte `sudo` gab nur seine Usage aus (Prüfung scheiterte immer).
+    const asRoot = process.getuid?.() === 0;
+    const command = asRoot ? firewallChecker : '/usr/bin/sudo';
+    const args = asRoot ? [] : ['-n', firewallChecker];
     const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';

@@ -12,6 +12,7 @@ import {
   unlinkSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { decryptValue, encryptValue, vaultEnabled } from './vault.js';
 
 const DISCORD_API = 'https://discord.com/api/v10';
 // Nur bekannte Discord-Codes zurückgeben, niemals den Parameterwert spiegeln.
@@ -103,10 +104,35 @@ const cookieValue = (req, name) =>
     .map((part) => part.trim().split('='))
     .find(([key]) => key === name)?.[1] ?? '';
 
+/**
+ * Wert einer Auth-Konfiguration. `_FILE` gewinnt: Zeigt
+ * `DISCORD_CLIENT_SECRET_FILE` auf eine Datei, wird deren Inhalt benutzt.
+ * So kann das Client-Secret in einer root-eigenen, 0440-geschützten Datei
+ * AUSSERHALB von Projekt-Root und `data/` liegen (systemd-Credential,
+ * Docker-Secret) und muss nicht mehr in der `.env` stehen, die leicht im Git
+ * landet – genau die Warnung, die der Hub beim Start ausgibt.
+ * Lese-/Parsing-Fehler führen zum Env-Wert, nicht zum Abbruch.
+ */
+const configValue = (name) => {
+  const filePath = String(process.env[`${name}_FILE`] ?? '').trim();
+  if (filePath) {
+    try {
+      const content = readFileSync(filePath, 'utf8');
+      const value = content.trim();
+      if (value) return value;
+    } catch (error) {
+      console.error(
+        `[hub] ${name}_FILE konnte nicht gelesen werden (${error.code ?? error.message}) – falle auf ${name} zurück.`,
+      );
+    }
+  }
+  return String(process.env[name] ?? '').trim();
+};
+
 const config = () => ({
-  clientId: String(process.env.DISCORD_CLIENT_ID ?? '').trim(),
-  clientSecret: String(process.env.DISCORD_CLIENT_SECRET ?? '').trim(),
-  redirectUri: String(process.env.DISCORD_REDIRECT_URI ?? '').trim(),
+  clientId: configValue('DISCORD_CLIENT_ID'),
+  clientSecret: configValue('DISCORD_CLIENT_SECRET'),
+  redirectUri: configValue('DISCORD_REDIRECT_URI'),
 });
 
 const origin = () => {
@@ -145,6 +171,7 @@ const session = (req) => {
   if (!current) return null;
   if (current.expiresAt <= Date.now()) {
     sessions.delete(value);
+    saveSessions();
     return null;
   }
   return current;
@@ -172,9 +199,14 @@ const cleanup = () => {
   for (const [key, value] of states) {
     if (value.expiresAt <= now) states.delete(key);
   }
+  let expired = false;
   for (const [key, value] of sessions) {
-    if (value.expiresAt <= now) sessions.delete(key);
+    if (value.expiresAt <= now) {
+      sessions.delete(key);
+      expired = true;
+    }
   }
+  if (expired) saveSessions();
 };
 const cleanupTimer = setInterval(cleanup, 60_000);
 cleanupTimer.unref();
@@ -220,6 +252,77 @@ const saveAccess = (strict = false) => {
     // verschlucken, sondern melden sie als Teilfehler.
     if (strict) throw error;
   }
+};
+
+/* Sessions leben im Speicher, überleben aber einen Neustart: Sie werden in
+ * `data/sessions.json` ausgelagert (Mode 0600). Die Datei enthält gültige
+ * Session-Tokens – wer den data/-Ordner kopiert, wäre sonst angemeldet. Mit
+ * Vault-Key liegt die Datei deshalb als ein einziger AES-256-GCM-Umschlag
+ * (v2, fest an Dateiname+Schlüsselname gebunden) auf der Platte; ohne Key
+ * bleibt das alte Klartext-Verhalten. */
+let sessionFile = null;
+const projectRootOfSessionFile = () => dirname(dirname(sessionFile));
+const saveSessions = () => {
+  if (!sessionFile) return;
+  const temporary = `${sessionFile}.${process.pid}.tmp`;
+  try {
+    mkdirSync(dirname(sessionFile), { recursive: true });
+    const now = Date.now();
+    const persistent = {};
+    for (const [key, value] of sessions) {
+      if (value.expiresAt > now) persistent[key] = value;
+    }
+    let content = `${JSON.stringify(persistent, null, 2)}\n`;
+    if (vaultEnabled(projectRootOfSessionFile()))
+      content = `${encryptValue('sessions', 'file', content, projectRootOfSessionFile())}\n`;
+    writeFileSync(temporary, content, { mode: 0o600 });
+    chmodSync(temporary, 0o600);
+    const fd = openSync(temporary, 'r');
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporary, sessionFile);
+  } catch (error) {
+    try {
+      unlinkSync(temporary);
+    } catch {
+      /* Ein TempFile-Rest ist harmlos; der Schreibfehler wird gemeldet. */
+    }
+    console.error('[hub] Sessions konnten nicht gespeichert werden:', error.message);
+  }
+};
+const loadSessions = () => {
+  if (!sessionFile || !existsSync(sessionFile)) return;
+  try {
+    const raw = readFileSync(sessionFile, 'utf8');
+    let content = raw;
+    if (raw.trim().startsWith('vault:')) {
+      content = decryptValue('sessions', 'file', raw.trim(), projectRootOfSessionFile());
+    }
+    const parsed = JSON.parse(content);
+    const now = Date.now();
+    for (const [key, value] of Object.entries(parsed ?? {})) {
+      if (
+        value &&
+        typeof value.expiresAt === 'number' &&
+        value.expiresAt > now &&
+        value.user?.id
+      )
+        sessions.set(key, value);
+    }
+    // Klartext-Altbestand einmalig in den Umschlag hochziehen.
+    if (!raw.trim().startsWith('vault:') && vaultEnabled(projectRootOfSessionFile()))
+      saveSessions();
+  } catch (error) {
+    console.error('[hub] Sessions konnten nicht geladen werden:', error.message);
+  }
+};
+export const configureSessionStore = (file) => {
+  sessionFile = file;
+  sessions.clear();
+  loadSessions();
 };
 
 const loadAccess = () => {
@@ -578,6 +681,7 @@ export const handleAuthRoutes = async (req, res, url, sendJson, httpError) => {
       })),
       expiresAt: Date.now() + SESSION_TTL,
     });
+    saveSessions();
     res.writeHead(302, {
       location: '/',
       'set-cookie': [
@@ -591,6 +695,7 @@ export const handleAuthRoutes = async (req, res, url, sendJson, httpError) => {
 
   if (url.pathname === '/api/auth/logout' && req.method === 'POST') {
     sessions.delete(cookieValue(req, SESSION_COOKIE));
+    saveSessions();
     res.setHeader('set-cookie', cookie('', 0));
     return sendJson(res, 200, { ok: true });
   }

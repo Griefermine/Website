@@ -92,7 +92,19 @@ def update_path(path: pathlib.Path, *, with_input: bool) -> pathlib.Path | None:
     anchors = []
     if with_input:
         anchors.append((":ufw-before-input - [0:0]", BLOCK))
-    anchors.append((":ufw-before-output - [0:0]", output_block()))
+    # In before6.rules tragen die Ketten das Präfix `ufw6-`; ohne die
+    # Anpassung schlägt die Anker-Suche fehl (und die Regeln würden in einer
+    # im IPv6-File nicht existierenden Kette landen).
+    if with_input:
+        output_anchor = ":ufw-before-output - [0:0]"
+        output_lines = output_block()
+    else:
+        output_anchor = ":ufw6-before-output - [0:0]"
+        output_lines = [
+            line.replace("ufw-before-output", "ufw6-before-output")
+            for line in output_block()
+        ]
+    anchors.append((output_anchor, output_lines))
     for anchor, block in anchors:
         if lines.count(anchor) != 1:
             raise SystemExit(f"Erwartete UFW-Regel fehlt/ist mehrdeutig: {anchor}")

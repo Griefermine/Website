@@ -303,8 +303,19 @@ def start_panel_callback(bot: Any, loop: asyncio.AbstractEventLoop) -> Threading
         daemon=True,
         name="panel-callback",
     ).start()
-    hub_link.callback(f"http://127.0.0.1:{server.server_port}/panel", CALLBACK_TOKEN)
-    logger.info(f"Panel-Callback aktiv auf Port {server.server_port}")
+    if os.environ.get("BOT_HUB_DISCORD_PROXY"):
+        # Container-Betrieb: Der Hub teilt keinen Loopback mit uns und lehnt
+        # Loopback-Ziele aus SSRF-Gründen ab (400). Panel-Aktionen, die den
+        # Bot direkt ansprechen, braucht es hier einen freigegebenen
+        # externen Callback-Ziel (--callback-host); die Bot-Seite funktioniert
+        # trotzdem, solange der Bot seine Werte über hub_link veröffentlicht.
+        logger.info(
+            "Panel-Callback im Container-Betrieb nicht registriert "
+            f"(lauscht intern auf Port {server.server_port})."
+        )
+    else:
+        hub_link.callback(f"http://127.0.0.1:{server.server_port}/panel", CALLBACK_TOKEN)
+        logger.info(f"Panel-Callback aktiv auf Port {server.server_port}")
     return server
 
 
@@ -326,7 +337,13 @@ def create_bot(discord: Any) -> Any:
     intents.members = True
     intents.message_content = True
 
-    bot = commands.Bot(command_prefix="!", intents=intents)
+    # Im Produktions-Container führt der einzige Weg nach außen über den
+    # Squid-Egress-Proxy; der Hub liefert ihn über HTTPS_PROXY. discord.py
+    # liest Umgebungsvariablen nicht automatisch – ohne diese Übergabe
+    # versucht der Bot eine Direktverbindung und scheitert am bewusst
+    # DNS-freien Bot-Netz (ClientConnectorDNSError).
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
+    bot = commands.Bot(command_prefix="!", intents=intents, proxy=proxy)
 
     # --- Dropdown für einzelne Berechtigungen ---
 

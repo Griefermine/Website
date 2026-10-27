@@ -240,7 +240,7 @@ describe('Produktionsnetzwerke isolieren gleichzeitige Container', () => {
     );
     assert.match(
       checker,
-      /actual\[:\s*len\(EXPECTED_UFW_RULES\)\]\s*==\s*EXPECTED_UFW_RULES/,
+      /actual\[:\s*len\((?:EXPECTED_UFW_RULES|expected_input)\)\]\s*==\s*(?:EXPECTED_UFW_RULES|expected_input)/,
       'Prüfer verlangt die erwartete Regelfolge am Anfang der Live-Kette',
     );
     for (const bridge of ['br-bothubdisc', 'br-bothubdeps']) {
@@ -369,31 +369,36 @@ describe('Produktionsnetzwerke isolieren gleichzeitige Container', () => {
     assert.ok(covers('distro_domains', 'deb.debian.org'));
     assert.ok(covers('distro_domains', 'security.ubuntu.com'));
     assert.ok(covers('distro_domains', 'ports.ubuntu.com'));
-    // Jede ACL nennt genau ihre maximalen Domains: ohne führenden Punkt,
-    // ohne Doppelungen, ohne Subdomains eigener Einträge.
+    // Jede ACL nennt genau ihre maximalen Domains: in der von Squid 5.7
+    // verlangten Form mit führendem Punkt (nur der Punkt trifft auch
+    // Subdomains – Begründung im Kopf der squid.conf), ohne Doppelungen,
+    // ohne Subdomains eigener Einträge.
     assert.deepEqual(dstdomainAcl('discord_domains').split(/\s+/), [
-      'discord.com',
-      'discord.gg',
+      '.discord.com',
+      '.discord.gg',
+      '.discordapp.com',
+      '.discordapp.net',
     ]);
     assert.deepEqual(dstdomainAcl('docker_domains').split(/\s+/), [
-      'docker.io',
-      'production.cloudflare.docker.com',
-      'mcr.microsoft.com',
+      '.docker.io',
+      '.docker.com',
+      '.mcr.microsoft.com',
     ]);
     assert.deepEqual(dstdomainAcl('hub_domains').split(/\s+/), [
-      'discord.com',
-      'discord.gg',
-      'letsencrypt.org',
+      '.discord.com',
+      '.discord.gg',
+      '.letsencrypt.org',
     ]);
     assert.deepEqual(dstdomainAcl('distro_domains').split(/\s+/), [
-      'debian.org',
-      'ubuntu.com',
+      '.debian.org',
+      '.ubuntu.com',
     ]);
     assert.ok(
       dstdomainAcl('package_domains')
         .split(/\s+/)
-        .every((eintrag) => !eintrag.startsWith('.')),
-      'package_domains führt weiterhin Punkteinträge',
+        .every((eintrag) => eintrag.startsWith('.')),
+      'package_domains nennt Einträge ohne führenden Punkt – unter Squid 5.7 ' +
+        'träfen sie nur die exakten Namen, nicht ihre Subdomains',
     );
   });
 });
