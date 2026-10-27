@@ -224,6 +224,79 @@ docker exec -d bot-hub-vm bash -c \
      BOT_HUB_TOKEN: eigene Routes 200, fremde Bot-Ids 401, Rate-Feedback
      einheitlich 401.
 
+ 25. **MySQL-Anbindung hing sich in NAT-losen Umgebungen fest**: der
+     Provisionierer verband sich auf `127.0.0.1:<publizierter Port>` – in der
+     Simulations-VM setzt Docker die Port-NAT-Regeln aber nicht (DOCKER-Kette
+     der nat-Tabelle leer), der Hub lief 180 s in `waitForAdmin` und der
+     Dashboard-Port blieb 502. Fix: festes internes Netz
+     (`BOT_HUB_MYSQL_NETWORK_CIDR`, Standard 172.30.252.0/24; n+1 Gateway,
+     n+2 MySQL, n+3 phpMyAdmin) – Hub und Tests verbinden die statischen
+     Container-Adressen. (Die Loopback-Publikation fiel später als leere
+     Zusage ganz weg – Maßnahme 26.) Zweiter Fund aus demselben Durchlauf:
+     ein Abbruch nach `docker create` hinterließ einen Container mit
+     Init-Passwort, das der Neustart überschrieb → nie wieder reinkommen
+     ohne Reset. Jetzt wird eine vorhandene `mysql-init.env` wiederverwendet,
+     und ohne sie nennt der Hub den Grund samt `BOT_HUB_MYSQL_RESET=1` statt
+     zu hungern. phpMyAdmin-Tests verbinden jetzt ebenfalls über das Netz
+     (`mysql-container.test.js`).
+
+**MySQL/phpMyAdmin in der Simulations-VM (Betriebsnotiz).** Die Anbindung
+läuft über das feste interne Netz `172.30.252.0/24`: `.2` = MySQL, `.3` =
+phpMyAdmin. Wegen der NAT-losen VM ist der Hinweis im Hub-Log
+(`http://127.0.0.1:8081`) hier nicht benutzbar – von außen gilt stattdessen:
+
+    docker exec bot-hub-vm curl -s http://172.30.252.3/        # Login-Seite
+    docker exec bot-hub-vm bash -c 'mysql -h 172.30.252.2 …'   # (client ist
+      nicht installiert; Zugangsdaten: data/secrets/db.env + phpmyadmin.env,
+      transparent lesbar über readSecretValues als bot-hub)
+
+Auf dem Hub-Host routet Docker ins interne Netz, phpMyAdmin liegt dort auf
+`.3:80`. Von einem anderen Rechner: `ssh -L 8081:172.30.252.3:80 user@vps`
+(kein 127.0.0.1-Hafen – die Veröffentlichung gibt es auf internen Netzen
+nicht, Maßnahme 26). Anlegen/Reset:
+`BOT_HUB_DB=mysql-container` + `BOT_HUB_PHPMYADMIN=1` in `.env`; für einen
+sauberen Neuaufbau einmalig `BOT_HUB_MYSQL_RESET=1` setzen, Start abwarten,
+Zeile **sofort wieder entfernen** (sondern löscht jeder Neustart alle
+Bot-Speicher-Daten). Seit Maßnahme 25 läuft die Provisionierung auch unter
+einem Root-Hub (Container dann als Image-Benutzer 999 statt Demotion).
+
+ 26. **phpMyAdmin/MySQL „nur Loopback“ war auf `--internal`-Netzen eine leere
+     Zusage**: Die Container hingen am internen Netz UND sollten auf
+     `127.0.0.1:<Hafen>` veröffentlichen. Docker richtet auf internen Netzen
+     aber grundsätzlich keine Hafen-Weiterleitung ein – `docker port` bleibt
+     leer, es horcht nichts. Der Hub-Log („http://127.0.0.1:8081“) und ein
+     Integrations-Test, der genau diesen Loopback-Hörer verlangte, liefen damit
+     ins Leere; in der NAT-losen Simulations-VM fiel es als
+     `die Bindung ist nicht die erwartete (ist: "")` auf, ist aber kein VM-Artefakt,
+     sondern Docker-Verhalten auf jedem Host. Fix: `--publish` für MySQL und
+     phpMyAdmin entfernt (die Zusage trägt jetzt das interne Netz selbst, nicht
+     eine Schleife), Hinweis/Log nennen die feste Netzadresse n+3, und die Tests
+     prüfen jetzt die belastbare Aussage: gar kein Hafen (`docker port` und
+     `HostConfig.PortBindings` leer) plus echter Kontakt nur über die
+     feste Adresse. Der SSH-Tunnel-Weg bleibt, zielt aber jetzt auf die
+     Netzadresse (`ssh -L 8081:<addr>:80 user@server`).
+
+ 27. **Admin-Wächter verwechselte „gestoppt“ mit „gelöscht“**: Der Prüfer, ob
+     der phpMyAdmin-Benutzer existiert, lief vor dem Start des MySQL-Containers.
+     Bei einem bloß entfernten oder gestoppten Container (Wartung,
+     Signatur-austausch, Host-Umzug) ist die Datenbank schlicht nicht
+     erreichbar – die Antwort „kann nicht rein“ wurde als „Benutzer fehlt,
+     Reset empfohlen“ gelesen, und der Hub looppte mit
+     Datenvernichtungs-Hinweis. Jetzt prüft der Wächter erst, wenn mysqld läuft
+     (ortsgleich mit der Entscheidung), und eine intakte Anlage überlebt das
+     Verschwinden ihres Containers ohne RESET. Live ausgelöst und bewiesen:
+     Container von Hand entfernt → Korrektur gespielt → Hub rekonstruierte den
+     Container und meldete „bereit“, Bot-Daten unversehrt.
+ 28. **Container-Neuanlage brauchte eine löchrige env-file**: Nach erfolgreicher
+     Erst-Einrichtung löscht der Provisionierer seine Init-Datei (root-Passwort-
+     reste) – doch `docker create --env-file` verlangt die Datei bei JEDER
+     Anlage, auch bei längst eingerichteten Datenvolumina, wo ihr Inhalt
+     bedeutungslos ist. Folge: derselbe Crash-Loop wie in 27 aus einem anderen
+     Grund. Fix: bei Neuanlage über einem eingerichteten Volumen legt der
+     Provisionierer eine Wegwerf-env-file an (0600, im Finally immer gelöscht);
+     Fake-Modelle können das nicht fangen (sie erzwingen keine env-file), die
+     Live-VM schon – Regressionstest hält immerhin das neue Verhalten fest.
+
 ### Betriebslehre
 
 * **Startordner schlägt Datei-Editor**: Hat ein Bot einen Startordner,

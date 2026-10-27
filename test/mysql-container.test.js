@@ -37,6 +37,12 @@ const skip = dockerOk
   ? false
   : 'docker ist nicht verfügbar – der echte Container wird nicht gestartet';
 
+// Eigene kleine Netze: das Produktions-Netz (Standard-CIDR) und die beiden
+// Suiten dieser Datei würden sonst denselben Adresspool verlangen – Docker
+// lehnt überlappende Netze stillschweigend ab, und die Suite hinge im before.
+const netzA = process.env.BOT_HUB_TEST_MYSQL_CIDR || '172.30.240.0/28';
+const netzB = process.env.BOT_HUB_TEST_PHPMYADMIN_CIDR || '172.30.241.0/28';
+
 /** Freier Port auf Loopback. Zwischen Messung und Bindung kann es knapp werden. */
 const freePort = async () =>
   new Promise((done) => {
@@ -101,6 +107,7 @@ before(async () => {
       BOT_HUB_CONTAINER_PREFIX: prefix,
       BOT_HUB_DB_PORT: String(port),
       BOT_HUB_MYSQL_STARTUP_TIMEOUT_MS: '300000',
+      BOT_HUB_MYSQL_NETWORK_CIDR: netzA,
     },
     projectRoot: dir,
     run: async (args, opts) => {
@@ -121,7 +128,11 @@ before(async () => {
   appPassword = secrets.readSecretValues(dir, 'db').BOT_HUB_DB_PASSWORD;
   dbEnvFile = join(dir, 'data', 'secrets', 'db.env');
   config = mysql.managedConfig({
-    env: { BOT_HUB_CONTAINER_PREFIX: prefix, BOT_HUB_DB_PORT: String(port) },
+    env: {
+      BOT_HUB_CONTAINER_PREFIX: prefix,
+      BOT_HUB_DB_PORT: String(port),
+      BOT_HUB_MYSQL_NETWORK_CIDR: netzA,
+    },
     projectRoot: dir,
   });
 });
@@ -150,17 +161,17 @@ describe('Der verwaltete MySQL-Container in echt', () => {
         'network',
         'inspect',
         '--format',
-        '{{.Driver}}|{{.Internal}}',
+        '{{.Driver}}|{{.Internal}}|{{if .IPAM.Config}}{{(index .IPAM.Config 0).Subnet}}{{end}}',
         config.networkName,
       ],
       { capture: true },
     );
-    assert.equal(network.stdout.trim(), 'bridge|true');
+    assert.equal(network.stdout.trim(), `bridge|true|${netzA}`);
     const connect = async (user, password, database) => {
       const client = await import('mysql2/promise');
       return client.createConnection({
-        host: '127.0.0.1',
-        port,
+        host: config.host,
+        port: config.connectPort,
         user,
         password,
         database,
@@ -188,8 +199,8 @@ describe('Der verwaltete MySQL-Container in echt', () => {
       await assert.rejects(
         () =>
           client.createConnection({
-            host: '127.0.0.1',
-            port,
+            host: config.host,
+            port: config.connectPort,
             user: 'root',
             password: adminPassword,
             connectTimeout: 5000,
@@ -211,8 +222,8 @@ describe('Der verwaltete MySQL-Container in echt', () => {
       await assert.rejects(
         () =>
           client.createConnection({
-            host: '127.0.0.1',
-            port,
+            host: config.host,
+            port: config.connectPort,
             user: 'root',
             password: mysql.generatePassword(),
             connectTimeout: 5000,
@@ -252,8 +263,8 @@ describe('Der verwaltete MySQL-Container in echt', () => {
     async () => {
       const client = await import('mysql2/promise');
       const connection = await client.createConnection({
-        host: '127.0.0.1',
-        port,
+        host: config.host,
+        port: config.connectPort,
         user: config.user,
         password: appPassword,
         database: config.database,
@@ -316,27 +327,33 @@ describe('Der verwaltete MySQL-Container in echt', () => {
     },
   );
 
-  it('lauscht nur auf Loopback', { skip }, async () => {
-    const listen = spawnSync('ss', ['-ltnH', `sport = :${port}`], {
-      encoding: 'utf8',
+  it('veröffentlicht keine Häfen und ist nur im internen Netz erreichbar', { skip }, async () => {
+    // Interne Netze veröffentlichen nicht – statt eines Loopback-Hörers gilt:
+    // gar kein Hafen (Dock-eigene Aussage) und echter Kontakt nur über die
+    // feste Netzadresse.
+    const port = await docker(['port', config.containerName], { capture: true });
+    assert.equal(port.stdout.trim(), '', 'der Container veröffentlicht Häfen');
+    const bind = await docker(
+      [
+        'inspect',
+        '-f',
+        '{{json .HostConfig.PortBindings}}',
+        config.containerName,
+      ],
+      { capture: true },
+    );
+    assert.equal(bind.stdout.trim(), '{}', 'es sind Bindungen hinterlegt');
+    // Echte Erreichbarkeit: nur über die feste Netzadresse.
+    const client = await import('mysql2/promise');
+    const c = await client.createConnection({
+      host: config.host,
+      port: config.connectPort,
+      user: config.user,
+      password: appPassword,
+      database: config.database,
+      connectTimeout: 5000,
     });
-    if (listen.status !== 0) return; // ss fehlt: die Erreichbarkeit prüfen die Tests weiter unten
-    // `ss -ltnH` liefert "LISTEN <recv> <send> <lokal> <peer>". Die Spalte
-    // wird gelesen statt mit einem Muster verglichen – ein Regex-Literal
-    // interpoliert kein ${port}, und das hätte hier still falsch ausgesehen.
-    const zeilen = listen.stdout
-      .trim()
-      .split('\n')
-      .filter((zeile) => zeile.includes(`:${port}`));
-    assert.ok(zeilen.length > 0, `kein Listener auf ${port} gefunden`);
-    for (const zeile of zeilen) {
-      const lokal = zeile.trim().split(/\s+/)[3];
-      assert.equal(
-        lokal,
-        `127.0.0.1:${port}`,
-        `der Port lauscht nicht nur auf Loopback: ${zeile.trim()}`,
-      );
-    }
+    await c.end();
   });
 
   it(
@@ -438,8 +455,8 @@ describe('Der verwaltete MySQL-Container in echt', () => {
         database: config.database,
         user: config.user,
         password: appPassword,
-        host: '127.0.0.1',
-        port,
+        host: config.host,
+        port: config.connectPort,
         socket: '',
         connectionLimit: 4,
         maxValueBytes: 64 * 1024,
@@ -530,8 +547,8 @@ describe('Der verwaltete MySQL-Container in echt', () => {
         database: config.database,
         user: config.user,
         password: appPassword,
-        host: '127.0.0.1',
-        port,
+        host: config.host,
+        port: config.connectPort,
         socket: '',
         connectionLimit: 4,
         maxValueBytes: 64 * 1024,
@@ -563,8 +580,8 @@ describe('Der verwaltete MySQL-Container in echt', () => {
         database: config.database,
         user: config.user,
         password: appPassword,
-        host: '127.0.0.1',
-        port,
+        host: config.host,
+        port: config.connectPort,
         socket: '',
         connectionLimit: 4,
         maxValueBytes: 64 * 1024,
@@ -621,6 +638,7 @@ describe('Die Verwaltungsoberfläche in echt', () => {
     BOT_HUB_PHPMYADMIN: '1',
     BOT_HUB_PHPMYADMIN_PORT: String(port),
     BOT_HUB_MYSQL_STARTUP_TIMEOUT_MS: '300000',
+    BOT_HUB_MYSQL_NETWORK_CIDR: netzB,
   });
 
   const box = () => anlage.phpmyadmin.containerName;
@@ -697,8 +715,8 @@ describe('Die Verwaltungsoberfläche in echt', () => {
     return new Promise((done, fail) => {
       const anfrage = request(
         {
-          host: '127.0.0.1',
-          port,
+          host: anlage.phpmyadmin.containerAddress,
+          port: 80,
           path: pfad,
           method: post ? 'POST' : 'GET',
           headers: {
@@ -781,17 +799,25 @@ describe('Die Verwaltungsoberfläche in echt', () => {
     assert.equal(mounts.stdout.trim(), '', `es gibt Mounts: ${mounts.stdout}`);
   });
 
-  it('ist nur über Loopback erreichbar', { skip }, async () => {
+  it('veröffentlicht keine Häfen und liegt nur im internen Netz', { skip }, async () => {
     const bind = await docker(['port', box()], { capture: true });
-    assert.equal(
-      bind.stdout.trim(),
-      `80/tcp -> 127.0.0.1:${port}`,
-      'die Bindung ist nicht die erwartete',
+    assert.equal(bind.stdout.trim(), '', 'die Oberfläche veröffentlicht Häfen');
+    const bindingen = await docker(
+      [
+        'inspect',
+        '-f',
+        '{{json .HostConfig.PortBindings}}',
+        box(),
+      ],
+      { capture: true },
     );
+    assert.equal(bindingen.stdout.trim(), '{}', 'es sind Bindungen hinterlegt');
     assert.ok(
-      !/0\.0\.0\.0/.test(bind.stdout),
-      '0.0.0.0 würde sie ins Netz stellen',
+      !/0\.0\.0\.0/.test(bindingen.stdout + bind.stdout),
+      '0.0.0.0 gehört hier in kein Feld',
     );
+    const antwort = await seite('/index.php');
+    assert.equal(antwort.status, 200, 'im Netz muss die Seite erreichbar sein');
   });
 
   it('kommt von einem Bot-Container nicht heran', { skip }, async () => {
@@ -900,8 +926,8 @@ describe('Die Verwaltungsoberfläche in echt', () => {
   it('sieht weder andere Datenbanken noch mysql.user', { skip }, async () => {
     const client = await import('mysql2/promise');
     const verbindung = await client.createConnection({
-      host: '127.0.0.1',
-      port: dbPort,
+      host: anlage.host,
+      port: anlage.connectPort,
       user: anlage.adminUser,
       password: verwaltungsPasswort,
       connectTimeout: 5000,

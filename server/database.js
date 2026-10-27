@@ -436,6 +436,32 @@ export const staysInside = (root, target) => {
  * Zyklus erzeugen – und zwar genau dann, wenn er am unauffälligsten ist,
  * nämlich beim ersten Start.
  */
+/**
+ * Die feste Zieladresse des verwalteten MySQL-Containers. Muss zu
+ * `server/mysql.js` (DEFAULT_MYSQL_CIDR, `containerAddress`) passen – hier
+ * absichtlich dupliziert statt importiert: `mysql.js` importiert
+ * `managedNames` aus dieser Datei, ein Rückimport wäre ein Zyklus.
+ */
+const MANAGED_MYSQL_CIDR = '172.30.252.0/24';
+const MANAGED_MYSQL_PORT = 3306;
+
+export const managedConnectTarget = (env = process.env) => {
+  const cidr =
+    String(env.BOT_HUB_MYSQL_NETWORK_CIDR ?? '').trim() || MANAGED_MYSQL_CIDR;
+  const match = cidr.match(/^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/);
+  if (!match)
+    throw new Error(
+      `BOT_HUB_MYSQL_NETWORK_CIDR "${cidr}" ist keine IPv4-CIDR wie 172.30.252.0/24.`,
+    );
+  const base = match[1]
+    .split('.')
+    .reduce((acc, part) => acc * 256 + Number(part), 0);
+  const host = [24, 16, 8, 0]
+    .map((shift) => Math.floor((base + 2) / 2 ** shift) % 256)
+    .join('.');
+  return { host, port: MANAGED_MYSQL_PORT };
+};
+
 export const managedNames = (env = process.env) => {
   const name = (value, key, fallback) => {
     const text = String(value ?? '').trim() || fallback;
@@ -542,13 +568,16 @@ export const resolveDatabaseConfig = ({
   }
 
   const socket = managed ? '' : String(env.BOT_HUB_DB_SOCKET ?? '').trim();
+  const managedTarget = managed ? managedConnectTarget(env) : null;
   const host = managed
-    ? '127.0.0.1'
+    ? managedTarget.host
     : String(env.BOT_HUB_DB_HOST ?? '127.0.0.1').trim() || '127.0.0.1';
   // Der Punkt der ganzen Sache: der Bot-Speicher bleibt auf diesem Rechner.
-  if (!socket && !LOOPBACK.has(host))
+  // Beim verwalteten Container ist „lokal" die feste Adresse im internen
+  // Docker-Netz – dahin führt von außen und aus Bot-Netzen keine Route.
+  if (!socket && !(managedTarget && host === managedTarget.host) && !LOOPBACK.has(host))
     throw new Error(
-      `BOT_HUB_DB_HOST="${host}" ist nicht lokal. Der Bot-Speicher darf nur auf Loopback (127.0.0.1, ::1, localhost) oder über BOT_HUB_DB_SOCKET laufen – von außen dürfte sonst ein fremder Rechner auf die Bot-Daten zugreifen.`,
+      `BOT_HUB_DB_HOST="${host}" ist nicht lokal. Der Bot-Speicher darf nur auf Loopback (127.0.0.1, ::1, localhost), über BOT_HUB_DB_SOCKET oder beim verwalteten Container über dessen internes Netz laufen – von außen dürfte sonst ein fremder Rechner auf die Bot-Daten zugreifen.`,
     );
 
   const database = required(
@@ -565,7 +594,7 @@ export const resolveDatabaseConfig = ({
     );
 
   const port = managed
-    ? managedNames(env).port
+    ? managedTarget.port
     : Number(env.BOT_HUB_DB_PORT ?? 3306);
   if (!Number.isInteger(port) || port < 1 || port > 65535)
     throw new Error(
