@@ -452,6 +452,80 @@ const aufraeumen = (wurzel, datei) => {
 };
 
 /**
+ * Ist jede vorhandene Zwischenstufe von `datei` unter `wurzel` ein echtes
+ * Verzeichnis? Der Bot (gleiche UID wie der Hub) darf im Workspace jederzeit
+ * Ordner durch Symlinks ersetzen – dann führt jeder Pfad darunter aus dem
+ * Workspace heraus. Solche Pfade lässt der Hub unberührt; nicht vorhandene
+ * Zwischenstufen sind unkritisch, sie werden ohnehin neu angelegt.
+ */
+const zwischenstufenSicher = (wurzel, datei) => {
+  const rel = relative(wurzel, datei);
+  if (!rel || rel.startsWith('..') || isAbsolute(rel)) return false;
+  let ordner = wurzel;
+  for (const teil of rel.split('/').slice(0, -1)) {
+    ordner = join(ordner, teil);
+    try {
+      const stat = lstatSync(ordner);
+      if (!stat.isDirectory()) return false;
+    } catch (error) {
+      if (error.code !== 'ENOENT') return false;
+    }
+  }
+  return true;
+};
+
+/** Elternordner von `datei` anlegen, ohne je einem Verweis zu folgen. */
+const legeOrdnerAn = (wurzel, datei) => {
+  const rel = relative(wurzel, dirname(datei));
+  if (!rel || rel === '.') return;
+  let ordner = wurzel;
+  for (const teil of rel.split('/')) {
+    ordner = join(ordner, teil);
+    try {
+      // bewusst ohne `recursive`: ein mkdir folgt keine Zwischenstufen, und
+      // existierende Verweise würden als EEXIST sichtbar statt durchwandert.
+      mkdirSync(ordner, { mode: 0o700 });
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
+  }
+};
+
+/**
+ * `von` atomar und ohne Symlink-Folge nach `nach` stellen. `copyFileSync`
+ * folgt einem Verweis auf dem letzten Segment – der Bot kann jederzeit einen
+ * solchen Link hinterlassen, und dann schriebe der Hub Hub-Inhalt auf einen
+ * Host-Pfad außerhalb des Workspace (Maßnahme 36). Darum: Nicht-Datei am Ziel
+ * wird als Verweis selbst entfernt, die Inhalte landen in einer frisch
+ * angelegten Temporärdatei und werden per `rename` ans Ziel gebracht – rename
+ * ersetzt das Ziel, statt ihm zu folgen.
+ */
+const ersetzeDatei = (von, nach, info) => {
+  try {
+    const stat = lstatSync(nach);
+    if (!stat.isFile()) unlinkSync(nach);
+  } catch {
+    /* Ziel existiert (noch) nicht */
+  }
+  const tmp = join(
+    dirname(nach),
+    `.hubsync-${randomBytes(6).toString('hex')}.tmp`,
+  );
+  try {
+    copyFileSync(von, tmp);
+    renameSync(tmp, nach);
+  } catch (error) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* der ursprüngliche Fehler zählt */
+    }
+    throw error;
+  }
+  utimesSync(nach, new Date(info.mtimeMs), new Date(info.mtimeMs));
+};
+
+/**
  * Den Startordner in den Workspace spiegeln.
  *
  * Rückgabe: `{ kopiert, entfernt, unveraendert, uebersprungen }` – Zahlen, die
@@ -484,6 +558,12 @@ export const sync = (bot, projectRoot) => {
   for (const [rel, info] of jetzt) {
     const von = join(quelle, rel);
     const nach = join(ziel, rel);
+    // Der Workspace gehört dem Bot (gleiche UID) – er kann Pfade verbogen
+    // haben. Gebogene Pfade bleiben unberührt, statt ihnen hinterherzuschreiben.
+    if (!zwischenstufenSicher(ziel, nach)) {
+      uebersprungen.add(`${rel} (Verweis im Zwischenpfad)`);
+      continue;
+    }
     const inhalt = hashOf(von);
     // Verglichen wird der Inhalt, nicht der Zeitstempel. Ein Dateisystem, das
     // auf Sekunden rundet, und eines mit Nanosekunden liefern verschiedene
@@ -494,16 +574,31 @@ export const sync = (bot, projectRoot) => {
     // Die Merkliste entsteht im selben Durchgang: die Prüfsumme steht hier
     // schon in der Hand, und ein zweites Lesen derselben Datei wäre
     // Verschwendung.
-    merkliste[rel] = [info.groesse, inhalt];
     if (istUnveraendert(nach, alt[rel], inhalt)) {
+      merkliste[rel] = [info.groesse, inhalt];
       unveraendert += 1;
       continue;
     }
-    mkdirSync(join(nach, '..'), { recursive: true, mode: 0o700 });
-    copyFileSync(von, nach);
+    try {
+      legeOrdnerAn(ziel, nach);
+      ersetzeDatei(von, nach, info);
+    } catch (error) {
+      if (
+        error.code === 'EISDIR' ||
+        error.code === 'ENOTEMPTY' ||
+        error.code === 'EACCES' ||
+        error.code === 'EPERM'
+      ) {
+        // Der Bot hat die Stelle blockiert (Ordner hingelegt) – Datei
+        // überspringen, der Spiegel bleibt für den Rest gültig.
+        uebersprungen.add(`${rel} (Ziel blockiert)`);
+        continue;
+      }
+      throw error;
+    }
+    merkliste[rel] = [info.groesse, inhalt];
     // Der Zeitstempel wandert mit. Er ist Anzeige, keine Entscheidung – aber
     // ein Workspace, in dem alles „gerade eben“ trägt, lädt zum Grübeln ein.
-    utimesSync(nach, new Date(info.mtimeMs), new Date(info.mtimeMs));
     kopiert += 1;
   }
 
@@ -514,9 +609,12 @@ export const sync = (bot, projectRoot) => {
     const nach = join(ziel, rel);
     // Der Pfad kam aus einer Datei, die der Hub selbst geschrieben hat – aber
     // geprüft wird er trotzdem noch einmal, denn die Merkliste ist ein Text auf
-    // der Platte.
+    // der Platte. Seit Maßnahme 36 gilt dasselbe auch für die Zwischenstufen:
+    // ein vom Bot gelegter Verzeichnis-Verweis dürfe nie zum Löschen nach
+    // außerhalb führen.
     const innen = relative(ziel, nach);
     if (!innen || innen.startsWith('..') || isAbsolute(innen)) continue;
+    if (!zwischenstufenSicher(ziel, nach)) continue;
     try {
       const stat = lstatSync(nach);
       if (stat.isDirectory()) continue;

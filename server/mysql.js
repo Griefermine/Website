@@ -20,11 +20,14 @@
  *    dafür gibt es `BOT_HUB_MYSQL_RESET=1`, das das Datenvolumen verwirft und
  *    neu aufsetzt.
  *
- * 2. **Nur Loopback.** Veröffentlicht wird `127.0.0.1:<Port>:3306`, nie
- *    `0.0.0.0`. Ein Bot, der `host.docker.internal` hat, erreicht damit höchstens
- *    die Portnummer – und dann ein 48-stelliges Zufallspasswort. Zusätzlich
- *    hängt der MySQL-Container an einem eigenen Netz, an dem kein Bot hängt:
- *    Bot-Container laufen auf der Default-Bridge und haben dorthin keine Route.
+ * 2. **Nur das eigene Netz.** Der Container veröffentlicht keine Häfen – auf
+ *    einem `--internal`-Netz setzt Docker Port-Publikationen grundsätzlich
+ *    nicht um, und etwas zu verlangen, das es nicht gibt, wäre irreführend.
+ *    Erreichbar ist die Datenbank über die feste Adresse des Netzes (n+2),
+ *    und das nur vom Hub-Host aus: Ein Bot, der `host.docker.internal` hat,
+ *    trifft bestenfalls die alte Portnummer im Leeren – und dorthin führt aus
+ *    den Bot-Netzen keine Route, denn MySQL hängt an einem eigenen Netz, an
+ *    dem kein Bot hängt.
  *
  * 3. **Kein Geheimnis in der Argumentliste.** Das Admin-Passwort steht in
  *    `data/secrets/mysql-init.env` (0600 in einem 0700-Verzeichnis) und wird
@@ -52,8 +55,11 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes as nodeRandomBytes } from 'node:crypto';
 import {
+  chownSync,
   chmodSync,
+  existsSync,
   mkdirSync,
+  readFileSync,
   rmSync,
   unlinkSync,
   writeFileSync,
@@ -77,6 +83,16 @@ const PASSWORD_SHAPE = /^[A-Za-z0-9_-]+$/;
 
 const DEFAULT_IMAGE = 'mysql:8.4';
 const CONTAINER_PORT = 3306;
+
+// Festes Netz für den verwalteten Container. Warum nicht nur die
+// Loopback-Veröffentlichung: Docker setzt Port-Mappings über NAT-Regeln um,
+// und die fehlen still in Umgebungen ohne iptables-NAT (verschärfte
+// Firewalls, verschachtelte Daemons) – dann hängt die Provisionierung in
+// `waitForAdmin` gegen ein Port, der nie horcht. Die feste Adresse im
+// internen Netz funktioniert überall, wo Docker-Routing funktioniert. Das
+// Netz ist `--internal`: von außen (und von Bot-Netzen) gibt es dort keine
+// Route, nur der Hub-Host erreicht es – dieselbe Zusage wie zuvor Loopback.
+const DEFAULT_MYSQL_CIDR = '172.30.252.0/24';
 const BOOTSTRAP_TIMEOUT_MS = 180_000;
 const BOOTSTRAP_POLL_MS = 1000;
 
@@ -180,12 +196,51 @@ const number = (value, fallback, { min, max, name }) => {
   return parsed;
 };
 
+const ipToInt = (text) =>
+  text.split('.').reduce((acc, part) => acc * 256 + Number(part), 0);
+const intToIp = (value) =>
+  [24, 16, 8, 0].map((shift) => Math.floor(value / 2 ** shift) % 256).join('.');
+
+/** Zerlegt eine private IPv4-CIDR (Maske /16–/28) in Basis und Präfix. */
+const parseCidr = (text) => {
+  const match = String(text).match(/^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/);
+  if (!match)
+    throw new Error(
+      `BOT_HUB_MYSQL_NETWORK_CIDR "${text}" ist keine IPv4-CIDR (z. B. 172.30.252.0/24).`,
+    );
+  const mask = Number(match[2]);
+  const parts = match[1].split('.').map(Number);
+  if (mask < 16 || mask > 28 || parts.some((part) => part > 255))
+    throw new Error(
+      `BOT_HUB_MYSQL_NETWORK_CIDR "${text}" muss eine IPv4-Netzwerkadresse mit Maske /16 bis /28 sein.`,
+    );
+  const base = ipToInt(match[1]);
+  const size = 2 ** (32 - mask);
+  if (base % size !== 0)
+    throw new Error(
+      `BOT_HUB_MYSQL_NETWORK_CIDR "${text}" ist keine Netzwerkadresse – die Host-Bits müssen null sein.`,
+    );
+  if (!isPrivateIp(match[1]))
+    throw new Error(
+      `BOT_HUB_MYSQL_NETWORK_CIDR "${text}" ist kein privates Netz (10/8, 172.16/12, 192.168/16).`,
+    );
+  return { base, size, cidr: `${match[1]}/${mask}` };
+};
+
+const isPrivateIp = (text) => {
+  const [a, b] = text.split('.').map(Number);
+  return (
+    a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
+  );
+};
+
 /**
  * Wo der verwaltete MySQL-Container liegt und wie er heisst.
  *
  * Kein `BOT_HUB_DB_HOST` und kein `BOT_HUB_DB_SOCKET`: beides würde die
- * Loopback-Zusage aufheben. Der Host ist hier fest 127.0.0.1, und wer eine
- * andere Adresse braucht, hat `BOT_HUB_DB=mysql` vor sich.
+ * Zusage aufheben, dass nur der Hub-Host die Datenbank erreicht. Der Host ist
+ * die feste Adresse im internen Netz (siehe `DEFAULT_MYSQL_CIDR`), und wer
+ * eine andere Adresse braucht, hat `BOT_HUB_DB=mysql` vor sich.
  */
 export const managedConfig = ({ env = process.env, projectRoot } = {}) => {
   const root = projectRoot ?? projectRootOf(env);
@@ -244,8 +299,19 @@ export const managedConfig = ({ env = process.env, projectRoot } = {}) => {
       max: 65535,
       name: 'BOT_HUB_PHPMYADMIN_PORT',
     }),
+    // Gleiche Adresslogik wie bei MySQL (n + 1 = Gateway, n + 2 = Datenbank,
+    // n + 3 = Oberfläche) – erreichbar auch ohne funktionierendes NAT.
+    containerAddress: intToIp(
+      parseCidr(
+        String(env.BOT_HUB_MYSQL_NETWORK_CIDR ?? '').trim() ||
+          DEFAULT_MYSQL_CIDR,
+      ).base + 3,
+    ),
   };
 
+  const net = parseCidr(
+    String(env.BOT_HUB_MYSQL_NETWORK_CIDR ?? '').trim() || DEFAULT_MYSQL_CIDR,
+  );
   return {
     projectRoot: root,
     containerName: `${prefix}-mysql`,
@@ -255,8 +321,16 @@ export const managedConfig = ({ env = process.env, projectRoot } = {}) => {
     database: names.database,
     user: names.user,
     adminUser,
+    // `port` wird nicht mehr veröffentlicht (siehe containerCreateArgs) –
+    // der Wert bleibt nur im Signatur-Hash, damit bestehende Container nicht
+    // grundlos ausgetauscht werden. Die Verbindung läuft über die feste
+    // Netzadresse.
     port: names.port,
-    host: '127.0.0.1',
+    networkCidr: net.cidr,
+    gateway: intToIp(net.base + 1),
+    containerAddress: intToIp(net.base + 2),
+    host: intToIp(net.base + 2),
+    connectPort: CONTAINER_PORT,
     phpmyadmin,
   };
 };
@@ -280,9 +354,18 @@ const secretsDirectory = (projectRoot) => join(projectRoot, 'data', 'secrets');
 const initEnvFile = (projectRoot) =>
   join(secretsDirectory(projectRoot), 'mysql-init.env');
 
+// Benutzer des MySQL-Images (offizielles Image: mysql = 999).
+const MYSQL_IMAGE_UID = 999;
+
 const containerUser = () => {
   const uid = Number.isInteger(process.getuid?.()) ? process.getuid() : 1000;
   const gid = Number.isInteger(process.getgid?.()) ? process.getgid() : 1000;
+  // Wurzel-Falle: Der ENTRYPOINT des Images trennt Root-Rechte per
+  // setgid/setuid ab – mit `--cap-drop ALL` (kein CAP_SETGID) scheitert genau
+  // das und mysqld loopingt gegen "setgid: Operation not permitted". Läuft der
+  // Hub als root, fährt der Container deshalb direkt als Image-Benutzer hoch;
+  // die Demotion entfällt dann, weil er gar nicht erst als root startet.
+  if (uid === 0) return `${MYSQL_IMAGE_UID}:${MYSQL_IMAGE_UID}`;
   return `${uid}:${gid}`;
 };
 
@@ -306,6 +389,7 @@ const containerSignature = (config, envFile) =>
         config.dataDir,
         config.networkName,
         config.port,
+        config.containerAddress ?? '',
         envFile,
       ].join('\u0000'),
     )
@@ -341,9 +425,13 @@ export const containerCreateArgs = (
   // Hub nicht, und jeder Weg in den Container hinein ist einer zu viel.
   '--network',
   config.networkName,
-  // Nur Loopback. `0.0.0.0` würde die Datenbank ins Netz stellen.
-  '--publish',
-  `127.0.0.1:${config.port}:${CONTAINER_PORT}`,
+  // Feste Adresse im internen Netz – der Hub verbindet sich direkt dorthin
+  // und hängt nicht an Docker-NAT-Regeln, die in gehärteten oder
+  // verschachtelten Umgebungen fehlen können.
+  ...(config.containerAddress ? ['--ip', config.containerAddress] : []),
+  // Kein --publish: Auf internen Netzen verhindert Docker die
+  // Hafen-Weiterleitung ohnehin – und die Zusage „nur der Hub-Host kommt
+  // hinein" gilt hier über das Netz selbst, nicht über eine Schleife.
   // mysqld legt Socket und Pidfile unter /var/run/mysqld ab. Als beliebige
   // uid kann der Prozess in der Container-Ebene dort nichts anlegen, deshalb
   // ein tmpfs statt eines weiteren Host-Verzeichnisses.
@@ -405,9 +493,11 @@ const phpmyadminSignature = (config) =>
  * - **Kein Volume, kein Bind-Mount.** Die Oberfläche bekommt nichts vom Host
  *   und nichts von den Bots. Es gibt hier keinen Pfad, über den sie Daten
  *   herausholen könnte – nicht einmal den, den ein Bot von außen benutzt.
- * - **Nur Loopback.** `127.0.0.1:<Port>:80`, nie `0.0.0.0`. phpMyAdmin ohne
- *   vorgeschaltete Authentifizierung und ohne Rate-Limit gehört nicht ins
- *   Internet; für alles andere gibt es einen SSH-Tunnel.
+ * - **Nur das interne Netz.** Die Oberfläche hängt am selben internen Netz
+ *   wie die Datenbank (feste Adresse n+3) und veröffentlicht keinen Hafen –
+ *   von einem anderen Rechner führt der Weg über einen SSH-Tunnel zum
+ *   Hub-Host, der das Netz routet. phpMyAdmin ohne vorgeschaltete
+ *   Authentifizierung und ohne Rate-Limit gehört nicht ins Internet.
  * - **`PMA_ARBITRARY=0`.** Ohne das darf phpMyAdmin über die Adresse im
  *   Formular jeden beliebigen Datenbankserver ansteuern, den der Hub-Container
  *   sieht – nicht nur MySQL.
@@ -444,8 +534,11 @@ export const phpmyadminCreateArgs = (config, { env = process.env } = {}) => [
   // wie die Datenbank selbst.
   '--network',
   config.networkName,
-  '--publish',
-  `127.0.0.1:${config.phpmyadmin.port}:${PHPMYADMIN_PORT}`,
+  ...(config.phpmyadmin.containerAddress
+    ? ['--ip', config.phpmyadmin.containerAddress]
+    : []),
+  // Kein --publish – siehe MySQL-Container: interne Netze leiten keine
+  // Häfen weiter, erreichbar ist die Oberfläche über die feste Netzadresse.
   '--env',
   `PMA_HOST=${config.containerName}`,
   '--env',
@@ -647,7 +740,7 @@ export const createProvisioner = (deps = {}) => {
     try {
       connection = await connect({
         host: config.host,
-        port: config.port,
+        port: config.connectPort ?? CONTAINER_PORT,
         user: config.user,
         password: readSecretValues(config.projectRoot, 'db')
           .BOT_HUB_DB_PASSWORD,
@@ -688,13 +781,23 @@ export const createProvisioner = (deps = {}) => {
   };
 
   const ensureNetwork = async () => {
+    const expected = `bridge|true|${config.networkCidr ?? ''}`;
     const networkState = async () =>
-      inspect('network', config.networkName, '{{.Driver}}|{{.Internal}}');
+      inspect(
+        'network',
+        config.networkName,
+        '{{.Driver}}|{{.Internal}}|{{if .IPAM.Config}}{{(index .IPAM.Config 0).Subnet}}{{end}}',
+      );
     const existing = await networkState();
     if (existing.present) {
-      if (existing.value !== 'bridge|true')
+      // Ein Altbau-Netz ohne Subnet-Zusage passt nur, solange gar keines
+      // verlangt wird; mit fester Adressplanung muss das Subnetz exakt
+      // stimmen, sonst greift --ip ins Leere.
+      const legacyOk =
+        !config.networkCidr && existing.value.startsWith('bridge|true');
+      if (existing.value !== expected && !legacyOk)
         throw new Error(
-          `Netzwerk ${config.networkName} ist nicht als internes Docker-Bridge-Netz isoliert. Stoppe und entferne die verwalteten MySQL/phpMyAdmin-Container, entferne das Netz und starte den Hub erneut. Die Daten bleiben im getrennten Datenverzeichnis erhalten.`,
+          `Netzwerk ${config.networkName} ist nicht als internes Docker-Bridge-Netz isoliert (erwartetes Subnetz: ${config.networkCidr ?? 'beliebig'}, ist: ${existing.value || 'unbekannt'}). Stoppe und entferne die verwalteten MySQL/phpMyAdmin-Container, entferne das Netz und starte den Hub erneut – oder setze BOT_HUB_MYSQL_RESET=1. Die Daten bleiben im getrennten Datenverzeichnis erhalten.`,
         );
       return;
     }
@@ -705,12 +808,14 @@ export const createProvisioner = (deps = {}) => {
         '--driver',
         'bridge',
         '--internal',
+        ...(config.networkCidr ? ['--subnet', config.networkCidr] : []),
+        ...(config.gateway ? ['--gateway', config.gateway] : []),
         config.networkName,
       ],
       { capture: true },
     );
     const verified = await networkState();
-    if (!verified.present || verified.value !== 'bridge|true')
+    if (!verified.present || verified.value !== expected)
       throw new Error(
         `Internes Netzwerk ${config.networkName} konnte nicht sicher angelegt werden: ${created.stderr.trim() || verified.error || `Exit-Code ${created.code}`}`,
       );
@@ -718,6 +823,15 @@ export const createProvisioner = (deps = {}) => {
 
   const ensureContainer = async () => {
     mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
+    // Siehe containerUser: als root-Hub läuft mysqld als 999 – dann gehört ihm
+    // auch das Datenverzeichnis, sonst scheitert die Initialisierung still.
+    if (process.getuid?.() === 0) {
+      try {
+        chownSync(config.dataDir, MYSQL_IMAGE_UID, MYSQL_IMAGE_UID);
+      } catch {
+        /* Fremd gehörende Verzeichnisse meldet MySQL beim Start selbst. */
+      }
+    }
     const present = await containerExists();
     if (present) {
       const label = await inspect(
@@ -821,7 +935,7 @@ export const createProvisioner = (deps = {}) => {
     });
     if (stopped.code !== 0 && (await pmaIsRunning()))
       throw new Error(
-        `Container ${config.phpmyadmin.containerName} liess sich nicht stoppen: ${stopped.stderr.trim() || `Exit-Code ${stopped.code}`}. BOT_HUB_PHPMYADMIN ist nicht gesetzt, die Oberfläche laeuft aber weiter auf 127.0.0.1:${config.phpmyadmin.port}.`,
+        `Container ${config.phpmyadmin.containerName} liess sich nicht stoppen: ${stopped.stderr.trim() || `Exit-Code ${stopped.code}`}. BOT_HUB_PHPMYADMIN ist nicht gesetzt, die Oberfläche laeuft aber weiter im internen Netz auf ${config.phpmyadmin.containerAddress}.`,
       );
     return true;
   };
@@ -857,7 +971,7 @@ export const createProvisioner = (deps = {}) => {
       try {
         connection = await connect({
           host: config.host,
-          port: config.port,
+          port: config.connectPort ?? CONTAINER_PORT,
           user: 'root',
           password,
         });
@@ -901,7 +1015,7 @@ export const createProvisioner = (deps = {}) => {
     try {
       connection = await connect({
         host: config.host,
-        port: config.port,
+        port: config.connectPort ?? CONTAINER_PORT,
         user: 'root',
         password: rootPassword,
       });
@@ -957,7 +1071,7 @@ export const createProvisioner = (deps = {}) => {
     try {
       connection = await connect({
         host: config.host,
-        port: config.port,
+        port: config.connectPort ?? CONTAINER_PORT,
         user,
         password: currentSecret,
       });
@@ -990,7 +1104,7 @@ export const createProvisioner = (deps = {}) => {
     try {
       connection = await connect({
         host: config.host,
-        port: config.port,
+        port: config.connectPort ?? CONTAINER_PORT,
         user,
         password,
       });
@@ -1040,7 +1154,7 @@ export const createProvisioner = (deps = {}) => {
   // Nicht `describe`: das Wort ist in diesem Repo durch die Tests besetzt, und
   // ein gleichnamiges Feld in einem Rückgabewert lädt zu Verwechslungen ein.
   const beschreibung = () =>
-    `mysql 127.0.0.1:${config.port}/${config.database} als ${config.user}` +
+    `mysql ${config.host}:${config.connectPort ?? CONTAINER_PORT}/${config.database} als ${config.user}` +
     ` (Container ${config.containerName})`;
 
   /**
@@ -1081,34 +1195,64 @@ export const createProvisioner = (deps = {}) => {
     const established = secrets.BOT_HUB_DB_BOOTSTRAPPED === '1';
     const usable = established && Boolean(secrets.BOT_HUB_DB_PASSWORD);
     const wantsPhpmyadmin = config.phpmyadmin.enabled;
-    const adminReady = wantsPhpmyadmin && (await adminUsable());
-
-    if (wantsPhpmyadmin && established && usable && !adminReady)
-      throw new Error(
-        `BOT_HUB_PHPMYADMIN=1 ist gesetzt, aber der Benutzer ${config.adminUser} existiert nicht: ` +
-          'er entsteht nur beim ersten Einrichten, und danach gibt es keinen Adminzugang mehr, der ihn nachholen könnte. ' +
-          `Bitte BOT_HUB_PHPMYADMIN=1 vor dem ersten Start setzen. Oder ${config.dataDir} wird mit BOT_HUB_MYSQL_RESET=1 verworfen und alles neu angelegt; dabei gehen alle Bot-Daten verloren.`,
-      );
 
     let adminPassword = null;
     let appPassword = null;
     let adminDbPassword = null;
     if (!usable) {
-      adminPassword = generatePassword(PASSWORD_LENGTH, randomBytes);
+      // Crash-Fenster: war die Einrichtung nach `docker create` abgebrochen,
+      // trägt der Container das root-Passwort aus der Init-Datei. Ein
+      // neu erzeugtes Passwort wäre gegen diesen Container wirkungslos –
+      // `waitForAdmin` liefe bis zum Timeout ins Leere. Darum gilt: existiert
+      // der Container, wird die Init-Datei wiederverwendet; ohne sie gibt es
+      // keinen Weg hinein, und ein klarer Fehler ist besser als ein Hänger.
+      const retained =
+        (await containerExists()) && existsSync(envFile)
+          ? /^\s*MYSQL_ROOT_PASSWORD=(.*)$/m
+              .exec(readFileSync(envFile, 'utf8'))?.[1]
+              ?.trim() || null
+          : null;
+      if (!retained && (await containerExists()))
+        throw new Error(
+          `MySQL-Container ${config.containerName} existiert bereits, aber sein Admin-Passwort ist nicht mehr greifbar (data/secrets/mysql-init.env fehlt). Ohne root-Zugang kann die Einrichtung nicht fortgesetzt werden. Mit BOT_HUB_MYSQL_RESET=1 werden Container, Netz und ${config.dataDir} verworfen und alles neu angelegt; dabei gehen alle Bot-Daten verloren.`,
+        );
+      adminPassword =
+        retained ?? generatePassword(PASSWORD_LENGTH, randomBytes);
       appPassword = generatePassword(PASSWORD_LENGTH, randomBytes);
       if (wantsPhpmyadmin)
         adminDbPassword = generatePassword(PASSWORD_LENGTH, randomBytes);
-      writeInitEnvFile(adminPassword);
+      if (!retained) writeInitEnvFile(adminPassword);
     }
 
     let status = 'eingerichtet';
     try {
+      if (usable && !existsSync(envFile)) {
+        // Nachträgliche Container-Neuanlage (rm, Host-Umzug, Signatur-
+        // austausch): Das Datenvolumen ist initialisiert, der ENTRYPOINT
+        // überspringt die Einrichtung – das root-Passwort in der env-file wird
+        // nie gebraucht. Aber `docker create --env-file` verlangt die Datei
+        // schlicht. Ein Wegwerfwert, hinterher ohnehin gelöscht; wäre das
+        // Volumen wider Erwarten leer, scheitert die Prüfung unten mit klarer
+        // Ansage statt still zu verlockend frischem root-Zugang.
+        writeInitEnvFile(generatePassword(PASSWORD_LENGTH, randomBytes));
+      }
       await ensureNetwork();
       await ensureContainer();
       await ensureStarted();
 
       if (secrets.BOT_HUB_DB_PASSWORD && (await running())) {
         status = 'bereit';
+        // Der einzige Ort, an dem diese Frage entscheidbar ist: ob der
+        // Verwaltungsbenutzer existiert, weiß man erst, wenn mysqld läuft.
+        // Vorher wäre „nicht erreichbar" nicht von „nicht vorhanden" zu
+        // unterscheiden – ein bloß gestoppter Container durfte nie wie ein
+        // Datenverlust behandelt werden.
+        if (wantsPhpmyadmin && !(await adminUsable()))
+          throw new Error(
+            `BOT_HUB_PHPMYADMIN=1 ist gesetzt, aber der Benutzer ${config.adminUser} existiert nicht: ` +
+              'er entsteht nur beim ersten Einrichten, und danach gibt es keinen Adminzugang mehr, der ihn nachholen könnte. ' +
+              `Bitte BOT_HUB_PHPMYADMIN=1 vor dem ersten Start setzen. Oder ${config.dataDir} wird mit BOT_HUB_MYSQL_RESET=1 verworfen und alles neu angelegt; dabei gehen alle Bot-Daten verloren.`,
+          );
       } else if (established) {
         throw new Error(
           `Der MySQL-Container ${config.containerName} ist eingerichtet, aber der Benutzer ${config.user} kommt nicht hinein. ` +
@@ -1139,8 +1283,10 @@ export const createProvisioner = (deps = {}) => {
     } finally {
       // Auch im Fehlerfall: ein Passwort, das auf der Platte bleibt, obwohl der
       // Admin-Zugang von aussen schon weg ist, ist nur Ballast. Beim nächsten
-      // Start entsteht ohnehin ein neues.
-      if (!usable) dropInitEnvFile();
+      // Start entsteht ohnehin ein neues – und bei der Neuanlage eines
+      // Containers über einen eingerichteten Volumen ist der Inhalt sowieso
+      // bedeutungslos (siehe oben), weg gehört er trotzdem.
+      dropInitEnvFile();
     }
 
     if (!usable) {
@@ -1171,7 +1317,7 @@ export const createProvisioner = (deps = {}) => {
    * Passwort steht, ist ein Log, den irgendwer kopiert.
    */
   const phpmyadminHinweis = () =>
-    `http://127.0.0.1:${config.phpmyadmin.port}` +
+    `http://${config.phpmyadmin.containerAddress ?? `127.0.0.1:${config.phpmyadmin.port}`}` +
     ` (Anmeldung als ${config.adminUser}, Passwort in data/secrets/phpmyadmin.env)`;
 
   /**

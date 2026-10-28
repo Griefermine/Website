@@ -105,7 +105,7 @@ try {
       // anderen Rechner braucht, tunneliert sie – sonst steht sie irgendwann
       // doch im Internet, und dann ist die Schleife offen.
       console.warn(
-        '[hub] HINWEIS: phpMyAdmin ist nur über 127.0.0.1 erreichbar. Von einem anderen Rechner aus z. B. mit "ssh -L 8081:127.0.0.1:8081 user@server". Ohne Rate-Limit davor gehört phpMyAdmin nicht ins Internet.',
+        '[hub] HINWEIS: phpMyAdmin hängt am internen Netz und ist vom Hub-Host über dessen feste Adresse erreichbar (siehe Zeile oben). Von einem anderen Rechner aus z. B. mit "ssh -L 8081:<Adresse>:80 user@server". Ohne Rate-Limit davor gehört phpMyAdmin nicht ins Internet.',
       );
     }
   }

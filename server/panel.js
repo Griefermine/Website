@@ -27,6 +27,7 @@ import { lookup } from 'node:dns/promises';
 import { BlockList, isIP } from 'node:net';
 import {
   chmodSync,
+  createReadStream,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -41,7 +42,6 @@ import {
   httpError,
   isEvalFlag,
   MIME,
-  parseDotenv,
   readBody,
   safeDecode,
   sendJson,
@@ -308,10 +308,10 @@ const discordConfig = (bot) => {
   // und darf die OAuth-App des Panels nicht bestimmen. Nur
   // data/secrets/<bot-id>.env (0600, Hub-kontrolliert) zählt.
   try {
-    const securePath = join(projectRoot(), 'data', 'secrets', `${bot.id}.env`);
-    const values = existsSync(securePath)
-      ? parseDotenv(readFileSync(securePath, 'utf8'))
-      : {};
+    // Maßnahme 38 (Audit WEB-02): über readSecretValues lesen – mit aktivem
+    // Vault liegt in der Datei ein Umschlag, und rohes parseDotenv hätte den
+    // Panel-OAuth dauerhaft auf einen unauflösbaren client_id-Wert gestellt.
+    const values = readSecretValues(projectRoot(), bot.id) ?? {};
     const oauthUrl = String(values.DISCORD_OAUTH_URL ?? '').trim();
     let oauthClientId = '';
     try {
@@ -819,57 +819,11 @@ const panelDiscordAuth = async (bot, req, res, url, rest) => {
   return false;
 };
 
-/*
- * The dashboard session is intentionally not forwarded to bot panels.
- */
-const linkHubDiscordSession = async (
-  bot,
-  req,
-  res,
-  authSession,
-  panelAccessToken = '',
-) => {
-  return;
-  const cookieSessionId = discordCookie(req, bot.id);
-  const existing = discordSession(req, bot.id);
-  const panelKey = panelAccessToken
-    ? `${bot.id}:${panelAccessToken}`
-    : panelSessionKey(req, bot.id);
-  if (existing?.user?.id === authSession.user.id) {
-    const existingId =
-      cookieSessionId || discordPanelSessions.get(panelSessionKey(req, bot.id));
-    if (panelKey && existingId) discordPanelSessions.set(panelKey, existingId);
-    return;
-  }
-
-  const installedGuildIds = await botGuilds(bot);
-  const sessionId = randomUUID();
-  discordSessions.set(sessionId, {
-    botId: bot.id,
-    user: {
-      id: authSession.user.id,
-      name: authSession.user.name,
-      username: authSession.user.username,
-      avatar: authSession.user.avatar ?? null,
-    },
-    guilds: (authSession.guilds ?? [])
-      .filter(discordGuildAllowed)
-      .filter((guild) => installedGuildIds.has(String(guild.id)))
-      .map(({ id, name, icon, owner, permissions }) => ({
-        id,
-        name,
-        icon: icon ?? null,
-        owner: Boolean(owner),
-        permissions: String(permissions ?? '0'),
-      })),
-    expiresAt: Math.min(
-      authSession.expiresAt,
-      Date.now() + 7 * 24 * 60 * 60 * 1000,
-    ),
-  });
-  if (panelKey) discordPanelSessions.set(panelKey, sessionId);
-  res.setHeader('set-cookie', panelCookie(bot.id, sessionId));
-};
+/* Maßnahme 38 (Audit WEB-10): `linkHubDiscordSession` wurde entfernt – die
+ * Funktion begann mit einem nackten `return` und hatte keine Aufrufer; ein
+ * späteres „Reparieren“ der Zeile hätte still die Dashboard-Session in Bot-
+ * Panels vererbt. Die Anweisung „Die Dashboard-Session wird bewusst nicht an
+ * Bot-Panels weitergereicht“ gilt als Designregel fort. */
 
 /* ------------------------------------------------------------------ *
  * Eingaben normalisieren
@@ -2495,6 +2449,12 @@ const panelAssetOrigin = (req) => {
   return `http://${host}`;
 };
 
+/* Maßnahme 38 (Audit WEB-03/SEC-08): Der Bot schreibt die Dateien seiner
+ * Panel-Seite selbst und ist im Workspace Plattenquota-los – ohne Obergrenze
+ * hätte ein einziger Request mit einem 4-GiB-„big.png“ den Hub in den RAM
+ * gelesen (OOM = Totalausfall aller Bots). Dazu Streaming statt readFileSync. */
+const MAX_PANEL_FILE_BYTES = 8 * 1024 * 1024;
+
 const sendFile = (res, path, assetOrigin = '') => {
   let stat;
   try {
@@ -2503,6 +2463,8 @@ const sendFile = (res, path, assetOrigin = '') => {
     throw httpError(404, 'Datei nicht gefunden');
   }
   if (!stat.isFile()) throw httpError(404, 'Datei nicht gefunden');
+  if (stat.size > MAX_PANEL_FILE_BYTES)
+    throw httpError(413, 'Panel-Datei größer als 8 MiB');
   const ext = path.slice(path.lastIndexOf('.')).toLowerCase();
   res.writeHead(200, {
     'content-type': MIME[ext] ?? 'application/octet-stream',
@@ -2523,7 +2485,9 @@ const sendFile = (res, path, assetOrigin = '') => {
       "frame-ancestors 'self'",
     ].join('; '),
   });
-  res.end(readFileSync(path));
+  createReadStream(path)
+    .on('error', () => res.destroy())
+    .pipe(res);
 };
 
 const servePanelFile = (

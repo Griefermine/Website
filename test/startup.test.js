@@ -27,6 +27,12 @@ const spawnHub = (env) => {
       HOME: process.env.HOME,
       BOT_DASHBOARD_ROOT: join(ROOT, 'test', '.startup'),
       PORT: '0',
+      // Maßnahme 42 (VM-Befund): ein Hub-Test darf niemals das produktive
+      // MySQL anrühren. Ohne diese Zeile erbte der Spawn auf einer VM mit
+      // verwaltetem MySQL deren BOT_HUB_DB=mysql-container über die
+      // CWD-`.env` – und wollte den echten Container übernehmen
+      // (im Extremfall: `BOT_HUB_MYSQL_RESET=1` würde ihn löschen).
+      BOT_HUB_DB: 'sqlite',
       ...env,
     },
     stdio: ['ignore', 'pipe', 'pipe'],

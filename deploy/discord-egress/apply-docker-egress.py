@@ -34,7 +34,13 @@ def install_family(binary: str, *, optional: bool) -> None:
     run([binary, "-A", CHAIN, "-i", "docker0", "-o", "br+", "-j", "RETURN"])
     run([binary, "-A", CHAIN, "-i", "docker0", "-j", "DROP"])
     run([binary, "-A", CHAIN, "-i", "br+", "-o", "docker0", "-j", "RETURN"])
-    run([binary, "-A", CHAIN, "-i", "br+", "-o", "br+", "-j", "RETURN"])
+    # Audit SEC-05 (Maßnahme 40): ein pauschales `br+ -> br+ RETURN` ließ
+    # Bot-Container quer über Brücken laufen – z. B. direkt zum MySQL-Container
+    # im Pflege-Netz, vollständig an Squid und Hub-API vorbei. Gleichnetz-/
+    # Gateway-Verkehre (Bot -> Squid 172.30.x.1, Bot -> Hub 8788) betreffen
+    # diese Kette gar nicht: Ziel-IP ist der Host selbst (INPUT) bzw. derselbe
+    # Bridge-Port (L2-Switching, kein FORWARD). Also: kein RETURN für br+ ->
+    # br+, es fällt auf das DROP darunter.
     run([binary, "-A", CHAIN, "-i", "br+", "-j", "DROP"])
     # Ab hier kann die Eingabe weder docker0 noch br+ sein – die vorherigen
     # Regeln haben beide vollständig abgearbeitet. Das entspricht dem
@@ -65,7 +71,6 @@ def check_family(binary: str, *, optional: bool) -> bool:
         f"-A {CHAIN} -i docker0 -o br+ -j RETURN",
         f"-A {CHAIN} -i docker0 -j DROP",
         f"-A {CHAIN} -i br+ -o docker0 -j RETURN",
-        f"-A {CHAIN} -i br+ -o br+ -j RETURN",
         f"-A {CHAIN} -i br+ -j DROP",
         f"-A {CHAIN} -o docker0 -m conntrack --ctstate NEW -j DROP",
         f"-A {CHAIN} -o br+ -m conntrack --ctstate NEW -j DROP",

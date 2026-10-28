@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import { createCipheriv, randomBytes } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
@@ -58,7 +64,10 @@ describe('Vault-Verschlüsselung (AES-256-GCM)', () => {
     storeSecretValues(root, BOT_ID, { DISCORD_BOT_TOKEN: TOKEN, EMPTY: '' });
     const raw = rawFile(root, BOT_ID);
     assert.ok(raw.includes('vault:v2:'), 'Umschlag erwartet');
-    assert.ok(!raw.includes('SuperGeheim'), 'Klartext darf nicht in der Datei stehen');
+    assert.ok(
+      !raw.includes('SuperGeheim'),
+      'Klartext darf nicht in der Datei stehen',
+    );
     const values = readSecretValues(root, BOT_ID);
     assert.equal(values.DISCORD_BOT_TOKEN, TOKEN);
     assert.equal(values.EMPTY, '', 'leere Werte bleiben leer');
@@ -142,7 +151,12 @@ describe('Vault-Verschlüsselung (AES-256-GCM)', () => {
   it('v2-Umschlag ist an seine Datei gebunden (Cross-File-Tausch wirft)', () => {
     writeKey(root);
     process.env.BOT_HUB_KEY_FILE = keyPath(root);
-    storeSecretValues(root, 'botA', { DISCORD_BOT_TOKEN: TOKEN }, { merge: false });
+    storeSecretValues(
+      root,
+      'botA',
+      { DISCORD_BOT_TOKEN: TOKEN },
+      { merge: false },
+    );
     const envelope = rawFile(root, 'botA').match(
       /DISCORD_BOT_TOKEN="([^"]+)"/,
     )[1];

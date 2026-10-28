@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import {
+  chmodSync,
   closeSync,
   cpSync,
   existsSync,
@@ -32,6 +33,7 @@ import * as dateien from './botFiles.js';
 import {
   cleanupTempEnvFiles,
   dotenvKey,
+  isPanelOAuthKey,
   readSecretValues,
   removeSecretValues,
   bootstrapSecretVault,
@@ -83,9 +85,11 @@ import {
   cleanupExecEnvFile,
   dependencyRunArgs,
   ensureContainer,
+  ensureDotnetCliHome,
   execArgs,
   stopContainer,
   removeContainer,
+  sweepStaleExecEnvFiles,
 } from './containers.js';
 import { database } from './database.js';
 import { ensurePanelScaffold, migrateScaffold } from './panelScaffold.js';
@@ -277,6 +281,15 @@ const rateLimit = (req, url) => {
     // war das ein billiger Weg, den Hub mit teuren Reads zuzuschütten.
     limit = 300;
     rateClass = 'logs';
+  } else if (
+    /^\/api\/bots(?:\/|$)/.test(path) &&
+    (req.method === 'GET' || req.method === 'HEAD')
+  ) {
+    // Maßnahme 38 (Audit WEB-04): Jedes GET baut publicBot für alle Bots –
+    // inklusive Panel-Manifest-Prüfung und rekursivem Datei-Scan. Ohne
+    // Bucket war das ein billiger CPU-/I-O-Hammer gegen die geteilte VM.
+    limit = 300;
+    rateClass = 'bots-read';
   }
   const now = Date.now();
   const ip = clientAddress(req);
@@ -848,6 +861,9 @@ const secretValues = (config, incoming) => {
   const next = { ...stored };
   for (const [key, value] of Object.entries(incoming ?? {})) {
     if (value === undefined || value === null) continue;
+    // Panel-OAuth-Schlüssel sind Handpflege vorbehalten – ein Bot darf den
+    // Login nicht auf fremde Apps umbiegen (Maßnahme 37, Audit SEC-03).
+    if (isPanelOAuthKey(key)) continue;
     if (value === '' || value === MASK) {
       continue;
     }
@@ -1219,8 +1235,32 @@ const killTree = (child, signal) => {
  * Scheitert das Warten, wirft er 409: der Bot bleibt gesperrt, statt dass
  * Cleanup unter einem laufenden Prozess abläuft.
  */
+/* Maßnahme 38 (Audit SEC-04): SIGKILL gegen den `docker run`-Client tötet den
+ * Container NICHT – ein böshaftes Install-Skript würde als verwaister
+ * Dependency-Container weiterlaufen und schreiben, lange nachdem der Bot
+ * gelöscht ist. Erst `docker stop` am gespeicherten Containernamen, dann die
+ * Eskalation gegen den Client. */
+const stopBusyContainer = (name) =>
+  new Promise((resolve) => {
+    if (!name) return resolve();
+    let stopper;
+    try {
+      stopper = spawn(containerRuntimeName(), ['stop', '--time', '2', name], {
+        stdio: 'ignore',
+      });
+    } catch {
+      return resolve();
+    }
+    stopper.once('error', resolve);
+    stopper.once('exit', resolve);
+  });
+
 const abortActiveOperation = async (bot, { graceMs = 5000 } = {}) => {
   const proc = bot.busy;
+  if (bot.busyContainer) {
+    await stopBusyContainer(bot.busyContainer);
+    bot.busyContainer = null;
+  }
   if (proc) {
     pushLine(bot.id, 'system', 'Laufende Installation wird abgebrochen …');
     killTree(proc, 'SIGTERM');
@@ -1440,8 +1480,10 @@ const parseCommand = (command) => {
 };
 
 /**
- * Ein Programm im eigenen Ordner des Bots, z.B. der Gradle-Wrapper
- * `./gradlew`.
+ * Ein Programm im eigenen Ordner des Bots: beim Bauen der Gradle-Wrapper
+ * `./gradlew`, beim Start zusätzlich das vom Sprach-Preset erzeugte Programm
+ * selbst – Rusts Standard-Startbefehl heißt `./target/release/bot`, und ohne
+ * diese Freigabe könnte der Hub sein eigenes Preset nicht ausführen.
  *
  * Dafür gilt mehr als "beginnt mit ./": das Ziel muss eine reguläre Datei im
  * Workspace sein, ausführbar, und nach `realpath` immer noch darin liegen. Ein
@@ -1449,8 +1491,13 @@ const parseCommand = (command) => {
  */
 const WORKSPACE_PROGRAMS = new Set(['./gradlew', './mvnw', './gradlew.bat']);
 
-const workspaceProgram = (executable, dir) => {
-  if (!WORKSPACE_PROGRAMS.has(executable)) return null;
+const workspaceProgram = (executable, dir, allowAny = false) => {
+  if (
+    allowAny
+      ? !executable.startsWith('./')
+      : !WORKSPACE_PROGRAMS.has(executable)
+  )
+    return null;
   const candidate = resolve(dir, executable);
   let info;
   let real;
@@ -1473,7 +1520,9 @@ const commandSpec = (bot, command, dir, purpose = 'start') => {
   const [executable, ...args] = tokens;
   // `./gradlew` ist der einzige erlaubte Pfad: eine Datei im eigenen Ordner des
   // Bots, nicht irgendwo im Dateisystem.
-  const local = workspaceProgram(executable, dir);
+  // Beim Start ist jede ausführbare Datei im Workspace zulässig (Presets wie
+  // `./target/release/bot`); beim Bauen bleibt die Liste eng auf die Wrapper.
+  const local = workspaceProgram(executable, dir, purpose === 'start');
   if (
     !local &&
     (isAbsolute(executable) ||
@@ -1593,7 +1642,10 @@ const runCommand = (
         if (settled) return;
         settled = true;
         if (killer) clearTimeout(killer);
-        if (bot.busy === child) bot.busy = null;
+        if (bot.busy === child) {
+          bot.busy = null;
+          bot.busyContainer = null;
+        }
         if (exec?.envFile) cleanupExecEnvFile(exec.envFile);
         resolveRun({ code });
       };
@@ -1627,6 +1679,7 @@ const runCommand = (
           }),
         );
         bot.busy = child;
+        bot.busyContainer = exec?.containerName ?? null;
         const outputReader = outputLineReader(bot.id, 'deps');
         const errorReader = outputLineReader(bot.id, 'deps');
         child.stdout.on('data', (data) => outputReader.write(data));
@@ -1711,6 +1764,10 @@ const installDependencies = async (bot, dir, { state, force = false } = {}) => {
     depsStatus: 'installing',
     depsCommand: installLabel(plan),
   });
+  // Maßnahme 35: ohne Erststart-Sentinel im DOTNET_CLI_HOME crasht jeder
+  // dotnet-Befehl als Nicht-Root im Container (NuGet-Migrations-Mutex).
+  if (containerRuntimeEnabled() && bot.language === 'csharp')
+    await ensureDotnetCliHome(bot, PROJECT_ROOT);
   pushLine(
     bot.id,
     'system',
@@ -2140,6 +2197,9 @@ const ablehnungsgrund = (config) => {
 };
 
 const load = () => {
+  // Maßnahme 38 (Audit SEC-07): verwaiste Exec-env-Dateien aus /tmp räumen –
+  // sie enthalten Bot- und Laufzeit-Tokens und überleben einen harten Hub-Tod.
+  sweepStaleExecEnvFiles();
   // Reste abgebrochener Schreibvorgänge enthalten vollständige Geheimnisse.
   cleanupTempEnvFiles(join(PROJECT_ROOT, 'data', 'secrets'));
   if (!existsSync(DATA_FILE)) return;
@@ -2293,9 +2353,24 @@ const normaliseConfig = (input, existing) => {
       20,
       Math.max(0, Number(input.maxRestarts ?? existing?.maxRestarts ?? 5)),
     ),
-    env: input.env ?? existing?.env ?? {},
+    env: filterPanelOAuthKeys(input.env ?? existing?.env ?? {}),
     secretEnv: secretValues(existing ?? {}, input.secretEnv),
   };
+};
+
+/**
+ * Bot-seitig gesetzte Panel-OAuth-Schlüssel werden an der Grenze verworfen
+ * (Maßnahme 37, Audit SEC-03): nur die von Hand gepflegte
+ * `data/secrets/<id>.env` bestimmt den Panel-Login.
+ */
+const filterPanelOAuthKeys = (env) => {
+  if (!env || typeof env !== 'object') return {};
+  const clean = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (isPanelOAuthKey(key)) continue;
+    clean[key] = value;
+  }
+  return clean;
 };
 
 /**
@@ -2314,6 +2389,30 @@ const normaliseConfig = (input, existing) => {
  */
 const auditTag = (id, actor) =>
   `[hub] BOT_DELETE bot=${id} actor=${actor ?? '-'} ts=${new Date().toISOString()}`;
+
+/* Go-Modul-Cache & Co. lagern ihre Dateien in Verzeichnissen mit Modus
+ * 0555 – bewusst schreibgeschützt. Ohne Owner-Schreibbit scheitern dort
+ * sowohl unlink als auch rmdir, und die Bot-Löschung blieb mit EACCES
+ * stehen (Maßnahme 32). Vor dem Entfernen erhalten deshalb alle
+ * Verzeichnisse im (längst validierten) Bot-Ordner das Owner-Schreibbit;
+ * symlinks und tiefer als 64 Ebenen wird nicht gefolgt. Einzelpfade
+ * scheitern still – die folgende rm-Spur entscheidet über Erfolg oder
+ * Cleanup-Fehler. */
+export const openDirsForRemoval = (root, depth = 0) => {
+  if (depth > 64) return;
+  try {
+    const st = lstatSync(root);
+    if (!st.isDirectory()) return;
+    chmodSync(root, st.mode | 0o700);
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      if (entry.isDirectory() && !entry.isSymbolicLink())
+        openDirsForRemoval(join(root, entry.name), depth + 1);
+    }
+  } catch {
+    /* restlos ignorieren: wenn schon das Begehen klemmt, muss rm selbst
+     * sehen, ob es ohne weiterkommt – der attempt-Wrapper meldet es. */
+  }
+};
 
 const deleteBotCompletely = async (bot, actor) => {
   const id = bot.id;
@@ -2426,6 +2525,7 @@ const deleteBotCompletely = async (bot, actor) => {
         throw new Error('Bot-Verzeichnis ist ungültig');
       try {
         lstatSync(botDirectory);
+        openDirsForRemoval(botDirectory);
         rmSync(botDirectory, { recursive: true });
       } catch (error) {
         if (error?.code !== 'ENOENT') throw error;
@@ -2891,11 +2991,11 @@ const handleApi = async (req, res, url) => {
     const bot = bots.get(id);
     if (!bot) throw httpError(404, 'Bot nicht gefunden');
 
-    if (!action && req.method === 'GET') permission('bots.read');
+    if (!action && req.method === 'GET') permission('bots.read', bot.id);
     if (!action && req.method === 'GET')
       return sendJson(res, 200, { bot: publicBot(bot) });
     if (!action && req.method === 'PATCH') {
-      permission('bots.manage');
+      permission('bots.manage', bot.id);
       const body = await readBody(req);
       const config = normaliseConfig(body, bot);
       if (!safeBotPath(bot, config.cwd))
@@ -2924,7 +3024,7 @@ const handleApi = async (req, res, url) => {
       return sendJson(res, 200, result);
     }
     if (!action && req.method === 'DELETE') {
-      permission('bots.delete');
+      permission('bots.delete', bot.id);
       // P1-J: Vor dem Warten auf den Lifecycle-Lock die laufende Installation
       // beenden und ihr Ende abfragen – sonst hängt DELETE hinter einer
       // npm/pip-Installation, die Minuten laufen kann. deletePending sperrt
@@ -2944,7 +3044,7 @@ const handleApi = async (req, res, url) => {
       }
     }
     if (action === 'start' && req.method === 'POST') {
-      permission('bots.control');
+      permission('bots.control', bot.id);
       const started = await withBotLifecycleLock(id, async () => {
         assertNotDeleting(bot);
         if (bots.get(id) !== bot) throw httpError(404, 'Bot nicht gefunden');
@@ -2973,7 +3073,7 @@ const handleApi = async (req, res, url) => {
     }
 
     if (action === 'install' && req.method === 'POST') {
-      permission('bots.manage');
+      permission('bots.manage', bot.id);
       // P1-J: Ein vorbereiteter oder laufender Delete blockiert neue
       // Installationen schon vor der Antwort mit 202 – nicht erst in der
       // Lock-Übernahme, die der Anfragende nie zu sehen bekäme.
@@ -3011,7 +3111,7 @@ const handleApi = async (req, res, url) => {
       return sendJson(res, 202, { bot: publicBot(bot) });
     }
     if (action === 'stop' && req.method === 'POST') {
-      permission('bots.control');
+      permission('bots.control', bot.id);
       // P1-J: Stop wartet nicht das Ende einer Installation ab – der
       // Installationsprozess wird zuerst terminiert; der Lock wird dadurch
       // in Sekunden frei, und stopBot räumt ohnehin final auf.
@@ -3023,7 +3123,7 @@ const handleApi = async (req, res, url) => {
       return sendJson(res, 200, { bot: stopped });
     }
     if (action === 'kill' && req.method === 'POST') {
-      permission('bots.control');
+      permission('bots.control', bot.id);
       // P1-J: wie stop, nur sofort hart.
       if (bot.busy) killTree(bot.busy, 'SIGKILL');
       const stopped = await withBotLifecycleLock(id, async () => {
@@ -3033,7 +3133,7 @@ const handleApi = async (req, res, url) => {
       return sendJson(res, 200, { bot: stopped });
     }
     if (action === 'restart' && req.method === 'POST') {
-      permission('bots.restart');
+      permission('bots.restart', bot.id);
       const restarted = await withBotLifecycleLock(id, async () => {
         assertNotDeleting(bot);
         stopBot(id, { signal: 'SIGTERM' });
@@ -3076,7 +3176,7 @@ const handleApi = async (req, res, url) => {
       // alles Schreibende (Settings, Commands, State, Login/Logout) nicht.
       if (req.method !== 'GET') assertNotDeleting(bot);
       if (req.method === 'GET' && url.pathname.endsWith('/panel/open')) {
-        permission('panel.read');
+        permission('panel.read', bot.id);
         ensurePanel(bot);
         const manifest = bot.panel?.manifest;
         const requested = url.searchParams.get('page') ?? '';
@@ -3113,7 +3213,7 @@ const handleApi = async (req, res, url) => {
         return res.end();
       }
       if (isPanelDiscordAuthRoute) {
-        if (!panelTokenAuth) permission('panel.read');
+        if (!panelTokenAuth) permission('panel.read', bot.id);
         return handlePanelRoutes(bot, req, res, url);
       }
       if (isPanelStaticAsset) {
@@ -3141,6 +3241,7 @@ const handleApi = async (req, res, url) => {
         req.method === 'POST' && /\/panel\/discord\/logout$/.test(url.pathname);
       permission(
         req.method === 'GET' || panelLogout ? 'panel.read' : 'panel.manage',
+        bot.id,
       );
       return handlePanelRoutes(bot, req, res, url);
     }

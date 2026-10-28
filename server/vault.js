@@ -35,11 +35,7 @@
  * AAD-Bindung.
  */
 
-import {
-  createCipheriv,
-  createDecipheriv,
-  randomBytes,
-} from 'node:crypto';
+import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import {
   chmodSync,
   existsSync,
@@ -75,7 +71,11 @@ const keyCache = new Map();
  * 64-stelliges Hex (AES-256) ist. `ensure` legt einen frischen Zufallskey an,
  * falls noch keiner existiert (Einrichtungs-Aufruf, nie im Lese-/Schreibpfad).
  */
-export const loadVaultKey = (projectRoot, env = process.env, ensure = false) => {
+export const loadVaultKey = (
+  projectRoot,
+  env = process.env,
+  ensure = false,
+) => {
   const path = vaultKeyPath(projectRoot, env);
   const cached = keyCache.get(path);
   if (cached && !ensure) return cached;

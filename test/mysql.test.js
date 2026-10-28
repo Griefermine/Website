@@ -63,6 +63,9 @@ const fakeDocker = (initial = {}) => {
   const state = {
     network: initial.network ?? false,
     networkInternal: initial.networkInternal ?? true,
+    // Vorgesetzte Netze entsprechen dem heutigen Standard (festes Subnetz),
+    // damit nur die ausdrücklich gesetzten Ausnahmen daran scheitern.
+    networkSubnet: initial.networkSubnet ?? '172.30.252.0/24',
     /** name -> { running, label } */
     containers: new Map(initial.containers ?? []),
   };
@@ -78,13 +81,18 @@ const fakeDocker = (initial = {}) => {
         const format = args.includes('--format')
           ? args[args.indexOf('--format') + 1]
           : null;
-        if (format === '{{.Driver}}|{{.Internal}}')
-          return ok(`bridge|${state.networkInternal}`);
+        if (format && format.startsWith('{{.Driver}}|{{.Internal}}'))
+          return ok(
+            `bridge|${state.networkInternal}|${state.networkSubnet ?? ''}`,
+          );
         return ok('[]');
       }
       if (args[1] === 'create') {
         state.network = true;
         state.networkInternal = args.includes('--internal');
+        state.networkSubnet = args.includes('--subnet')
+          ? args[args.indexOf('--subnet') + 1]
+          : '';
         return ok('netzwerkid');
       }
       if (args[1] === 'rm') {
@@ -338,12 +346,19 @@ describe('Der MySQL-Container', () => {
   });
   const valueOf = (name) => args[args.indexOf(name) + 1];
 
-  it('veröffentlicht nur auf Loopback', () => {
-    assert.equal(valueOf('--publish'), '127.0.0.1:3307:3306');
+  it('veröffentlicht gar keinen Hafen nach außen', () => {
+    // Internes Netz: Docker setzt Publikationen dort nicht um, und der Hub
+    // verbindet die feste Netzadresse – ein Hafen wäre eine falsche Fährte.
+    assert.ok(!args.includes('--publish'), 'kein --publish erwartet');
     assert.ok(
       !argsOf([args]).includes('0.0.0.0'),
       'der Port darf nicht auf allen Interfaces liegen',
     );
+  });
+
+  it('bezieht die feste Adresse im internen Netz', () => {
+    assert.equal(config.containerAddress, '172.30.252.2');
+    assert.equal(valueOf('--ip'), '172.30.252.2');
   });
 
   it('hängt an einem eigenen Netz, nicht an der Default-Bridge', () => {
@@ -668,6 +683,80 @@ describe('Das Einrichten', () => {
     assert.ok(readDbSecret(dir).BOT_HUB_DB_PASSWORD.length >= MIN);
   });
 
+  it('legt das Netz mit festem Subnetz und Gateway an', async () => {
+    const dir = makeRoot();
+    const docker = fakeDocker();
+    const { provisioner } = setup({ dir, docker });
+    await provisioner.provision();
+    const netz = docker.calls.find(
+      (args) => args[0] === 'network' && args[1] === 'create',
+    );
+    assert.ok(netz, 'Netz wurde nicht angelegt');
+    assert.equal(netz[netz.indexOf('--subnet') + 1], '172.30.252.0/24');
+    assert.equal(netz[netz.indexOf('--gateway') + 1], '172.30.252.1');
+    assert.ok(netz.includes('--internal'), 'Netz muss intern sein');
+  });
+
+  it('nutzt nach einem Abbruch das Init-Passwort des Containers erneut', async () => {
+    // Crash-Fenster: Container schon erstellt, Hub starb vorher. Ein neu
+    // erzeugtes Passwort wäre gegen den bestehenden Container wertlos –
+    // die Init-Datei muss wiederverwendet werden.
+    const dir = makeRoot();
+    const docker = fakeDocker({
+      containers: [['bot-hub-mysql', { running: false, label: 'alt' }]],
+    });
+    mkdirSync(join(dir, 'data', 'secrets'), { recursive: true, mode: 0o700 });
+    writeFileSync(
+      adminFile(dir),
+      'MYSQL_ROOT_PASSWORD=gerettetes-Passwort\nMYSQL_ROOT_HOST=%\n',
+      { mode: 0o600 },
+    );
+    const { provisioner, adminPassword } = setup({ dir, docker });
+    await provisioner.provision();
+    assert.equal(adminPassword(), 'gerettetes-Passwort');
+  });
+
+  it('nennt einen klaren Grund, wenn ein Container ohne Init-Datei dasteht', async () => {
+    const dir = makeRoot();
+    const docker = fakeDocker({
+      containers: [['bot-hub-mysql', { running: false, label: 'alt' }]],
+    });
+    const { provisioner } = setup({ dir, docker });
+    await assert.rejects(
+      () => provisioner.provision(),
+      /Admin-Passwort ist nicht mehr greifbar/,
+    );
+  });
+
+  it('startet einen gelöschten Container ohne Reset-Gerede wieder an', async () => {
+    // Wartungsfall: Container entfernt (docker rm, Host-Umzug), Datenvolumen
+    // und Secrets unversehrt. Vor der Korrektur prüfte der Provisionierer den
+    // Admin-Zugang, bevor der Container überhaupt lief, und empfahl
+    // ausgerechnet den datenvernichtenden Reset.
+    const dir = makeRoot();
+    const { provisioner, docker } = setup({
+      dir,
+      env: { BOT_HUB_PHPMYADMIN: '1' },
+    });
+    await provisioner.provision();
+    docker.state.containers.delete('bot-hub-mysql');
+    const zweiter = await provisioner.provision();
+    assert.equal(zweiter.status, 'bereit');
+    assert.ok(
+      docker.state.containers.has('bot-hub-mysql'),
+      'der Hub muss den Container neu anlegen',
+    );
+    assert.ok(
+      !existsSync(join(dir, 'data', 'secrets', 'mysql-init.env')),
+      'die Wegwerf-env-file der Neuanlage darf nicht zurückbleiben',
+    );
+    assert.match(
+      zweiter.beschreibung,
+      /mysql 172\.30\.252\.2:3306/,
+      'die Beschreibung muss die echte Zieladresse nennen',
+    );
+  });
+
   it('verweigert ein bestehendes SQL-Netz ohne interne Bridge-Isolation', async () => {
     const dir = makeRoot();
     const docker = fakeDocker({ network: true, networkInternal: false });
@@ -851,8 +940,17 @@ describe('BOT_HUB_DB=mysql-container in der Konfiguration', () => {
     assert.equal(config.driver, 'mysql');
     assert.equal(config.database, 'bot_hub');
     assert.equal(config.user, 'bot_hub');
-    assert.equal(config.host, '127.0.0.1');
-    assert.equal(config.port, 3307);
+    // Der Hub verbindet die feste Adresse im internen Netz – nicht den
+    // publizierten Loopback-Hafen (dessen NAT-Regeln fehlen können).
+    assert.equal(config.host, '172.30.252.2');
+    assert.equal(config.port, 3306);
+    // Eine andere CIDR verschiebt Basis-Adresse und Zieladresse mit.
+    const verschoben = database.resolveDatabaseConfig({
+      env: { ...env(), BOT_HUB_MYSQL_NETWORK_CIDR: '10.10.7.0/28' },
+      projectRoot: makeRoot(),
+    });
+    assert.equal(verschoben.host, '10.10.7.2');
+    assert.equal(verschoben.port, 3306);
   });
 
   it('lässt weder Adresse noch Socket noch Passwort zu', () => {
@@ -937,6 +1035,12 @@ describe('Die Verwaltungsoberfläche', () => {
       : gefunden.slice(schluessel.length + 1);
   };
 
+  it('bezieht die dritte feste Adresse im internen Netz', () => {
+    assert.equal(config.phpmyadmin.containerAddress, '172.30.252.3');
+    assert.ok(args.includes('--ip'), 'feste Netzadresse fehlt');
+    assert.equal(args[args.indexOf('--ip') + 1], '172.30.252.3');
+  });
+
   it('ist aus, solange niemand sie verlangt', () => {
     const ohne = mysql.managedConfig({ env: {}, projectRoot: '/opt/hub' });
     assert.equal(ohne.phpmyadmin.enabled, false);
@@ -974,10 +1078,15 @@ describe('Die Verwaltungsoberfläche', () => {
     );
   });
 
-  it('ist nur auf Loopback erreichbar', () => {
-    assert.equal(wert('--publish'), '127.0.0.1:8081:80');
+  it('ist nur über das interne Netz erreichbar', () => {
+    // Kein Hafen: interne Netze veröffentlichen nicht, die Oberfläche liegt
+    // auf ihrer festen Netzadresse, und der Hub-Host routet dorthin.
+    assert.ok(!args.includes('--publish'), 'kein --publish erwartet');
     assert.ok(!/0\.0\.0\.0/.test(text), '0.0.0.0 würde sie ins Netz stellen');
-    assert.ok(!/:8081:80\s*$/.test(text.replace('--publish 127.0.0.1', '')));
+    assert.ok(
+      text.includes('172.30.252.3'),
+      'die feste Netzadresse muss erreichbar machen, was sie ersetzt',
+    );
   });
 
   it('läuft nicht als root und mit allen Rechten abgewürgt', () => {
@@ -1019,7 +1128,10 @@ describe('Die Verwaltungsoberfläche', () => {
     // bei 80 – wer auf 8081 veröffentlicht, bekommt einen Container, den
     // niemand erreicht.
     assert.equal(wert('PMA_PORT'), '3306');
-    assert.ok(text.includes('127.0.0.1:8081:80'));
+    assert.ok(
+      !text.includes('8081'),
+      'ein Hafen 8081 wäre ohne Veröffentlichung reine Selbsttäuschung',
+    );
   });
 
   it('festelt kein Bild ohne Versionsangabe', () => {

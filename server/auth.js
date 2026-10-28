@@ -71,6 +71,14 @@ let accessFile = null;
 let access = { users: {} };
 
 const loadDotenv = () => {
+  // Maßnahme 42: Der Test-Modus erbt keine Produktiv-Konfiguration über den
+  // Arbeitsordner. Wer die Suite im Projektordner startet, holte sich sonst
+  // die `.env` des Dienstes in den Prozess – inkl. BOT_HUB_KEY_FILE: Tests,
+  // die Klartext in data/secrets erwarten, fanden plötzlich mit dem
+  // Master-Key verschlüsselte Umschläge vor (auf der VM reproduziert).
+  // Tests setzen ihre Konfiguration selbst; das systemd EnvironmentFile
+  // versorgt den echten Dienst.
+  if (process.env.BOT_HUB_TEST_MODE === '1') return;
   try {
     const content = readFileSync(join(process.cwd(), '.env'), 'utf8');
     for (const line of content.split(/\r?\n/)) {
@@ -290,7 +298,10 @@ const saveSessions = () => {
     } catch {
       /* Ein TempFile-Rest ist harmlos; der Schreibfehler wird gemeldet. */
     }
-    console.error('[hub] Sessions konnten nicht gespeichert werden:', error.message);
+    console.error(
+      '[hub] Sessions konnten nicht gespeichert werden:',
+      error.message,
+    );
   }
 };
 const loadSessions = () => {
@@ -299,7 +310,12 @@ const loadSessions = () => {
     const raw = readFileSync(sessionFile, 'utf8');
     let content = raw;
     if (raw.trim().startsWith('vault:')) {
-      content = decryptValue('sessions', 'file', raw.trim(), projectRootOfSessionFile());
+      content = decryptValue(
+        'sessions',
+        'file',
+        raw.trim(),
+        projectRootOfSessionFile(),
+      );
     }
     const parsed = JSON.parse(content);
     const now = Date.now();
@@ -313,10 +329,16 @@ const loadSessions = () => {
         sessions.set(key, value);
     }
     // Klartext-Altbestand einmalig in den Umschlag hochziehen.
-    if (!raw.trim().startsWith('vault:') && vaultEnabled(projectRootOfSessionFile()))
+    if (
+      !raw.trim().startsWith('vault:') &&
+      vaultEnabled(projectRootOfSessionFile())
+    )
       saveSessions();
   } catch (error) {
-    console.error('[hub] Sessions konnten nicht geladen werden:', error.message);
+    console.error(
+      '[hub] Sessions konnten nicht geladen werden:',
+      error.message,
+    );
   }
 };
 export const configureSessionStore = (file) => {
@@ -416,9 +438,12 @@ const effectivePermissions = (entry, botId) => {
     allowed.has(permission),
   );
   if (!botId) return global;
+  // Per-Bot-Rechte sind eine ERWEITERUNG, keine Untermenge der Rolle:
+  // Wer als viewer: [] nur auf Bot A berechtigt werden soll, kann ohne
+  // Bot-Bezug nichts, mit Bot A genau das Eingetragene. Ein Rollen-Deckel
+  // hier machte die Bot-Rechte-UI zu Dekor (Audit WEB-01, Maßnahme 37).
   const perBot = entry.bots?.[botId]?.permissions ?? [];
-  const merged = [...new Set([...global, ...perBot])];
-  return merged.filter((permission) => allowed.has(permission));
+  return [...new Set([...global, ...perBot])];
 };
 
 export const publicAccess = (userId, botId) => {

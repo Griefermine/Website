@@ -3,7 +3,9 @@
 ## 📦 Was Sie jetzt haben
 
 ### 1. **deploy-full.sh** - Full Deployment Skript
+
 Installiert automatisch ALLES:
+
 - ✅ Docker & Docker Compose
 - ✅ Node.js 22
 - ✅ nginx (Reverse-Proxy)
@@ -15,13 +17,16 @@ Installiert automatisch ALLES:
 - ✅ Verzeichnisse und Rechte
 
 ### 2. **setup-tls.sh** - TLS/HTTPS Setup
+
 Richtet automatisch HTTPS ein:
+
 - ✅ Let's Encrypt Zertifikat
 - ✅ nginx HTTPS Konfiguration
 - ✅ Auto-Renewal
 - ✅ .env Aktualisierung
 
 ### 3. **DEPLOYMENT_GUIDE.md** - Umfassende Anleitung
+
 Enthält alle Schritte und Troubleshooting.
 
 ---
@@ -29,6 +34,7 @@ Enthält alle Schritte und Troubleshooting.
 ## ⚡ 5-Minuten Deployment
 
 ### Voraussetzungen
+
 - Ubuntu/Debian Server
 - Root-Zugriff
 - Domain-Name
@@ -60,6 +66,7 @@ nano .env
 ```
 
 Minimal-Konfiguration:
+
 ```bash
 DISCORD_CLIENT_ID=ihre-client-id
 DISCORD_CLIENT_SECRET=ihre-client-secret
@@ -89,6 +96,7 @@ Besuchen Sie: `https://ihre-domain.de`
 ### deploy-full.sh
 
 **Was es tut:**
+
 1. System-Update
 2. Pakete installieren (curl, git, nginx, ufw, fail2ban)
 3. Docker installieren
@@ -103,6 +111,7 @@ Besuchen Sie: `https://ihre-domain.de`
 12. Service starten
 
 **Verwendung:**
+
 ```bash
 sudo bash deploy-full.sh
 ```
@@ -110,6 +119,7 @@ sudo bash deploy-full.sh
 ### setup-tls.sh
 
 **Was es tut:**
+
 1. certbot installieren
 2. Port 80 prüfen
 3. nginx für HTTP-only konfigurieren
@@ -120,6 +130,7 @@ sudo bash deploy-full.sh
 8. Auto-Renewal einrichten
 
 **Verwendung:**
+
 ```bash
 sudo bash setup-tls.sh ihre-domain.de
 ```
@@ -131,24 +142,29 @@ sudo bash setup-tls.sh ihre-domain.de
 ### Was automatisch eingerichtet wird:
 
 ✅ **Firewall (UFW)**
+
 - Nur Ports 22, 80, 443 offen
 - Alles andere geblockt
 
 ✅ **Docker-Isolation**
+
 - Isoliertes Netzwerk (bot-hub-discord)
 - Host-Firewall aktiv
 - Docker-Socket nicht gemountet
 
 ✅ **nginx Security Headers**
+
 - X-Frame-Options
 - X-Content-Type-Options
 - X-XSS-Protection
 - HSTS (nach TLS Setup)
 
 ✅ **fail2ban**
+
 - Brute-Force Schutz
 
 ✅ **Verzeichnisrechte**
+
 - data/: 700
 - secrets/: 700
 - .env: 600
@@ -331,6 +347,7 @@ systemctl restart bot-hub
 ## 🎉 Fertig!
 
 Ihr Bot-Hub ist jetzt produktiv bereit mit:
+
 - ✅ Automatischer Installation
 - ✅ HTTPS/TLS
 - ✅ Firewall

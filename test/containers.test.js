@@ -553,9 +553,41 @@ describe('execArgs: Umgebung als 0600-Datei, nie als Argument', () => {
       body,
       /^PATH=\/workspace\/\.venv\/bin:\/workspace\/\.venv\/Scripts:\/usr\/local\/sbin/m,
     );
+    assert.match(body, /^GOPATH=\/workspace\/\.cache\/go$/m);
     assert.equal(statSync(plan.envFile).mode & 0o777, 0o600);
     containers.cleanupExecEnvFile(plan.envFile);
     assert.equal(existsSync(plan.envFile), false);
+  });
+
+  it('mapped ein Workspace-Programm beim Start nach /workspace', () => {
+    // Der Prüfer liefert Host-Pfade (`realpath`); im Container gilt die
+    // Workspace-Einhängung unter /workspace (Bug 29).
+    const plan = containers.execArgs(
+      bot,
+      root,
+      dir,
+      { executable: join(dir, 'target', 'release', 'bot'), args: [] },
+      { LANG: 'C' },
+    );
+    assert.deepEqual(plan.args.slice(-2), [
+      'bot-hub-bot1',
+      '/workspace/target/release/bot',
+    ]);
+    containers.cleanupExecEnvFile(plan.envFile);
+  });
+
+  it('lehnt ein Workspace-Programm außerhalb des Workspace ab', () => {
+    assert.throws(
+      () =>
+        containers.execArgs(
+          bot,
+          root,
+          dir,
+          { executable: join(root, 'fremd', 'bot'), args: [] },
+          {},
+        ),
+      /außerhalb des Bot-Workspace/,
+    );
   });
 
   it('hält unbrauchbare Schlüssel und Werte mit Zeilenumbruch aus der Datei', () => {
@@ -572,6 +604,15 @@ describe('execArgs: Umgebung als 0600-Datei, nie als Argument', () => {
     assert.ok(
       !body.includes('BOSER_KEY'),
       'umgebrochener Wert schmuggelt einen Schlüssel',
+    );
+    // Maßnahme 34: Docker erzwingt noexec auf --tmpfs – 'go run' braucht
+    // GOTMPDIR/TMPDIR im ausführbaren Workspace.
+    assert.match(body, /^GOTMPDIR=\/workspace\/\.cache\/tmp$/m);
+    assert.match(body, /^TMPDIR=\/workspace\/\.cache\/tmp$/m);
+    // Maßnahme 35: dotnet-Erststart-Sentinel-Home im Workspace.
+    assert.match(
+      body,
+      /^DOTNET_CLI_HOME=\/workspace\/\.cache\/dotnet-cli-home$/m,
     );
     containers.cleanupExecEnvFile(plan.envFile);
   });
@@ -612,6 +653,42 @@ describe('Paket-Runner ohne Host-Angriffsfläche', () => {
     containers.cleanupExecEnvFile(installer.envFile);
     if (previous === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = previous;
+  });
+
+  it('hält Go-Werkzeug-Caches auf schreibbaren Workspace-Pfaden', () => {
+    // Das golang-Bild setzt GOPATH=/go auf die read-only-Rootfs: die
+    // Sumdb-Prüfung landete auf /go/pkg/sumdb und scheiterte (Bug 30).
+    const body = installer.envFile
+      ? readFileSync(installer.envFile, 'utf8')
+      : '';
+    assert.match(body, /^GOPATH=\/workspace\/\.cache\/go$/m);
+    assert.match(body, /^GOMODCACHE=\/workspace\/\.cache\/go-mod$/m);
+    assert.match(body, /^GOCACHE=\/workspace\/\.cache\/go-build$/m);
+    // Docker erzwingt noexec auf --tmpfs: go run braucht GOTMPDIR im Workspace.
+    assert.match(body, /^GOTMPDIR=\/workspace\/\.cache\/tmp$/m);
+    assert.match(
+      body,
+      /^DOTNET_CLI_HOME=\/workspace\/\.cache\/dotnet-cli-home$/m,
+    );
+    assert.match(body, /^XDG_DATA_HOME=\/workspace\/\.cache\/xdg-data$/m);
+    assert.ok(
+      existsSync(join(root, 'bots', 'bot1', 'workspace', '.cache', 'tmp')),
+    );
+    // Maven 3.9s Native-Transport ignoriert JVM-Proxy-Properties und
+    // Umgebungsvariablen: einziger gültiger Kanal ist eine settings.xml,
+    // die der Runner in den Workspace schreibt und via MAVEN_ARGS übergibt
+    // (Maßnahme 31, Probe A/B2/C auf dem Paketnetz).
+    assert.match(
+      body,
+      /^MAVEN_ARGS=-s \/workspace\/\.bot-hub\/maven-settings\.xml$/m,
+    );
+    const settings = readFileSync(
+      join(root, 'bots', 'bot1', 'workspace', '.bot-hub', 'maven-settings.xml'),
+      'utf8',
+    );
+    assert.match(settings, /<protocol>https<\/protocol>/);
+    assert.match(settings, /<host>172\.30\.251\.1<\/host>/);
+    assert.match(settings, /<port>3128<\/port>/);
   });
 
   it('übergibt dem Docker-Prozess keine Sockets und keine Fremd-Rechte', () => {

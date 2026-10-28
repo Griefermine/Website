@@ -24,6 +24,7 @@ Alle kritischen Sicherheitsmaßnahmen aus SECURITY_FIXES_V10.md wurden implement
   - ✅ Zugriff auf `data/` und `.env` wird verhindert
 
 **Dateien:**
+
 - <ref_file file="/home/wired/WebstormProjects/untitled/server/botFiles.js" lines="212-280" />
 - <ref_file file="/home/wired/WebstormProjects/untitled/server/panel.js" lines="1049-1071" />
 - <ref_file file="/home/wired/WebstormProjects/untitled/test/security-v26-workspace-isolation.test.js" />
@@ -42,6 +43,7 @@ Alle kritischen Sicherheitsmaßnahmen aus SECURITY_FIXES_V10.md wurden implement
   - ✅ Unsichere Executable-Pfade werden abgelehnt
 
 **Dateien:**
+
 - <ref_file file="/home/wired/WebstormProjects/untitled/server/manager.js" lines="1439-1468" />
 - <ref_file file="/home/wired/WebstormProjects/untitled/test/security-v26-command-injection.test.js" />
 
@@ -56,6 +58,7 @@ Alle kritischen Sicherheitsmaßnahmen aus SECURITY_FIXES_V10.md wurden implement
 - Reserved Env Keys verhindern Überschreiben von Hub-Secrets
 
 **Dateien:**
+
 - <ref_file file="/home/wired/WebstormProjects/untitled/server/manager.js" lines="535-621" />
 - <ref_file file="/home/wired/WebstormProjects/untitled/server/secrets.js" lines="77-88" />
 
@@ -70,6 +73,7 @@ Alle kritischen Sicherheitsmaßnahmen aus SECURITY_FIXES_V10.md wurden implement
 - Timing-Safe Token-Vergleich
 
 **Dateien:**
+
 - <ref_file file="/home/wired/WebstormProjects/untitled/server/panel.js" lines="223-243" />
 - <ref_file file="/home/wired/WebstormProjects/untitled/server/panel.js" lines="246-254" />
 - <ref_file file="/home/wired/WebstormProjects/untitled/server/panel.js" lines="256-282" />
@@ -78,7 +82,7 @@ Alle kritischen Sicherheitsmaßnahmen aus SECURITY_FIXES_V10.md wurden implement
 
 **Status:** ✅ VERBESSERT
 
-- `default-src 'none'` 
+- `default-src 'none'`
 - `script-src 'self'` (kein `unsafe-inline`, kein `unsafe-eval`)
 - `style-src 'self' 'unsafe-inline'` (notwendig für Inline-Styles)
 - `connect-src 'self'` (kein `http:`, kein `https:` wildcard)
@@ -87,9 +91,11 @@ Alle kritischen Sicherheitsmaßnahmen aus SECURITY_FIXES_V10.md wurden implement
 - `base-uri 'self'` (verhindert Base-Tag Angriffe)
 
 **Änderung:**
+
 - `base-uri` von `'none'` zu `'self'` geändert für bessere Kompatibilität
 
 **Dateien:**
+
 - <ref_file file="/home/wired/WebstormProjects/untitled/server/manager.js" lines="3155-3166" />
 - <ref_file file="/home/wired/WebstormProjects/untitled/test/security-v26-csp.test.js" />
 
@@ -104,6 +110,7 @@ Alle kritischen Sicherheitsmaßnahmen aus SECURITY_FIXES_V10.md wurden implement
 - Letzter Owner kann nicht herabgestuft werden
 
 **Dateien:**
+
 - <ref_file file="/home/wired/WebstormProjects/untitled/server/auth.js" lines="309-319" />
 - <ref_file file="/home/wired/WebstormProjects/untitled/server/auth.js" lines="348-413" />
 
@@ -118,6 +125,7 @@ Alle kritischen Sicherheitsmaßnahmen aus SECURITY_FIXES_V10.md wurden implement
 - Separate Limits für kritische Routen (Auth, Actions, Files, Logs)
 
 **Dateien:**
+
 - <ref_file file="/home/wired/WebstormProjects/untitled/server/manager.js" lines="124-148" />
 - <ref_file file="/home/wired/WebstormProjects/untitled/server/manager.js" lines="243-315" />
 
@@ -132,6 +140,7 @@ Alle kritischen Sicherheitsmaßnahmen aus SECURITY_FIXES_V10.md wurden implement
 - Preflight prüft Verzeichnisrechte vor Start
 
 **Dateien:**
+
 - <ref_file file="/home/wired/WebstormProjects/untitled/server/secrets.js" lines="116-170" />
 - <ref_file file="/home/wired/WebstormProjects/untitled/server/preflight.js" lines="135-196" />
 
@@ -147,6 +156,7 @@ Alle kritischen Sicherheitsmaßnahmen aus SECURITY_FIXES_V10.md wurden implement
 - Minimale OAuth-Scopes (`identify guilds`)
 
 **Dateien:**
+
 - <ref_file file="/home/wired/WebstormProjects/untitled/server/auth.js" lines="477-590" />
 
 ### 10. Container-Isolation
@@ -162,6 +172,7 @@ Alle kritischen Sicherheitsmaßnahmen aus SECURITY_FIXES_V10.md wurden implement
 - Memory/CPU Limits
 
 **Dateien:**
+
 - <ref_file file="/home/wired/WebstormProjects/untitled/server/containers.js" lines="246-282" />
 - <ref_file file="/home/wired/WebstormProjects/untitled/server/index.js" lines="54-64" />
 
@@ -175,6 +186,7 @@ Alle kritischen Sicherheitsmaßnahmen aus SECURITY_FIXES_V10.md wurden implement
 - Proxy-Konfiguration vor erstem Request
 
 **Dateien:**
+
 - <ref_file file="/home/wired/WebstormProjects/untitled/server/egress.js" lines="13-50" />
 
 ---
@@ -218,6 +230,7 @@ Alle kritischen Sicherheitsmaßnahmen aus SECURITY_FIXES_V10.md wurden implement
 ### Voraussetzungen
 
 #### 1. Server-Infrastruktur
+
 - [ ] Ubuntu/Debian Server (empfohlen)
 - [ ] Docker & Docker Compose installiert
 - [ ] Node.js 22+ installiert
@@ -226,11 +239,13 @@ Alle kritischen Sicherheitsmaßnahmen aus SECURITY_FIXES_V10.md wurden implement
 - [ ] Mindestens 2GB RAM, 2 CPU Kerne
 
 #### 2. Domain und DNS
+
 - [ ] Domain registriert und auf Server zeigt
 - [ ] A-Record oder CNAME konfiguriert
 - [ ] Discord OAuth App erstellt mit Redirect URI
 
 #### 3. Discord Konfiguration
+
 - [ ] Discord Application erstellt
 - [ ] Client ID und Client Secret notiert
 - [ ] Redirect URI gesetzt: `https://ihre-domain.de/api/auth/discord/callback`
@@ -291,21 +306,21 @@ npm run build
 server {
     listen 443 ssl http2;
     server_name ihre-domain.de;
-    
+
     ssl_certificate /etc/letsencrypt/live/ihre-domain.de/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/ihre-domain.de/privkey.pem;
-    
+
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
-    
+
     location / {
         proxy_pass http://127.0.0.1:8787;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        
+
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -394,6 +409,7 @@ BOT_HUB_REQUIRE_IMAGE_DIGEST=1
 ```
 
 Digests ermitteln:
+
 ```bash
 docker pull python:3.12-bookworm
 docker inspect python:3.12-bookworm | grep sha256
@@ -459,9 +475,11 @@ sudo ufw enable
 ## 🎯 SICHERHEITSBEWERTUNG
 
 ### Vor V26-Härtung: 7/10
+
 - Gute Basis, aber einige Lücken in Workspace-Isolation und CSP
 
-### Nach V26-Härtung: **9/10** 
+### Nach V26-Härtung: **9/10**
+
 - ✅ Workspace strikt isoliert
 - ✅ Shell-Injection verhindert
 - ✅ CSP gehärtet
@@ -474,6 +492,7 @@ sudo ufw enable
 ## 📞 SUPPORT
 
 Bei Problemen:
+
 1. Logs prüfen: `sudo journalctl -u bot-hub -f`
 2. Docker Logs: `docker logs bot-hub-discord-egress`
 3. Tests lokal laufen: `npm test`
