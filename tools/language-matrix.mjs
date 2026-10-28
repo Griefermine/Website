@@ -21,19 +21,31 @@
  *   … --list | --cleanup           Testbots ansehen / löschen
  *
  * Der Hub spricht selbstsigniertes TLS auf dem Loopback-Port — darum ist
- * NODE_TLS_REJECT_UNAUTHORIZED hier bewusst abgeschaltet (nur Loopback).
+ * NODE_TLS_REJECT_UNAUTHORIZED hier bewusst abgeschaltet. DURCHGESETZT (Audit
+ * SC-04): ein HUB_URL auf einen fremden Host würde Bot-Tokens und Session-
+ * Cookie über einen mitlesbaren Weg schicken — der Abschalter bleibt daher an
+ * Loopback gebunden.
  */
 
 import process from 'node:process';
 
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-
 const HUB = process.env.HUB_URL || 'https://localhost:8443';
+const LOOPBACK = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/|$)/;
+if (!LOOPBACK.test(HUB)) {
+  console.error(
+    `HUB_URL "${HUB}" ist kein Loopback — TLS-Prüfung würde hier Tokens entblößen. Abbruch.`,
+  );
+  process.exit(2);
+}
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 const SESSION = process.env.BOT_SESSION;
 const TOKEN = process.env.DISCORD_TEST_TOKEN || '';
 const args = process.argv.slice(2);
 const onlyList = (args.find((a) => a.startsWith('--only=')) || '').split('=')[1]
-  ? args.find((a) => a.startsWith('--only=')).split('=')[1].split(',')
+  ? args
+      .find((a) => a.startsWith('--only='))
+      .split('=')[1]
+      .split(',')
   : null;
 const KEEP = args.includes('--keep');
 
@@ -908,7 +920,9 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const logText = (logs) =>
   (logs?.lines || [])
-    .map((l) => (typeof l === 'string' ? l : l?.line || l?.message || l?.text || ''))
+    .map((l) =>
+      typeof l === 'string' ? l : l?.line || l?.message || l?.text || '',
+    )
     .join('\n');
 
 async function runLanguage(key, spec) {
@@ -945,7 +959,9 @@ async function runLanguage(key, spec) {
         runningSeen = true;
         stoppedSince = 0; // nur ununterbrochene Stop-Phasen zählen
       }
-      const logs = await api('GET', `/api/bots/${bot.id}/logs`).catch(() => null);
+      const logs = await api('GET', `/api/bots/${bot.id}/logs`).catch(
+        () => null,
+      );
       const text = logText(logs);
       if (text.includes(spec.marker)) {
         ready = true;
@@ -969,7 +985,9 @@ async function runLanguage(key, spec) {
     if (!ready)
       throw new Error(
         `READY nie erreicht (Status ${lastStatus}) — Logtail:\n` +
-          logText(await api('GET', `/api/bots/${bot.id}/logs`).catch(() => null))
+          logText(
+            await api('GET', `/api/bots/${bot.id}/logs`).catch(() => null),
+          )
             .split('\n')
             .slice(-15)
             .join('\n'),
@@ -977,7 +995,9 @@ async function runLanguage(key, spec) {
     /* Panel-Zustand: live im Bot-Objekt sichtbar? */
     let panel = '—';
     try {
-      const now = (await api('GET', '/api/bots')).bots.find((b) => b.id === bot.id);
+      const now = (await api('GET', '/api/bots')).bots.find(
+        (b) => b.id === bot.id,
+      );
       panel = JSON.stringify(now?.panel || {}).includes('Bereit') ? '✓' : '?';
     } catch {
       /* Panel-Anzeige ist Beweiszusatz, kein K.-o.-Kriterium. */
@@ -990,8 +1010,8 @@ async function runLanguage(key, spec) {
     if (bot && !KEEP) {
       await api('POST', `/api/bots/${bot.id}/stop`, {}).catch(() => {});
       await wait(2000);
-      await api('DELETE', `/api/bots/${bot.id}`, {}).catch(
-        (e) => console.log(`  cleanup ${key}: ${e.message}`),
+      await api('DELETE', `/api/bots/${bot.id}`, {}).catch((e) =>
+        console.log(`  cleanup ${key}: ${e.message}`),
       );
     } else if (bot) {
       console.log(`  behalten: ${bot.id}`);
@@ -1004,7 +1024,9 @@ async function createSignature() {
     (b) => b.name === signatureBot.name,
   );
   if (existing) {
-    console.log(`Kommandante existiert bereits (${existing.id}, ${existing.status})`);
+    console.log(
+      `Kommandante existiert bereits (${existing.id}, ${existing.status})`,
+    );
     return;
   }
   const { files, ...def } = signatureBot;
@@ -1021,7 +1043,9 @@ async function createSignature() {
 
 const list = async () => {
   for (const b of (await api('GET', '/api/bots')).bots)
-    console.log(`${b.id}  ${b.name.padEnd(18)} ${b.language}/${b.framework}  ${b.status}`);
+    console.log(
+      `${b.id}  ${b.name.padEnd(18)} ${b.language}/${b.framework}  ${b.status}`,
+    );
 };
 
 const cleanup = async () => {
@@ -1031,7 +1055,9 @@ const cleanup = async () => {
   for (const b of listNow) {
     await api('POST', `/api/bots/${b.id}/stop`, {}).catch(() => {});
     await wait(1500);
-    await api('DELETE', `/api/bots/${b.id}`, {}).catch((e) => console.log(b.name, e.message));
+    await api('DELETE', `/api/bots/${b.id}`, {}).catch((e) =>
+      console.log(b.name, e.message),
+    );
     console.log('gelöscht:', b.name);
   }
 };
@@ -1058,7 +1084,8 @@ const main = async () => {
     console.log(`${key}: ${results[key]}`);
   }
   console.log('\n===== Ergebnis =====');
-  for (const [k, v] of Object.entries(results)) console.log(`${k.padEnd(12)} ${v}`);
+  for (const [k, v] of Object.entries(results))
+    console.log(`${k.padEnd(12)} ${v}`);
 };
 
 if (!process.env.MATRIX_EXPORT_ONLY) {

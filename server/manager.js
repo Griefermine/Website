@@ -33,6 +33,7 @@ import * as dateien from './botFiles.js';
 import {
   cleanupTempEnvFiles,
   dotenvKey,
+  isPanelOAuthKey,
   readSecretValues,
   removeSecretValues,
   bootstrapSecretVault,
@@ -88,6 +89,7 @@ import {
   execArgs,
   stopContainer,
   removeContainer,
+  sweepStaleExecEnvFiles,
 } from './containers.js';
 import { database } from './database.js';
 import { ensurePanelScaffold, migrateScaffold } from './panelScaffold.js';
@@ -279,6 +281,15 @@ const rateLimit = (req, url) => {
     // war das ein billiger Weg, den Hub mit teuren Reads zuzuschütten.
     limit = 300;
     rateClass = 'logs';
+  } else if (
+    /^\/api\/bots(?:\/|$)/.test(path) &&
+    (req.method === 'GET' || req.method === 'HEAD')
+  ) {
+    // Maßnahme 38 (Audit WEB-04): Jedes GET baut publicBot für alle Bots –
+    // inklusive Panel-Manifest-Prüfung und rekursivem Datei-Scan. Ohne
+    // Bucket war das ein billiger CPU-/I-O-Hammer gegen die geteilte VM.
+    limit = 300;
+    rateClass = 'bots-read';
   }
   const now = Date.now();
   const ip = clientAddress(req);
@@ -850,6 +861,9 @@ const secretValues = (config, incoming) => {
   const next = { ...stored };
   for (const [key, value] of Object.entries(incoming ?? {})) {
     if (value === undefined || value === null) continue;
+    // Panel-OAuth-Schlüssel sind Handpflege vorbehalten – ein Bot darf den
+    // Login nicht auf fremde Apps umbiegen (Maßnahme 37, Audit SEC-03).
+    if (isPanelOAuthKey(key)) continue;
     if (value === '' || value === MASK) {
       continue;
     }
@@ -1221,8 +1235,32 @@ const killTree = (child, signal) => {
  * Scheitert das Warten, wirft er 409: der Bot bleibt gesperrt, statt dass
  * Cleanup unter einem laufenden Prozess abläuft.
  */
+/* Maßnahme 38 (Audit SEC-04): SIGKILL gegen den `docker run`-Client tötet den
+ * Container NICHT – ein böshaftes Install-Skript würde als verwaister
+ * Dependency-Container weiterlaufen und schreiben, lange nachdem der Bot
+ * gelöscht ist. Erst `docker stop` am gespeicherten Containernamen, dann die
+ * Eskalation gegen den Client. */
+const stopBusyContainer = (name) =>
+  new Promise((resolve) => {
+    if (!name) return resolve();
+    let stopper;
+    try {
+      stopper = spawn(containerRuntimeName(), ['stop', '--time', '2', name], {
+        stdio: 'ignore',
+      });
+    } catch {
+      return resolve();
+    }
+    stopper.once('error', resolve);
+    stopper.once('exit', resolve);
+  });
+
 const abortActiveOperation = async (bot, { graceMs = 5000 } = {}) => {
   const proc = bot.busy;
+  if (bot.busyContainer) {
+    await stopBusyContainer(bot.busyContainer);
+    bot.busyContainer = null;
+  }
   if (proc) {
     pushLine(bot.id, 'system', 'Laufende Installation wird abgebrochen …');
     killTree(proc, 'SIGTERM');
@@ -1604,7 +1642,10 @@ const runCommand = (
         if (settled) return;
         settled = true;
         if (killer) clearTimeout(killer);
-        if (bot.busy === child) bot.busy = null;
+        if (bot.busy === child) {
+          bot.busy = null;
+          bot.busyContainer = null;
+        }
         if (exec?.envFile) cleanupExecEnvFile(exec.envFile);
         resolveRun({ code });
       };
@@ -1638,6 +1679,7 @@ const runCommand = (
           }),
         );
         bot.busy = child;
+        bot.busyContainer = exec?.containerName ?? null;
         const outputReader = outputLineReader(bot.id, 'deps');
         const errorReader = outputLineReader(bot.id, 'deps');
         child.stdout.on('data', (data) => outputReader.write(data));
@@ -2155,6 +2197,9 @@ const ablehnungsgrund = (config) => {
 };
 
 const load = () => {
+  // Maßnahme 38 (Audit SEC-07): verwaiste Exec-env-Dateien aus /tmp räumen –
+  // sie enthalten Bot- und Laufzeit-Tokens und überleben einen harten Hub-Tod.
+  sweepStaleExecEnvFiles();
   // Reste abgebrochener Schreibvorgänge enthalten vollständige Geheimnisse.
   cleanupTempEnvFiles(join(PROJECT_ROOT, 'data', 'secrets'));
   if (!existsSync(DATA_FILE)) return;
@@ -2308,9 +2353,24 @@ const normaliseConfig = (input, existing) => {
       20,
       Math.max(0, Number(input.maxRestarts ?? existing?.maxRestarts ?? 5)),
     ),
-    env: input.env ?? existing?.env ?? {},
+    env: filterPanelOAuthKeys(input.env ?? existing?.env ?? {}),
     secretEnv: secretValues(existing ?? {}, input.secretEnv),
   };
+};
+
+/**
+ * Bot-seitig gesetzte Panel-OAuth-Schlüssel werden an der Grenze verworfen
+ * (Maßnahme 37, Audit SEC-03): nur die von Hand gepflegte
+ * `data/secrets/<id>.env` bestimmt den Panel-Login.
+ */
+const filterPanelOAuthKeys = (env) => {
+  if (!env || typeof env !== 'object') return {};
+  const clean = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (isPanelOAuthKey(key)) continue;
+    clean[key] = value;
+  }
+  return clean;
 };
 
 /**
@@ -2931,11 +2991,11 @@ const handleApi = async (req, res, url) => {
     const bot = bots.get(id);
     if (!bot) throw httpError(404, 'Bot nicht gefunden');
 
-    if (!action && req.method === 'GET') permission('bots.read');
+    if (!action && req.method === 'GET') permission('bots.read', bot.id);
     if (!action && req.method === 'GET')
       return sendJson(res, 200, { bot: publicBot(bot) });
     if (!action && req.method === 'PATCH') {
-      permission('bots.manage');
+      permission('bots.manage', bot.id);
       const body = await readBody(req);
       const config = normaliseConfig(body, bot);
       if (!safeBotPath(bot, config.cwd))
@@ -2964,7 +3024,7 @@ const handleApi = async (req, res, url) => {
       return sendJson(res, 200, result);
     }
     if (!action && req.method === 'DELETE') {
-      permission('bots.delete');
+      permission('bots.delete', bot.id);
       // P1-J: Vor dem Warten auf den Lifecycle-Lock die laufende Installation
       // beenden und ihr Ende abfragen – sonst hängt DELETE hinter einer
       // npm/pip-Installation, die Minuten laufen kann. deletePending sperrt
@@ -2984,7 +3044,7 @@ const handleApi = async (req, res, url) => {
       }
     }
     if (action === 'start' && req.method === 'POST') {
-      permission('bots.control');
+      permission('bots.control', bot.id);
       const started = await withBotLifecycleLock(id, async () => {
         assertNotDeleting(bot);
         if (bots.get(id) !== bot) throw httpError(404, 'Bot nicht gefunden');
@@ -3013,7 +3073,7 @@ const handleApi = async (req, res, url) => {
     }
 
     if (action === 'install' && req.method === 'POST') {
-      permission('bots.manage');
+      permission('bots.manage', bot.id);
       // P1-J: Ein vorbereiteter oder laufender Delete blockiert neue
       // Installationen schon vor der Antwort mit 202 – nicht erst in der
       // Lock-Übernahme, die der Anfragende nie zu sehen bekäme.
@@ -3051,7 +3111,7 @@ const handleApi = async (req, res, url) => {
       return sendJson(res, 202, { bot: publicBot(bot) });
     }
     if (action === 'stop' && req.method === 'POST') {
-      permission('bots.control');
+      permission('bots.control', bot.id);
       // P1-J: Stop wartet nicht das Ende einer Installation ab – der
       // Installationsprozess wird zuerst terminiert; der Lock wird dadurch
       // in Sekunden frei, und stopBot räumt ohnehin final auf.
@@ -3063,7 +3123,7 @@ const handleApi = async (req, res, url) => {
       return sendJson(res, 200, { bot: stopped });
     }
     if (action === 'kill' && req.method === 'POST') {
-      permission('bots.control');
+      permission('bots.control', bot.id);
       // P1-J: wie stop, nur sofort hart.
       if (bot.busy) killTree(bot.busy, 'SIGKILL');
       const stopped = await withBotLifecycleLock(id, async () => {
@@ -3073,7 +3133,7 @@ const handleApi = async (req, res, url) => {
       return sendJson(res, 200, { bot: stopped });
     }
     if (action === 'restart' && req.method === 'POST') {
-      permission('bots.restart');
+      permission('bots.restart', bot.id);
       const restarted = await withBotLifecycleLock(id, async () => {
         assertNotDeleting(bot);
         stopBot(id, { signal: 'SIGTERM' });
@@ -3116,7 +3176,7 @@ const handleApi = async (req, res, url) => {
       // alles Schreibende (Settings, Commands, State, Login/Logout) nicht.
       if (req.method !== 'GET') assertNotDeleting(bot);
       if (req.method === 'GET' && url.pathname.endsWith('/panel/open')) {
-        permission('panel.read');
+        permission('panel.read', bot.id);
         ensurePanel(bot);
         const manifest = bot.panel?.manifest;
         const requested = url.searchParams.get('page') ?? '';
@@ -3153,7 +3213,7 @@ const handleApi = async (req, res, url) => {
         return res.end();
       }
       if (isPanelDiscordAuthRoute) {
-        if (!panelTokenAuth) permission('panel.read');
+        if (!panelTokenAuth) permission('panel.read', bot.id);
         return handlePanelRoutes(bot, req, res, url);
       }
       if (isPanelStaticAsset) {
@@ -3181,6 +3241,7 @@ const handleApi = async (req, res, url) => {
         req.method === 'POST' && /\/panel\/discord\/logout$/.test(url.pathname);
       permission(
         req.method === 'GET' || panelLogout ? 'panel.read' : 'panel.manage',
+        bot.id,
       );
       return handlePanelRoutes(bot, req, res, url);
     }

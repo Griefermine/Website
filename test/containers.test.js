@@ -666,9 +666,14 @@ describe('Paket-Runner ohne Host-Angriffsfläche', () => {
     assert.match(body, /^GOCACHE=\/workspace\/\.cache\/go-build$/m);
     // Docker erzwingt noexec auf --tmpfs: go run braucht GOTMPDIR im Workspace.
     assert.match(body, /^GOTMPDIR=\/workspace\/\.cache\/tmp$/m);
-    assert.match(body, /^DOTNET_CLI_HOME=\/workspace\/\.cache\/dotnet-cli-home$/m);
+    assert.match(
+      body,
+      /^DOTNET_CLI_HOME=\/workspace\/\.cache\/dotnet-cli-home$/m,
+    );
     assert.match(body, /^XDG_DATA_HOME=\/workspace\/\.cache\/xdg-data$/m);
-    assert.ok(existsSync(join(root, "bots", "bot1", "workspace", ".cache", "tmp")));
+    assert.ok(
+      existsSync(join(root, 'bots', 'bot1', 'workspace', '.cache', 'tmp')),
+    );
     // Maven 3.9s Native-Transport ignoriert JVM-Proxy-Properties und
     // Umgebungsvariablen: einziger gültiger Kanal ist eine settings.xml,
     // die der Runner in den Workspace schreibt und via MAVEN_ARGS übergibt
@@ -678,14 +683,7 @@ describe('Paket-Runner ohne Host-Angriffsfläche', () => {
       /^MAVEN_ARGS=-s \/workspace\/\.bot-hub\/maven-settings\.xml$/m,
     );
     const settings = readFileSync(
-      join(
-        root,
-        'bots',
-        'bot1',
-        'workspace',
-        '.bot-hub',
-        'maven-settings.xml',
-      ),
+      join(root, 'bots', 'bot1', 'workspace', '.bot-hub', 'maven-settings.xml'),
       'utf8',
     );
     assert.match(settings, /<protocol>https<\/protocol>/);

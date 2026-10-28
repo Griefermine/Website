@@ -42,3 +42,9 @@ release/
 # Vault-Master-Key (niemals ins Repo)
 .secrets.key
 *.key
+
+# Maßnahme 41 (Audit SC-08/13): Bot-Startordner und -Workspaces sind
+# Laufzeitdaten – Bot-Namen, UUIDs und Inhalte haben in einem öffentlichen
+# Repo nichts verloren. Der Hub schreibt sie zur Laufzeit unter bots/.
+/bots/
+.devin/

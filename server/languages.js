@@ -76,8 +76,11 @@ export const LANGUAGES = [
     runtime: 'java',
     entrypoint: 'build/libs/bot.jar',
     command: 'java -jar {entrypoint}',
-    check:
-      'ls build/libs/*.jar target/*.jar out/production/libs/*.jar > /dev/null 2>&1',
+    // Kein Shell, keine Globs: `parseCommand` lehnt `>`, `|`, `2>` und Co.
+    // ab – der alte Multi-Pfad-Check scheiterte damit IMMER und erzwang
+    // jeden Start zu einem Vollbau. Geprüft wird genau die Datei, die der
+    // Preset-Startbefehl gleich laden will (Maßnahme 39).
+    check: 'ls build/libs/bot.jar',
     install: {
       // Entspricht `[ -x ./gradlew ] && ./gradlew build || mvn ... package`:
       // der Wrapper im Projekt hat Vorrang, sonst Maven.
@@ -98,8 +101,11 @@ export const LANGUAGES = [
     runtime: 'java',
     entrypoint: 'build/libs/bot.jar',
     command: 'java -jar {entrypoint}',
-    check:
-      'ls build/libs/*.jar target/*.jar out/production/libs/*.jar > /dev/null 2>&1',
+    // Kein Shell, keine Globs: `parseCommand` lehnt `>`, `|`, `2>` und Co.
+    // ab – der alte Multi-Pfad-Check scheiterte damit IMMER und erzwang
+    // jeden Start zu einem Vollbau. Geprüft wird genau die Datei, die der
+    // Preset-Startbefehl gleich laden will (Maßnahme 39).
+    check: 'ls build/libs/bot.jar',
     install: {
       // Entspricht `[ -x ./gradlew ] && ./gradlew build || mvn ... package`:
       // der Wrapper im Projekt hat Vorrang, sonst Maven.
@@ -123,7 +129,9 @@ export const LANGUAGES = [
     runtime: 'go',
     entrypoint: 'main.go',
     command: 'go run {entrypoint}',
-    check: 'go list -m all 2> /dev/null | grep -q {module}',
+    // `go list -m` blockierte der Eval-Flag-Wächter, die Pipeline ohnehin
+    // `parseCommand` – der Check war toter Code (Maßnahme 39).
+    check: 'grep -q {module} go.mod',
     install: {
       // Entspricht `if [ -f go.mod ]; then go get {module}; else
       // go mod init bot && go get {module}; fi`. Der else-Zweig ist eine
@@ -157,7 +165,10 @@ export const LANGUAGES = [
     runtime: 'dotnet',
     entrypoint: 'bin/Release/net8.0/Bot.dll',
     command: 'dotnet {entrypoint}',
-    check: 'grep -l {package} ./*.csproj > /dev/null 2>&1',
+    // Kein Shell: das `> /dev/null` machte den Check kaputt; die csproj muss
+    // wie im Preset-Standard `Bot.csproj` heißen, sonst greift der
+    // Wiederinstall automatisch (Maßnahme 39).
+    check: 'grep -q {package} Bot.csproj',
     install: 'dotnet add package {package}',
     frameworks: [
       framework('Discord.Net', 'DNetCore', 'Discord.Net'),
@@ -171,7 +182,10 @@ export const LANGUAGES = [
     runtime: 'cargo',
     entrypoint: 'target/release/bot',
     command: './target/release/bot',
-    check: 'grep -qi {package} Cargo.toml 2> /dev/null',
+    // `2>` kannte `parseCommand` nicht – ohne Umleitung meldet grep bei
+    // fehlender Cargo.toml einfach Exit 2: Einbau nötig, exakt richtig
+    // (Maßnahme 39).
+    check: 'grep -qi {package} Cargo.toml',
     install: {
       // Entspricht `if [ -f Cargo.toml ]; then cargo add {package}; else
       // cargo init --name bot && cargo add {package}; fi`.

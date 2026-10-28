@@ -327,34 +327,44 @@ describe('Der verwaltete MySQL-Container in echt', () => {
     },
   );
 
-  it('veröffentlicht keine Häfen und ist nur im internen Netz erreichbar', { skip }, async () => {
-    // Interne Netze veröffentlichen nicht – statt eines Loopback-Hörers gilt:
-    // gar kein Hafen (Dock-eigene Aussage) und echter Kontakt nur über die
-    // feste Netzadresse.
-    const port = await docker(['port', config.containerName], { capture: true });
-    assert.equal(port.stdout.trim(), '', 'der Container veröffentlicht Häfen');
-    const bind = await docker(
-      [
-        'inspect',
-        '-f',
-        '{{json .HostConfig.PortBindings}}',
-        config.containerName,
-      ],
-      { capture: true },
-    );
-    assert.equal(bind.stdout.trim(), '{}', 'es sind Bindungen hinterlegt');
-    // Echte Erreichbarkeit: nur über die feste Netzadresse.
-    const client = await import('mysql2/promise');
-    const c = await client.createConnection({
-      host: config.host,
-      port: config.connectPort,
-      user: config.user,
-      password: appPassword,
-      database: config.database,
-      connectTimeout: 5000,
-    });
-    await c.end();
-  });
+  it(
+    'veröffentlicht keine Häfen und ist nur im internen Netz erreichbar',
+    { skip },
+    async () => {
+      // Interne Netze veröffentlichen nicht – statt eines Loopback-Hörers gilt:
+      // gar kein Hafen (Dock-eigene Aussage) und echter Kontakt nur über die
+      // feste Netzadresse.
+      const port = await docker(['port', config.containerName], {
+        capture: true,
+      });
+      assert.equal(
+        port.stdout.trim(),
+        '',
+        'der Container veröffentlicht Häfen',
+      );
+      const bind = await docker(
+        [
+          'inspect',
+          '-f',
+          '{{json .HostConfig.PortBindings}}',
+          config.containerName,
+        ],
+        { capture: true },
+      );
+      assert.equal(bind.stdout.trim(), '{}', 'es sind Bindungen hinterlegt');
+      // Echte Erreichbarkeit: nur über die feste Netzadresse.
+      const client = await import('mysql2/promise');
+      const c = await client.createConnection({
+        host: config.host,
+        port: config.connectPort,
+        user: config.user,
+        password: appPassword,
+        database: config.database,
+        connectTimeout: 5000,
+      });
+      await c.end();
+    },
+  );
 
   it(
     'ist für einen Bot-Container auf der Default-Bridge nicht erreichbar',
@@ -799,26 +809,37 @@ describe('Die Verwaltungsoberfläche in echt', () => {
     assert.equal(mounts.stdout.trim(), '', `es gibt Mounts: ${mounts.stdout}`);
   });
 
-  it('veröffentlicht keine Häfen und liegt nur im internen Netz', { skip }, async () => {
-    const bind = await docker(['port', box()], { capture: true });
-    assert.equal(bind.stdout.trim(), '', 'die Oberfläche veröffentlicht Häfen');
-    const bindingen = await docker(
-      [
-        'inspect',
-        '-f',
-        '{{json .HostConfig.PortBindings}}',
-        box(),
-      ],
-      { capture: true },
-    );
-    assert.equal(bindingen.stdout.trim(), '{}', 'es sind Bindungen hinterlegt');
-    assert.ok(
-      !/0\.0\.0\.0/.test(bindingen.stdout + bind.stdout),
-      '0.0.0.0 gehört hier in kein Feld',
-    );
-    const antwort = await seite('/index.php');
-    assert.equal(antwort.status, 200, 'im Netz muss die Seite erreichbar sein');
-  });
+  it(
+    'veröffentlicht keine Häfen und liegt nur im internen Netz',
+    { skip },
+    async () => {
+      const bind = await docker(['port', box()], { capture: true });
+      assert.equal(
+        bind.stdout.trim(),
+        '',
+        'die Oberfläche veröffentlicht Häfen',
+      );
+      const bindingen = await docker(
+        ['inspect', '-f', '{{json .HostConfig.PortBindings}}', box()],
+        { capture: true },
+      );
+      assert.equal(
+        bindingen.stdout.trim(),
+        '{}',
+        'es sind Bindungen hinterlegt',
+      );
+      assert.ok(
+        !/0\.0\.0\.0/.test(bindingen.stdout + bind.stdout),
+        '0.0.0.0 gehört hier in kein Feld',
+      );
+      const antwort = await seite('/index.php');
+      assert.equal(
+        antwort.status,
+        200,
+        'im Netz muss die Seite erreichbar sein',
+      );
+    },
+  );
 
   it('kommt von einem Bot-Container nicht heran', { skip }, async () => {
     // Ein Bot auf der Default-Bridge erreicht weder die Datenbank noch die

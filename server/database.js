@@ -575,7 +575,11 @@ export const resolveDatabaseConfig = ({
   // Der Punkt der ganzen Sache: der Bot-Speicher bleibt auf diesem Rechner.
   // Beim verwalteten Container ist „lokal" die feste Adresse im internen
   // Docker-Netz – dahin führt von außen und aus Bot-Netzen keine Route.
-  if (!socket && !(managedTarget && host === managedTarget.host) && !LOOPBACK.has(host))
+  if (
+    !socket &&
+    !(managedTarget && host === managedTarget.host) &&
+    !LOOPBACK.has(host)
+  )
     throw new Error(
       `BOT_HUB_DB_HOST="${host}" ist nicht lokal. Der Bot-Speicher darf nur auf Loopback (127.0.0.1, ::1, localhost), über BOT_HUB_DB_SOCKET oder beim verwalteten Container über dessen internes Netz laufen – von außen dürfte sonst ein fremder Rechner auf die Bot-Daten zugreifen.`,
     );

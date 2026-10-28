@@ -94,6 +94,24 @@ export const isReservedEnvKey = (key) => {
   );
 };
 
+/**
+ * Die Schlüssel, die den Panel-Discord-Login eines Bots KONFIGURIEREN
+ * (App-ID, Secret, OAuth-URL, Redirect). Sie gehören ausschließlich in die
+ * von Hand gepflegte `data/secrets/<id>.env`. Von Bot-Seite (env/secretEnv im
+ * API-Body) dürfen sie niemals gesetzt werden – sonst biegt ein Angreifer den
+ * Panel-Login auf seine eigene OAuth-App und liest die Identitäten seiner
+ * Opfer (Audit SEC-03, Maßnahme 37). DISCORD_BOT_TOKEN ist bewusst NICHT
+ * dabei: er ist der legitime Kanal für das Bot-Token selbst.
+ */
+export const isPanelOAuthKey = (key) =>
+  [
+    'DISCORD_CLIENT_ID',
+    'DISCORD_CLIENT_SECRET',
+    'DISCORD_CLIENT_TOKEN',
+    'DISCORD_OAUTH_URL',
+    'DISCORD_REDIRECT_URI',
+  ].includes(dotenvKey(key));
+
 export const dotenvValue = (value) =>
   `"${String(value ?? '')
     .replace(/\\/g, '\\\\')

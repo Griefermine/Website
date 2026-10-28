@@ -204,9 +204,10 @@ const intToIp = (value) =>
 /** Zerlegt eine private IPv4-CIDR (Maske /16–/28) in Basis und Präfix. */
 const parseCidr = (text) => {
   const match = String(text).match(/^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/);
-  if (!match) throw new Error(
-    `BOT_HUB_MYSQL_NETWORK_CIDR "${text}" ist keine IPv4-CIDR (z. B. 172.30.252.0/24).`,
-  );
+  if (!match)
+    throw new Error(
+      `BOT_HUB_MYSQL_NETWORK_CIDR "${text}" ist keine IPv4-CIDR (z. B. 172.30.252.0/24).`,
+    );
   const mask = Number(match[2]);
   const parts = match[1].split('.').map(Number);
   if (mask < 16 || mask > 28 || parts.some((part) => part > 255))
@@ -228,7 +229,9 @@ const parseCidr = (text) => {
 
 const isPrivateIp = (text) => {
   const [a, b] = text.split('.').map(Number);
-  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+  return (
+    a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
+  );
 };
 
 /**
@@ -298,7 +301,12 @@ export const managedConfig = ({ env = process.env, projectRoot } = {}) => {
     }),
     // Gleiche Adresslogik wie bei MySQL (n + 1 = Gateway, n + 2 = Datenbank,
     // n + 3 = Oberfläche) – erreichbar auch ohne funktionierendes NAT.
-    containerAddress: intToIp(parseCidr(String(env.BOT_HUB_MYSQL_NETWORK_CIDR ?? '').trim() || DEFAULT_MYSQL_CIDR).base + 3),
+    containerAddress: intToIp(
+      parseCidr(
+        String(env.BOT_HUB_MYSQL_NETWORK_CIDR ?? '').trim() ||
+          DEFAULT_MYSQL_CIDR,
+      ).base + 3,
+    ),
   };
 
   const net = parseCidr(
@@ -420,9 +428,7 @@ export const containerCreateArgs = (
   // Feste Adresse im internen Netz – der Hub verbindet sich direkt dorthin
   // und hängt nicht an Docker-NAT-Regeln, die in gehärteten oder
   // verschachtelten Umgebungen fehlen können.
-  ...(config.containerAddress
-    ? ['--ip', config.containerAddress]
-    : []),
+  ...(config.containerAddress ? ['--ip', config.containerAddress] : []),
   // Kein --publish: Auf internen Netzen verhindert Docker die
   // Hafen-Weiterleitung ohnehin – und die Zusage „nur der Hub-Host kommt
   // hinein" gilt hier über das Netz selbst, nicht über eine Schleife.
@@ -1210,7 +1216,8 @@ export const createProvisioner = (deps = {}) => {
         throw new Error(
           `MySQL-Container ${config.containerName} existiert bereits, aber sein Admin-Passwort ist nicht mehr greifbar (data/secrets/mysql-init.env fehlt). Ohne root-Zugang kann die Einrichtung nicht fortgesetzt werden. Mit BOT_HUB_MYSQL_RESET=1 werden Container, Netz und ${config.dataDir} verworfen und alles neu angelegt; dabei gehen alle Bot-Daten verloren.`,
         );
-      adminPassword = retained ?? generatePassword(PASSWORD_LENGTH, randomBytes);
+      adminPassword =
+        retained ?? generatePassword(PASSWORD_LENGTH, randomBytes);
       appPassword = generatePassword(PASSWORD_LENGTH, randomBytes);
       if (wantsPhpmyadmin)
         adminDbPassword = generatePassword(PASSWORD_LENGTH, randomBytes);

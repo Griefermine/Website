@@ -6,7 +6,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Audit SC-03: der Entwicklungszweig ist `pr/bot-hub-scaffold`, nicht
+    # `main` – mit nur [main] lief die Gate-Pipeline bei keinem einzigen
+    # Push mit. Jetzt: main und alle feature-/PR-Zweige.
+    branches: [main, 'pr/**']
   pull_request:
   # Der Historien-Scan ist keine Pfortenprüfung für einen einzelnen Commit: was
   # einmal in der Historie liegt, ist durch einen grünen Push nicht erledigt.
@@ -76,9 +79,13 @@ jobs:
         run: npm run build
 
       # Produktionsabhängigkeiten sind die, die im Betrieb laufen. Ein Fund hier
-      # blockiert.
+      # blockiert. `pipefail` (Maßnahme 41, Audit SC-02): ohne es wäre der
+      # Exit-Code von `npm audit` vom `tee` überdeckt – das Gate meldet grün,
+      # egal wie viele Funde es gibt.
       - name: Schwachstellen (Produktion)
-        run: npm audit --omit=dev --audit-level=high | tee audit-produktion.txt
+        run: |
+          set -o pipefail
+          npm audit --omit=dev --audit-level=high | tee audit-produktion.txt
 
       # Nur informativ: Entwicklungsabhängigkeiten erreichen keine Installation.
       - name: Schwachstellen (Entwicklung, informatierend)

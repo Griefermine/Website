@@ -38,16 +38,16 @@ docker exec -d bot-hub-vm bash -c \
 
 ## Alles Wichtige auf einen Blick
 
-| Was | Befehl / Adresse |
-|---|---|
-| Deploy-Fortschritt | `docker exec bot-hub-vm tail -f /var/log/deploy-run9.log` |
-| **Bot-Hub im Browser** | **https://localhost:8443** (Self-Signed → Zertifikatswarnung mit „Fortgeschritten → fortfahren" bestätigen) |
-| HTTP-Variante (nur Redirect) | http://localhost:8080 |
-| SSH in die VM | `ssh root@localhost -p 2222` (Passwort: `vmdemo`) |
-| Hub-Status (in der VM) | `systemctl status bot-hub` |
-| Hub-Logs (in der VM) | `journalctl -u bot-hub -f` |
-| VM stoppen / starten | `docker stop bot-hub-vm` / `docker start bot-hub-vm` |
-| VM löschen | `docker rm -f bot-hub-vm` |
+| Was                          | Befehl / Adresse                                                                                                                                                |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Deploy-Fortschritt           | `docker exec bot-hub-vm tail -f /var/log/deploy-run9.log`                                                                                                       |
+| **Bot-Hub im Browser**       | **https://localhost:8443** (Self-Signed → Zertifikatswarnung mit „Fortgeschritten → fortfahren" bestätigen)                                                     |
+| HTTP-Variante (nur Redirect) | http://localhost:8080                                                                                                                                           |
+| SSH in die VM                | `ssh root@localhost -p 2222` (Passwort im persönlichen Vault; stand bis Maßnahme 41 in dieser Zeile und wurde aus dem Repo entfernt — Rotation nicht vergessen) |
+| Hub-Status (in der VM)       | `systemctl status bot-hub`                                                                                                                                      |
+| Hub-Logs (in der VM)         | `journalctl -u bot-hub -f`                                                                                                                                      |
+| VM stoppen / starten         | `docker stop bot-hub-vm` / `docker start bot-hub-vm`                                                                                                            |
+| VM löschen                   | `docker rm -f bot-hub-vm`                                                                                                                                       |
 
 ## Bekannte Grenzen der Simulation
 
@@ -63,7 +63,7 @@ docker exec -d bot-hub-vm bash -c \
 - **Kein 24/7:** Der Hub schläft, wenn der Laptop schläft. Für
   Dauerbetrieb bleibt ein VPS (z. B. Hetzner ~4 €/Monat) oder ein
   Heimserver die richtige Wahl.
-- **Docker-in-Docker:** Die Bot-Container laufen in der *internen*
+- **Docker-in-Docker:** Die Bot-Container laufen in der _internen_
   Docker-Instanz der VM, sauber getrennt vom Laptop-Docker. Nach einem
   `docker start bot-hub-vm` zuerst `systemctl start docker` in der VM
   (apt/policy-rc.d verhindert den Autostart im Container).
@@ -96,7 +96,7 @@ docker exec -d bot-hub-vm bash -c \
    erkannten Admin-Gegenstelle → Setup brach mit „weitere eingehende
    Freigaben" ab. Fix: Step 9 verifiziert nur noch und ergänzt die
    audit-festen Ports 80/443; die UFW-Hoheit liegt beim Egress-Setup.
-9. **Audit-Logik in `check-host-firewall.py`**: eine *leere*
+9. **Audit-Logik in `check-host-firewall.py`**: eine _leere_
    `ssh-management.allow` (Konsolen-Installation ohne SSH-Sitzung) ließ den
    Audit bei jedem Re-Run scheitern (`exists() and expected is None`).
    Fix: nur eine Datei mit unlesbarem Inhalt blockiert jetzt; leer bedeutet
@@ -111,7 +111,7 @@ docker exec -d bot-hub-vm bash -c \
     sortieren; Regel-Reihenfolge bleibt geprüft) + Kettenname je Familie.
 11. **`bot-hub`-User ohne Docker-Gruppenmitgliedschaft**: Der Dienst
     validiert in Produktion die Egress-Netzwerke per `docker network
-    inspect` – ohne Gruppenrecht bringt er „Docker-Netz bot-hub-discord
+inspect` – ohne Gruppenrecht bringt er „Docker-Netz bot-hub-discord
     fehlt" (obwohl das Netz existierte). Fix: `usermod -aG docker bot-hub`
     in `deploy-full.sh`.
 12. **Setup ohne `--hub-user` aufgerufen**: die sudoers-Regel für den
@@ -142,103 +142,103 @@ docker exec -d bot-hub-vm bash -c \
     `crossorigin`-Stylesheets senden `Origin`) mit 403 → Seite unstyled,
     „Verbinden …" eingefroren. curl zeigt das nie (sendet kein Origin).
     Fix: `$http_host` in `deploy-full.sh` und `setup-local-tls.sh`.
- 18. **Bot-Keep-alive hieß `tail tail -f /dev/null`**: in
-     `containerCreateArgs` stand nach `--entrypoint tail` zusätzlich noch
-     `tail` als erstes Argument → jeder Bot-Container meldete
-     `tail: cannot open 'tail'` im Log. Fix: überflüssiges `tail`-Argument
-     entfernt (`server/containers.js`).
- 19. **Sessions nur im RAM**: jeder Hub-Neustart loggte alle Benutzer aus
-     (401 auf `/api/events` direkt nach Restart). Fix: Persistenz in
-     `data/sessions.json` (0600, tmp+fsync+rename wie `access.json`),
-     `configureSessionStore()` in `manager.js`; verdrahtet bei Login,
-     Logout, Ablauf und Cleanup.
- 20. **Falscher HINWEIS im Produktionsmodus**: `index.js` warnte vor dem
-     fehlenden `BOT_HUB_CONTAINER_URL`, obwohl Produktions-Bots automatisch
-     die private Hub-API (`172.30.250.1:8788`) bekommen – und der empfohlene
-     Wert hätte den Hub-Start sogar abbrechen lassen
-     (`validateProductionBotNetwork` sperrt die Variable). Fix: Warnung
-     nur noch außerhalb von `NODE_ENV=production`.
- 21. **Bot-Vorlage ignorierte `HTTPS_PROXY`**: der Hub spritzt dem
-     Bot-Container `HTTPS_PROXY`/`BOT_HUB_DISCORD_PROXY` (Squid) und
-     `NO_PROXY` (Hub-Gateway) ein, aber das python-echo-Template baute
-     `commands.Bot(...)` ohne Proxy → Direktversuch, DNS gibt es im
-     isolierten Bot-Netz bewusst nicht →
-     `ClientConnectorDNSError: discord.com`. Fix: Template liest
-     `HTTPS_PROXY` und übergibt es als `proxy=` an discord.py.
-     Daneben: `hub_link: callback fehlgeschlagen (400)` war korrektes
-     SSRF-Verhalten – im Container-Betrieb erlaubt der Hub nur extern
-     freigegebene HTTPS-Ziele (`--callback-host` beim UFW-Setup, keine
-     IPs/Loopback/privat). Das Template registriert den Loopback-Callback
-     jetzt nur noch außerhalb des Container-Betriebs.
- 22. **Panel-Brücke „Failed to fetch" (Preflight)**: Der ausgelieferte
-     Bridge-Code (`BRIDGE_SOURCE` in `panel.js`) sendete
-     `credentials: 'include'`; die Panel-Route antwortet wegen
-     Null-Origin-Sandbox aber bewusst ohne `access-control-allow-credentials`
-     (Header-Token-Auth, keine Cookies – siehe `applyCors`). Brave blockte
-     daher jede Panel-API-Last. Fix: `credentials: 'omit'` in der Bridge.
-     Achtung bei Änderungen an `BRIDGE_SOURCE`: Es ist ein Template-Literal –
-     Backticks im Text zerstücken den String (erst `node --check`!).
- 23. **Secrets nur noch verschlüsselt at-rest (Vault-Maßnahme)**:
-     `data/secrets/*.env` (Bot-Discord-Tokens, DB-Passwörter) lagen im
-     Klartext auf der Platte; das OAuth-Client-Secret stand in der `.env`,
-     wovor der Hub beim Start selbst warnt. Neu: `server/vault.js`
-     (AES-256-GCM-Umschläge `vault:v1:<iv>:<tag>:<ct>`, AAD = Schlüssel-
-     name → kein Umschichten zwischen Einträgen; GCM-Tag → Manipulation
-     wirft laut statt leer zu sein). `secrets.js` versiegelt beim Schreiben
-     und entschlüsselt beim Lesen transparent – alle Aufrufer sehen wie
-     bisher Klartext, alter Klartext bleibt lesbar. `bootstrapSecretVault`
-     (Aufruf in `manager.js`) versiegelt beim Start alle Klartext-Reste und
-     zieht `DISCORD_CLIENT_*` aus der Umgebung in den verschlüsselten
-     `data/secrets/hub.env` um (Vault-Wert gewinnt gegen die Umgebung,
-     `_FILE`-Indirektion in `auth.js` gewinnt gegen beides und verhindert
-     Duplikate). Master-Key AUSSERHALB von `data/`: Produktion
-     `BOT_HUB_KEY_FILE=/etc/bot-hub/master.key` (root:bot-hub 0640,
-     deploy-full.sh erzeugt ihn), Entwicklung fällt auf
-     `<projectRoot>/.secrets.key` zurück – existiert kein Key, bleibt das
-     alte Klartext-Verhalten (Tests, Entwickler). Der Bot-Container sieht
-     weiterhin nur seine gespritzten Umgebungsvariablen (Angriffskette
-     „kompromittierter Bot liest data/" bleibt wirkungslos); ehrliche
-     Grenze: Der Bot-Prozess muss sein eigenes Token nutzen können, und
-     wer Hub-Prozess + Key-Datei komplett lesen kann, kommt weiter (dagegen
-     hilft nur Festplattenverschlüsselung). Tests: `secrets-vault.test.js`.
+18. **Bot-Keep-alive hieß `tail tail -f /dev/null`**: in
+    `containerCreateArgs` stand nach `--entrypoint tail` zusätzlich noch
+    `tail` als erstes Argument → jeder Bot-Container meldete
+    `tail: cannot open 'tail'` im Log. Fix: überflüssiges `tail`-Argument
+    entfernt (`server/containers.js`).
+19. **Sessions nur im RAM**: jeder Hub-Neustart loggte alle Benutzer aus
+    (401 auf `/api/events` direkt nach Restart). Fix: Persistenz in
+    `data/sessions.json` (0600, tmp+fsync+rename wie `access.json`),
+    `configureSessionStore()` in `manager.js`; verdrahtet bei Login,
+    Logout, Ablauf und Cleanup.
+20. **Falscher HINWEIS im Produktionsmodus**: `index.js` warnte vor dem
+    fehlenden `BOT_HUB_CONTAINER_URL`, obwohl Produktions-Bots automatisch
+    die private Hub-API (`172.30.250.1:8788`) bekommen – und der empfohlene
+    Wert hätte den Hub-Start sogar abbrechen lassen
+    (`validateProductionBotNetwork` sperrt die Variable). Fix: Warnung
+    nur noch außerhalb von `NODE_ENV=production`.
+21. **Bot-Vorlage ignorierte `HTTPS_PROXY`**: der Hub spritzt dem
+    Bot-Container `HTTPS_PROXY`/`BOT_HUB_DISCORD_PROXY` (Squid) und
+    `NO_PROXY` (Hub-Gateway) ein, aber das python-echo-Template baute
+    `commands.Bot(...)` ohne Proxy → Direktversuch, DNS gibt es im
+    isolierten Bot-Netz bewusst nicht →
+    `ClientConnectorDNSError: discord.com`. Fix: Template liest
+    `HTTPS_PROXY` und übergibt es als `proxy=` an discord.py.
+    Daneben: `hub_link: callback fehlgeschlagen (400)` war korrektes
+    SSRF-Verhalten – im Container-Betrieb erlaubt der Hub nur extern
+    freigegebene HTTPS-Ziele (`--callback-host` beim UFW-Setup, keine
+    IPs/Loopback/privat). Das Template registriert den Loopback-Callback
+    jetzt nur noch außerhalb des Container-Betriebs.
+22. **Panel-Brücke „Failed to fetch" (Preflight)**: Der ausgelieferte
+    Bridge-Code (`BRIDGE_SOURCE` in `panel.js`) sendete
+    `credentials: 'include'`; die Panel-Route antwortet wegen
+    Null-Origin-Sandbox aber bewusst ohne `access-control-allow-credentials`
+    (Header-Token-Auth, keine Cookies – siehe `applyCors`). Brave blockte
+    daher jede Panel-API-Last. Fix: `credentials: 'omit'` in der Bridge.
+    Achtung bei Änderungen an `BRIDGE_SOURCE`: Es ist ein Template-Literal –
+    Backticks im Text zerstücken den String (erst `node --check`!).
+23. **Secrets nur noch verschlüsselt at-rest (Vault-Maßnahme)**:
+    `data/secrets/*.env` (Bot-Discord-Tokens, DB-Passwörter) lagen im
+    Klartext auf der Platte; das OAuth-Client-Secret stand in der `.env`,
+    wovor der Hub beim Start selbst warnt. Neu: `server/vault.js`
+    (AES-256-GCM-Umschläge `vault:v1:<iv>:<tag>:<ct>`, AAD = Schlüssel-
+    name → kein Umschichten zwischen Einträgen; GCM-Tag → Manipulation
+    wirft laut statt leer zu sein). `secrets.js` versiegelt beim Schreiben
+    und entschlüsselt beim Lesen transparent – alle Aufrufer sehen wie
+    bisher Klartext, alter Klartext bleibt lesbar. `bootstrapSecretVault`
+    (Aufruf in `manager.js`) versiegelt beim Start alle Klartext-Reste und
+    zieht `DISCORD_CLIENT_*` aus der Umgebung in den verschlüsselten
+    `data/secrets/hub.env` um (Vault-Wert gewinnt gegen die Umgebung,
+    `_FILE`-Indirektion in `auth.js` gewinnt gegen beides und verhindert
+    Duplikate). Master-Key AUSSERHALB von `data/`: Produktion
+    `BOT_HUB_KEY_FILE=/etc/bot-hub/master.key` (root:bot-hub 0640,
+    deploy-full.sh erzeugt ihn), Entwicklung fällt auf
+    `<projectRoot>/.secrets.key` zurück – existiert kein Key, bleibt das
+    alte Klartext-Verhalten (Tests, Entwickler). Der Bot-Container sieht
+    weiterhin nur seine gespritzten Umgebungsvariablen (Angriffskette
+    „kompromittierter Bot liest data/" bleibt wirkungslos); ehrliche
+    Grenze: Der Bot-Prozess muss sein eigenes Token nutzen können, und
+    wer Hub-Prozess + Key-Datei komplett lesen kann, kommt weiter (dagegen
+    hilft nur Festplattenverschlüsselung). Tests: `secrets-vault.test.js`.
 
- 24. **Vault v2 + Session-Vault nach Red-Team-Runde**: Die Durchspiele-Runde
-     fand zwei echte Schwachstellen (beide empirisch demonstriert, dann
-     behoben): (a) v1-Umschläge banden als AAD nur den Schlüsselnamen – ein
-     Umschlag aus `botA.env` ließ sich nach `botB.env` kopieren und entschlüsselte
-     dort. v2 bindet Dateiname UND Schlüsselname (`vault:v2:`, AAD
-     `id\u0000key`); v1 bleibt lesbar, `bootstrapSecretVault` hebt alle
-     v1-Dateien beim Start auf v2. (b) `data/sessions.json` lag als Klartext
-     in `data/` – eine Datenordner-Kopie war ein Login-Vorrat. Jetzt schreibt
-     `auth.js` die Datei als einzelnen Vault-Umschlag (Altbestand wird beim
-     ersten Load hochgezogen). Drittens dokumentiert: Das Simulations-VM
-     nutzt Laptop-Swap (dm-2 + zram) – Seiten des Hub-Prozesses (Key-Material!)
-     können unverschlüsselt den Datenträger erreichen; auf echtem VPS Swap
-     deaktivieren oder verschlüsseln, Laptop: Full-DiskEncryption.
-     Firewall-Prüfsummen: Key 0640 root:bot-hub, Gruppe leer; bot-hub darf
-     Key weder überschreiben noch löschen noch den Ordner anzapfen
-     (root:root 0755); www-data liest weder Key noch `.env` noch sessions
-     noch Secrets; Bot-Container hat keine Host-Mounts, kein docker.sock,
-     kein `/opt/bot-hub`; HTTP-Traversierung auf `master.key`/`.env` bleibt
-     400/404/SPA-Fallback ohne Inhalt; Lateral-Tests mit echtem
-     BOT_HUB_TOKEN: eigene Routes 200, fremde Bot-Ids 401, Rate-Feedback
-     einheitlich 401.
+24. **Vault v2 + Session-Vault nach Red-Team-Runde**: Die Durchspiele-Runde
+    fand zwei echte Schwachstellen (beide empirisch demonstriert, dann
+    behoben): (a) v1-Umschläge banden als AAD nur den Schlüsselnamen – ein
+    Umschlag aus `botA.env` ließ sich nach `botB.env` kopieren und entschlüsselte
+    dort. v2 bindet Dateiname UND Schlüsselname (`vault:v2:`, AAD
+    `id\u0000key`); v1 bleibt lesbar, `bootstrapSecretVault` hebt alle
+    v1-Dateien beim Start auf v2. (b) `data/sessions.json` lag als Klartext
+    in `data/` – eine Datenordner-Kopie war ein Login-Vorrat. Jetzt schreibt
+    `auth.js` die Datei als einzelnen Vault-Umschlag (Altbestand wird beim
+    ersten Load hochgezogen). Drittens dokumentiert: Das Simulations-VM
+    nutzt Laptop-Swap (dm-2 + zram) – Seiten des Hub-Prozesses (Key-Material!)
+    können unverschlüsselt den Datenträger erreichen; auf echtem VPS Swap
+    deaktivieren oder verschlüsseln, Laptop: Full-DiskEncryption.
+    Firewall-Prüfsummen: Key 0640 root:bot-hub, Gruppe leer; bot-hub darf
+    Key weder überschreiben noch löschen noch den Ordner anzapfen
+    (root:root 0755); www-data liest weder Key noch `.env` noch sessions
+    noch Secrets; Bot-Container hat keine Host-Mounts, kein docker.sock,
+    kein `/opt/bot-hub`; HTTP-Traversierung auf `master.key`/`.env` bleibt
+    400/404/SPA-Fallback ohne Inhalt; Lateral-Tests mit echtem
+    BOT_HUB_TOKEN: eigene Routes 200, fremde Bot-Ids 401, Rate-Feedback
+    einheitlich 401.
 
- 25. **MySQL-Anbindung hing sich in NAT-losen Umgebungen fest**: der
-     Provisionierer verband sich auf `127.0.0.1:<publizierter Port>` – in der
-     Simulations-VM setzt Docker die Port-NAT-Regeln aber nicht (DOCKER-Kette
-     der nat-Tabelle leer), der Hub lief 180 s in `waitForAdmin` und der
-     Dashboard-Port blieb 502. Fix: festes internes Netz
-     (`BOT_HUB_MYSQL_NETWORK_CIDR`, Standard 172.30.252.0/24; n+1 Gateway,
-     n+2 MySQL, n+3 phpMyAdmin) – Hub und Tests verbinden die statischen
-     Container-Adressen. (Die Loopback-Publikation fiel später als leere
-     Zusage ganz weg – Maßnahme 26.) Zweiter Fund aus demselben Durchlauf:
-     ein Abbruch nach `docker create` hinterließ einen Container mit
-     Init-Passwort, das der Neustart überschrieb → nie wieder reinkommen
-     ohne Reset. Jetzt wird eine vorhandene `mysql-init.env` wiederverwendet,
-     und ohne sie nennt der Hub den Grund samt `BOT_HUB_MYSQL_RESET=1` statt
-     zu hungern. phpMyAdmin-Tests verbinden jetzt ebenfalls über das Netz
-     (`mysql-container.test.js`).
+25. **MySQL-Anbindung hing sich in NAT-losen Umgebungen fest**: der
+    Provisionierer verband sich auf `127.0.0.1:<publizierter Port>` – in der
+    Simulations-VM setzt Docker die Port-NAT-Regeln aber nicht (DOCKER-Kette
+    der nat-Tabelle leer), der Hub lief 180 s in `waitForAdmin` und der
+    Dashboard-Port blieb 502. Fix: festes internes Netz
+    (`BOT_HUB_MYSQL_NETWORK_CIDR`, Standard 172.30.252.0/24; n+1 Gateway,
+    n+2 MySQL, n+3 phpMyAdmin) – Hub und Tests verbinden die statischen
+    Container-Adressen. (Die Loopback-Publikation fiel später als leere
+    Zusage ganz weg – Maßnahme 26.) Zweiter Fund aus demselben Durchlauf:
+    ein Abbruch nach `docker create` hinterließ einen Container mit
+    Init-Passwort, das der Neustart überschrieb → nie wieder reinkommen
+    ohne Reset. Jetzt wird eine vorhandene `mysql-init.env` wiederverwendet,
+    und ohne sie nennt der Hub den Grund samt `BOT_HUB_MYSQL_RESET=1` statt
+    zu hungern. phpMyAdmin-Tests verbinden jetzt ebenfalls über das Netz
+    (`mysql-container.test.js`).
 
 **MySQL/phpMyAdmin in der Simulations-VM (Betriebsnotiz).** Die Anbindung
 läuft über das feste interne Netz `172.30.252.0/24`: `.2` = MySQL, `.3` =
@@ -260,138 +260,246 @@ Zeile **sofort wieder entfernen** (sondern löscht jeder Neustart alle
 Bot-Speicher-Daten). Seit Maßnahme 25 läuft die Provisionierung auch unter
 einem Root-Hub (Container dann als Image-Benutzer 999 statt Demotion).
 
- 26. **phpMyAdmin/MySQL „nur Loopback“ war auf `--internal`-Netzen eine leere
-     Zusage**: Die Container hingen am internen Netz UND sollten auf
-     `127.0.0.1:<Hafen>` veröffentlichen. Docker richtet auf internen Netzen
-     aber grundsätzlich keine Hafen-Weiterleitung ein – `docker port` bleibt
-     leer, es horcht nichts. Der Hub-Log („http://127.0.0.1:8081“) und ein
-     Integrations-Test, der genau diesen Loopback-Hörer verlangte, liefen damit
-     ins Leere; in der NAT-losen Simulations-VM fiel es als
-     `die Bindung ist nicht die erwartete (ist: "")` auf, ist aber kein VM-Artefakt,
-     sondern Docker-Verhalten auf jedem Host. Fix: `--publish` für MySQL und
-     phpMyAdmin entfernt (die Zusage trägt jetzt das interne Netz selbst, nicht
-     eine Schleife), Hinweis/Log nennen die feste Netzadresse n+3, und die Tests
-     prüfen jetzt die belastbare Aussage: gar kein Hafen (`docker port` und
-     `HostConfig.PortBindings` leer) plus echter Kontakt nur über die
-     feste Adresse. Der SSH-Tunnel-Weg bleibt, zielt aber jetzt auf die
-     Netzadresse (`ssh -L 8081:<addr>:80 user@server`).
+26. **phpMyAdmin/MySQL „nur Loopback“ war auf `--internal`-Netzen eine leere
+    Zusage**: Die Container hingen am internen Netz UND sollten auf
+    `127.0.0.1:<Hafen>` veröffentlichen. Docker richtet auf internen Netzen
+    aber grundsätzlich keine Hafen-Weiterleitung ein – `docker port` bleibt
+    leer, es horcht nichts. Der Hub-Log („http://127.0.0.1:8081“) und ein
+    Integrations-Test, der genau diesen Loopback-Hörer verlangte, liefen damit
+    ins Leere; in der NAT-losen Simulations-VM fiel es als
+    `die Bindung ist nicht die erwartete (ist: "")` auf, ist aber kein VM-Artefakt,
+    sondern Docker-Verhalten auf jedem Host. Fix: `--publish` für MySQL und
+    phpMyAdmin entfernt (die Zusage trägt jetzt das interne Netz selbst, nicht
+    eine Schleife), Hinweis/Log nennen die feste Netzadresse n+3, und die Tests
+    prüfen jetzt die belastbare Aussage: gar kein Hafen (`docker port` und
+    `HostConfig.PortBindings` leer) plus echter Kontakt nur über die
+    feste Adresse. Der SSH-Tunnel-Weg bleibt, zielt aber jetzt auf die
+    Netzadresse (`ssh -L 8081:<addr>:80 user@server`).
 
- 27. **Admin-Wächter verwechselte „gestoppt“ mit „gelöscht“**: Der Prüfer, ob
-     der phpMyAdmin-Benutzer existiert, lief vor dem Start des MySQL-Containers.
-     Bei einem bloß entfernten oder gestoppten Container (Wartung,
-     Signatur-austausch, Host-Umzug) ist die Datenbank schlicht nicht
-     erreichbar – die Antwort „kann nicht rein“ wurde als „Benutzer fehlt,
-     Reset empfohlen“ gelesen, und der Hub looppte mit
-     Datenvernichtungs-Hinweis. Jetzt prüft der Wächter erst, wenn mysqld läuft
-     (ortsgleich mit der Entscheidung), und eine intakte Anlage überlebt das
-     Verschwinden ihres Containers ohne RESET. Live ausgelöst und bewiesen:
-     Container von Hand entfernt → Korrektur gespielt → Hub rekonstruierte den
-     Container und meldete „bereit“, Bot-Daten unversehrt.
- 28. **Container-Neuanlage brauchte eine löchrige env-file**: Nach erfolgreicher
-     Erst-Einrichtung löscht der Provisionierer seine Init-Datei (root-Passwort-
-     reste) – doch `docker create --env-file` verlangt die Datei bei JEDER
-     Anlage, auch bei längst eingerichteten Datenvolumina, wo ihr Inhalt
-     bedeutungslos ist. Folge: derselbe Crash-Loop wie in 27 aus einem anderen
-     Grund. Fix: bei Neuanlage über einem eingerichteten Volumen legt der
-     Provisionierer eine Wegwerf-env-file an (0600, im Finally immer gelöscht);
-     Fake-Modelle können das nicht fangen (sie erzwingen keine env-file), die
-     Live-VM schon – Regressionstest hält immerhin das neue Verhalten fest.
- 29. **Der Hub konnte seine eigenen Sprach-Presets nicht starten**: Rusts
-     vorgegebener Startbefehl `./target/release/bot` ist ein Pfadprogramm –
-     die Befehlsprüfung ließ als ausführbares Programm aber nur die
-     Sprach-Runtime und die drei Build-Wrapper (`./gradlew` & Co.) zu. Folge:
-     jeder Rust-Bot (und jedes Preset mit eigenem Binary) starb mit
-     „Das Programm muss aus der freigegebenen Runtime stammen“, noch ehe der
-     Container lief. Zwei Fehlerstellen: (a) die Prüfung erlaubte
-     Workspace-Programme nicht beim Startzweck, (b) `execArgs` gab den
-     Host-Pfad des Prüfers direkt an `docker exec` weiter, wo er nicht
-     existiert. Fix: beim Zweck `start` ist jede ausführbare Datei im
-     Workspace zulässig (identische Wachen: reguläre Datei, Ausführbit,
-     `realpath` bleibt im Workspace – ein SymLink nach `/bin/sh` scheitert
-     weiterhin); Bauen bleibt auf die Wrapper-Liste eng. `execArgs` bildet
-     Host-Pfade jetzt auf `/workspace/…` ab, analog zum Paket-Runner.
-     Regressionstests: drei in `commands.test.js`, zwei in
-     `containers.test.js` (520/520 gesamt).
- 30. **Go-Sumdb-Ablage lag auf der read-only-Rootfs**: Das golang-Bild setzt
-     `GOPATH=/go`; `go get` verifiziert Modulsummen unter `/go/pkg/sumdb` und
-     scheiterte dort mit „no such file or directory“ – jede Go-Anlage war
-     damit baunfähig, obwohl `GOMODCACHE`/`GOCACHE` bereits in den Workspace
-     zeigten. Fix: `GOPATH=/workspace/.cache/go` in Paket-Runner UND
-     Bot-Container (die golang-Standardpfade bleiben als Cache-Ziele
-     konsistent). Regressionstest prüft jetzt alle drei Go-Cache-Variablen.
- 31. **Maven brauchte eine settings.xml – JVM-Props und Env fielen ins
-     Leere**: Im DNS-freien Paketnetz wollte Maven `repo.maven.apache.org`
-     selbst auflösen („Temporary failure in name resolution“), Java- und
-     Kotlin-Bau unmöglich. Erst startskript-bedingt JAVA_TOOL_OPTIONS
-     vermutet (MRELEASE-1073), dann per Probe auf dem Paketnetz bestätigt:
-     Maven 3.9s Native-Transport ignoriert JVM-Proxy-Properties (MAVEN_OPTS
-     und JAVA_TOOL_OPTIONS, selbst wenn die JVM sie pickt) UND
-     HTTP(S)-PROXY-Variablen – einzig `-s settings.xml` wirkt. Fix: Der
-     Paket-Runner schreibt `.bot-hub/maven-settings.xml` (nur interne
-     Proxy-Adresse, keine Geheimnisse) in den Workspace und übergibt sie
-     über `MAVEN_ARGS` (Maven ≥ 3.9.7), ohne Installations-Kommandos
-     anzufassen. Regressionstest prüft Datei-Inhalt und MAVEN_ARGS.
- 32. **Der Go-Modul-Cache blockierte die Bot-Löschung**: `go` legt seine
-     Cache-Verzeichnisse bewusst mit Modus 0555 an – ohne Owner-Schreibbit
-     scheitern dort unlink wie rmdir, und der `files`-Cleanup-Schritt des
-     Löschens blieb mit EACCES stehen (DELETE 500, `cleanup_failed`,
-     wiederholt am selben Punkt). Fix: vor `rmSync` öffnet ein beherzter
-     Rundgang (`openDirsForRemoval`) allen Verzeichnissen im bereits
-     validierten Bot-Ordner das Owner-Schreibbit – Symlinks werden nicht
-     gefolgt, Tiefen über 64 Ebenen abgebrochen; Einzelpfade scheitern
-     still, die rm-Spur meldet echte Fehler. Zwei Regressionstests
-     (EACCES-Fall + Symlink-Nichtbefolgung). Nebenbefund aus demselben
-     Lauf: die Härtung `nosuid,nodev` auf dem Workspace-Bind lehnt dieser
-     Docker-Daemon für `--volume` ab („invalid mode“) und blieb daher aus –
-     wirkungslos ohnehin, da alle Container `no-new-privileges` +
-     `cap-drop ALL` tragen.
- 33. **JDA-Proxy: `WebSocketFactory.setProxy` existiert nicht** – der
-     Matrix-Java-Bau scheiterte mit „cannot find symbol“. Per javap am
-     echten Jar (nv-websocket-client 2.14, JDA 5.0.0-beta.13) verifiziert:
-     Die API heißt `factory.getProxySettings().setServer(host).setPort(port)`
-     (HTTP-CONNECT), REST separat via `setHttpClientBuilder(OkHttpClient…
-     .proxy(java.net.Proxy))`; einen `GatewayProxyBuilder` gibt es in
-     beta.13 nicht mehr. Harness (Java + Kotlin) accordingly berichtigt –
-     lokaler javac-Smoke-Test gegen die Original-Jars ist grün.
- 34. **Docker erzwingt `noexec` auf jedem `--tmpfs`** – selbst wenn man nur
-     `rw,nosuid` übergibt, mountet der Daemon `nodev,noexec` dazu (im
-     Vergleichscontainer per /proc/mounts belegt). `go run` baut seine
-     Binary nach /tmp und starb dort mit „fork/exec …: permission denied“.
-     Fix: `TMPDIR`/`GOTMPDIR` zeigen jetzt in den ausführbaren Workspace
-     (`.cache/tmp`), der Ordner wird beim Planen von Bot-Start und
-     Paket-Runner vorgelegt. Regressionstests prüfen beide Env-Dateien.
- 35. **NuGets „NuGet-Migrations“-Mutex kann in dieser Laufzeit nie
-     gelingen**: Erster Verdacht (Capabilities/seccomp/IPC) widerlegte sich
-     per Gegenprobe – selbst `seccomp=unconfined` + `--ipc host` änderte
-     nichts. Der wahre Grund, aus dem .NET-Runtime- und NuGet-Quellcode
-     belegt: .NET 8s benannte Mutexe sind eine reine Prozess-Tabelle, aber
-     NuGet übergibt den Namen ohne führenden Slash; die Laufzeit mappt ihn
-     auf das Windows-Gerät `/dev/Null→NuGet-Migrations` → ENXIO, der
-     Konstruktion wirft immer. Vor jedem Restore hilft nur, den
-     Migrations-Marker `$XDG_DATA_HOME/NuGet/Migrations/1` vorzuhalten
-     (existiert er, ist der Läufer no-op) – zusätzlich zu den
-     Erststart-Sentinels des Bildes (Punkt 1, sonst crasht vorher schon der
-     CLI-Konfigurator). Ein interner root-Lauf `ensureDotnetCliHome` legt
-     beides vor dem ersten Build an und `chown`t auf den
-     Workspace-Eigentümer; `XDG_DATA_HOME`/`DOTNET_CLI_HOME` zeigen in den
-     Workspace. Gegenprobe im Paket-Netz: „Restored Bot.csproj (7 s)“ ✓.
+27. **Admin-Wächter verwechselte „gestoppt“ mit „gelöscht“**: Der Prüfer, ob
+    der phpMyAdmin-Benutzer existiert, lief vor dem Start des MySQL-Containers.
+    Bei einem bloß entfernten oder gestoppten Container (Wartung,
+    Signatur-austausch, Host-Umzug) ist die Datenbank schlicht nicht
+    erreichbar – die Antwort „kann nicht rein“ wurde als „Benutzer fehlt,
+    Reset empfohlen“ gelesen, und der Hub looppte mit
+    Datenvernichtungs-Hinweis. Jetzt prüft der Wächter erst, wenn mysqld läuft
+    (ortsgleich mit der Entscheidung), und eine intakte Anlage überlebt das
+    Verschwinden ihres Containers ohne RESET. Live ausgelöst und bewiesen:
+    Container von Hand entfernt → Korrektur gespielt → Hub rekonstruierte den
+    Container und meldete „bereit“, Bot-Daten unversehrt.
+28. **Container-Neuanlage brauchte eine löchrige env-file**: Nach erfolgreicher
+    Erst-Einrichtung löscht der Provisionierer seine Init-Datei (root-Passwort-
+    reste) – doch `docker create --env-file` verlangt die Datei bei JEDER
+    Anlage, auch bei längst eingerichteten Datenvolumina, wo ihr Inhalt
+    bedeutungslos ist. Folge: derselbe Crash-Loop wie in 27 aus einem anderen
+    Grund. Fix: bei Neuanlage über einem eingerichteten Volumen legt der
+    Provisionierer eine Wegwerf-env-file an (0600, im Finally immer gelöscht);
+    Fake-Modelle können das nicht fangen (sie erzwingen keine env-file), die
+    Live-VM schon – Regressionstest hält immerhin das neue Verhalten fest.
+29. **Der Hub konnte seine eigenen Sprach-Presets nicht starten**: Rusts
+    vorgegebener Startbefehl `./target/release/bot` ist ein Pfadprogramm –
+    die Befehlsprüfung ließ als ausführbares Programm aber nur die
+    Sprach-Runtime und die drei Build-Wrapper (`./gradlew` & Co.) zu. Folge:
+    jeder Rust-Bot (und jedes Preset mit eigenem Binary) starb mit
+    „Das Programm muss aus der freigegebenen Runtime stammen“, noch ehe der
+    Container lief. Zwei Fehlerstellen: (a) die Prüfung erlaubte
+    Workspace-Programme nicht beim Startzweck, (b) `execArgs` gab den
+    Host-Pfad des Prüfers direkt an `docker exec` weiter, wo er nicht
+    existiert. Fix: beim Zweck `start` ist jede ausführbare Datei im
+    Workspace zulässig (identische Wachen: reguläre Datei, Ausführbit,
+    `realpath` bleibt im Workspace – ein SymLink nach `/bin/sh` scheitert
+    weiterhin); Bauen bleibt auf die Wrapper-Liste eng. `execArgs` bildet
+    Host-Pfade jetzt auf `/workspace/…` ab, analog zum Paket-Runner.
+    Regressionstests: drei in `commands.test.js`, zwei in
+    `containers.test.js` (520/520 gesamt).
+30. **Go-Sumdb-Ablage lag auf der read-only-Rootfs**: Das golang-Bild setzt
+    `GOPATH=/go`; `go get` verifiziert Modulsummen unter `/go/pkg/sumdb` und
+    scheiterte dort mit „no such file or directory“ – jede Go-Anlage war
+    damit baunfähig, obwohl `GOMODCACHE`/`GOCACHE` bereits in den Workspace
+    zeigten. Fix: `GOPATH=/workspace/.cache/go` in Paket-Runner UND
+    Bot-Container (die golang-Standardpfade bleiben als Cache-Ziele
+    konsistent). Regressionstest prüft jetzt alle drei Go-Cache-Variablen.
+31. **Maven brauchte eine settings.xml – JVM-Props und Env fielen ins
+    Leere**: Im DNS-freien Paketnetz wollte Maven `repo.maven.apache.org`
+    selbst auflösen („Temporary failure in name resolution“), Java- und
+    Kotlin-Bau unmöglich. Erst startskript-bedingt JAVA_TOOL_OPTIONS
+    vermutet (MRELEASE-1073), dann per Probe auf dem Paketnetz bestätigt:
+    Maven 3.9s Native-Transport ignoriert JVM-Proxy-Properties (MAVEN_OPTS
+    und JAVA_TOOL_OPTIONS, selbst wenn die JVM sie pickt) UND
+    HTTP(S)-PROXY-Variablen – einzig `-s settings.xml` wirkt. Fix: Der
+    Paket-Runner schreibt `.bot-hub/maven-settings.xml` (nur interne
+    Proxy-Adresse, keine Geheimnisse) in den Workspace und übergibt sie
+    über `MAVEN_ARGS` (Maven ≥ 3.9.7), ohne Installations-Kommandos
+    anzufassen. Regressionstest prüft Datei-Inhalt und MAVEN_ARGS.
+32. **Der Go-Modul-Cache blockierte die Bot-Löschung**: `go` legt seine
+    Cache-Verzeichnisse bewusst mit Modus 0555 an – ohne Owner-Schreibbit
+    scheitern dort unlink wie rmdir, und der `files`-Cleanup-Schritt des
+    Löschens blieb mit EACCES stehen (DELETE 500, `cleanup_failed`,
+    wiederholt am selben Punkt). Fix: vor `rmSync` öffnet ein beherzter
+    Rundgang (`openDirsForRemoval`) allen Verzeichnissen im bereits
+    validierten Bot-Ordner das Owner-Schreibbit – Symlinks werden nicht
+    gefolgt, Tiefen über 64 Ebenen abgebrochen; Einzelpfade scheitern
+    still, die rm-Spur meldet echte Fehler. Zwei Regressionstests
+    (EACCES-Fall + Symlink-Nichtbefolgung). Nebenbefund aus demselben
+    Lauf: die Härtung `nosuid,nodev` auf dem Workspace-Bind lehnt dieser
+    Docker-Daemon für `--volume` ab („invalid mode“) und blieb daher aus –
+    wirkungslos ohnehin, da alle Container `no-new-privileges` +
+    `cap-drop ALL` tragen.
+33. **JDA-Proxy: `WebSocketFactory.setProxy` existiert nicht** – der
+    Matrix-Java-Bau scheiterte mit „cannot find symbol“. Per javap am
+    echten Jar (nv-websocket-client 2.14, JDA 5.0.0-beta.13) verifiziert:
+    Die API heißt `factory.getProxySettings().setServer(host).setPort(port)`
+    (HTTP-CONNECT), REST separat via `setHttpClientBuilder(OkHttpClient…
+.proxy(java.net.Proxy))`; einen `GatewayProxyBuilder` gibt es in
+    beta.13 nicht mehr. Harness (Java + Kotlin) accordingly berichtigt –
+    lokaler javac-Smoke-Test gegen die Original-Jars ist grün.
+34. **Docker erzwingt `noexec` auf jedem `--tmpfs`** – selbst wenn man nur
+    `rw,nosuid` übergibt, mountet der Daemon `nodev,noexec` dazu (im
+    Vergleichscontainer per /proc/mounts belegt). `go run` baut seine
+    Binary nach /tmp und starb dort mit „fork/exec …: permission denied“.
+    Fix: `TMPDIR`/`GOTMPDIR` zeigen jetzt in den ausführbaren Workspace
+    (`.cache/tmp`), der Ordner wird beim Planen von Bot-Start und
+    Paket-Runner vorgelegt. Regressionstests prüfen beide Env-Dateien.
+35. **NuGets „NuGet-Migrations“-Mutex kann in dieser Laufzeit nie
+    gelingen**: Erster Verdacht (Capabilities/seccomp/IPC) widerlegte sich
+    per Gegenprobe – selbst `seccomp=unconfined` + `--ipc host` änderte
+    nichts. Der wahre Grund, aus dem .NET-Runtime- und NuGet-Quellcode
+    belegt: .NET 8s benannte Mutexe sind eine reine Prozess-Tabelle, aber
+    NuGet übergibt den Namen ohne führenden Slash; die Laufzeit mappt ihn
+    auf das Windows-Gerät `/dev/Null→NuGet-Migrations` → ENXIO, der
+    Konstruktion wirft immer. Vor jedem Restore hilft nur, den
+    Migrations-Marker `$XDG_DATA_HOME/NuGet/Migrations/1` vorzuhalten
+    (existiert er, ist der Läufer no-op) – zusätzlich zu den
+    Erststart-Sentinels des Bildes (Punkt 1, sonst crasht vorher schon der
+    CLI-Konfigurator). Ein interner root-Lauf `ensureDotnetCliHome` legt
+    beides vor dem ersten Build an und `chown`t auf den
+    Workspace-Eigentümer; `XDG_DATA_HOME`/`DOTNET_CLI_HOME` zeigen in den
+    Workspace. Gegenprobe im Paket-Netz: „Restored Bot.csproj (7 s)“ ✓.
+
+### Sicherheitsaudit durch drei autonome Agenten (Maßnahmen 36–41)
+
+Vor der Abnahme liefen drei read-only Security-Agenten über je eine Domäne
+(Web/API/Auth, Sandbox/Ausführung, Tooling/Supply-Chain). Befunde wurden
+dedupliziert, fixiert und in `test/security-audit.test.js` regressionsfest
+gehalten.
+
+36. **Hub-Schreibgriffe folgten Bot-Symlinks (kritisch, Audit SEC-01/02)**:
+    Bot und Hub teilen dieselbe UID; jeder Hub-Write in den Workspace
+    (`copyFileSync` in `botFiles.sync`, `mkdirSync(recursive)` +
+    `writeFileSync` in `containers.js`) folgt einem Verweis auf dem letzten
+    Pfadsegment. Ein Bot konnte `workspace/main.py` durch einen Symlink auf
+    `~bot-hub/.ssh/authorized_keys` ersetzen – der nächste Startordner-Sync
+    schrieb Betreiber-Inhalt durch den Link hindurch. Fix: in `botFiles.js`
+    prüfen `zwischenstufenSicher`/`legeOrdnerAn`/`ersetzeDatei` (rename statt
+    Überschreiben, Verweis wird als Verweis entfernt, sein Ziel bleibt
+    unangetastet; auch der Löschpfad prüft jede Zwischenstufe), in
+    `containers.js` `ensureWorkspaceDirNoFollow`/`writeWorkspaceFileNoFollow`
+    für `.bot-hub`, `.cache/tmp` und die dotnet-Home-Ziele vor dem
+    root-Initialisierungslauf.
+
+37. **Per-Bot-Rechte waren Dekor; Panel-OAuth war injizierbar (hoch,
+    Audit WEB-01/SEC-03)**: `effectivePermissions` filterte Per-Bot-Rechte
+    auf den Rollen-Deckel – Rechte, die die Rolle nicht hat, konnte kein Bot
+    gewähren; zugleich prüften Start/Stopp/Patch/Delete/Panel-Routen nur
+    global. Fix: Per-Bot-Rechte sind jetzt Union-Erweiterung (Rollen bleiben
+    global), und alle bot-bezogenen `permission()`-Aufrufe tragen `bot.id`.
+    Zweitens: `env`/`secretEnv` im API-Body durften `DISCORD_CLIENT_ID`/
+    `DISCORD_OAUTH_URL` & Co. setzen → sie wandern über `writePanelEnv` in
+    `data/secrets/<id>.env` und biegen den Panel-Login auf die OAuth-App des
+    Angreifers. Chokepoint: `isPanelOAuthKey` (secrets.js) verwirft diese
+    Schlüssel in `normaliseConfig`/`secretValues`; Handpflege in der
+    Secret-Datei bleibt der einzige Weg. `DISCORD_BOT_TOKEN` ist bewusst
+    erlaubt – er IST der legitime Token-Kanal.
+
+38. **Panel-/API-Nachlässe (mittel, Audit WEB-02/03/04, SEC-04/07, WEB-10)**:
+    `discordConfig` las `data/secrets/<id>.env` roh – mit aktivem Vault nur
+    der Umschlag, Panel-OAuth war tot (jetzt `readSecretValues`).
+    Panel-Dateien wurden unbegrenzt in den RAM gelesen (jetzt 8 MiB-Kappe +
+    `createReadStream`). `GET /api/bots*` war ohne Rate-Klasse (jetzt
+    `bots-read`). Bei DELETE/Abort wurde nur der `docker run`-Client
+    gekillt – der Build-Container lief verwaist weiter (jetzt wird
+    `bot.busyContainer` gemerkt und per `docker stop` beendet;
+    SIGKILL-ESkalation bleibt als Rückfall). Verwaiste
+    `bot-hub-exec-env-*` in `/tmp` (Token-Leichen nach hartem Hub-Tod)
+    räumt `sweepStaleExecEnvFiles()` beim Start. Totcode
+    `linkHubDiscordSession` (nacktes `return` als First Statement) ist
+    entfernt – seine Designregel steht als Kommentar.
+
+39. **Fünf `depsCheck`-Presets waren toter Code (Funktionsfund des
+    Audits)**: `parseCommand` kennt keinen Shell – `> /dev/null`, `2>&1` und
+    Pipes ließen den Check IMMER scheitern, `go list -m` blockierte zudem
+    der Eval-Flag-Wächter. Folge: Java/Kotlin/Go/C#/Rust bauten/installierten
+    bei JEDEM Start neu. Jetzt argv-only: `ls build/libs/bot.jar` (Java/
+    Kotlin, konsistent mit Preset-Entrypoint), `grep -q {module} go.mod`,
+    `grep -q {package} Bot.csproj`, `grep -qi {package} Cargo.toml`.
+
+40. **Egress: `br+ -> br+ RETURN` war die Querbrücke ins Pflege-Netz
+    (mittel, Audit SEC-05)**: Bot-Container konnten damit direkt
+    MySQL-Container-Ports treffen, an Squid und Hub-API vorbei. Die Regel
+    wurde gestrichen: Gleichnetz-Traffic läuft über L2-Switching (gar nicht
+    durch FORWARD), Gateway-Ziele (Squid 172.30.x.1, Hub :8788) sind der
+    Host selbst und laufen über INPUT. Was bleibt: `br+ -> DROP`. Erwartungs-
+    liste in `check_family` mitgezogen – `--check` erzwingt den neuen Stand.
+
+41. **Supply-Chain & Deploy (hoch, Audit SC-01/02/03 + mittel/niedrig)**:
+    undici 6.29.0 → 6.29.1 (TLS-Validierungs-Bypass + 4 DoS-Advisories;
+    undici IST hier der globale `fetch`-Ersatz aus `server/egress.js`) –
+    `npm audit --omit=dev` wieder 0. CI: das Produktions-Audit-Gate lief
+    ohne `pipefail` durch `| tee` immer grün; `push` triggerte nur auf
+    `main`, dem Repo aber fehlt der Branch – jetzt `main` + `pr/**`.
+    Deploy: Master-Key schreibt direkt nach `/etc/bot-hub` statt über den
+    erratbaren Pfad `/tmp/master.key.$$`; `setup-tls.sh` validiert die
+    Domain per Regex (Konfig-Injektion) und setzt `BOT_HUB_SECURE_COOKIES=1`
+    als echtes Upsert; systemd-Unit bekommt `NoNewPrivileges`/
+    `ProtectSystem=full`/`ProtectHome`/`PrivateTmp`; fail2ban bekommt
+    seinen sshd-Jail (vorher Installation ohne Jail = Luft); `bots/**` (121 Dateien
+    Laufzeitdaten: Bot-UUIDs, Namen, Startordner-Inhalte) aus dem Index
+    entfernt und gitignoret – das Repo ist öffentlich; SSH-Passwort aus
+    `VM-SIMULATION.md` getilgt (historische Commits ⇒ VM-Passwort
+    rotieren!); Matrix-Harness schaltet `NODE_TLS_REJECT_UNAUTHORIZED`
+    nur noch bei Loopback-`HUB_URL` ab.
+
+**Bewusst zurückgestellt (mit Begründung):** Audit WEB-05 (Ticket-Login kann
+identität seitlich wechseln – benötigt Pre-Auth-Bindung über den OAuth-Flow,
+kein schneller Patch ohne Login-Regression; Panel-Tickets sind
+Bot-Owner-scope), WEB-07 (`__Host-`-Prefix verlangt Secure, bricht
+Loopback-HTTP; absolute Session-Ablauffristen bleiben die Grenze) und SEC-06
+(Workspace-Plattenquota – Watchboard-Thema, kein Einzeiler; Container sind
+CPU/RAM/pids-limit-gequolt). Diese drei stehen als bekannte Grenzen unter
+dieser Liste.
 
 ### Betriebslehre
 
-* **Startordner schlägt Datei-Editor**: Hat ein Bot einen Startordner,
+- **Test-Suite auf der VM ist umgebungsabhängig**: Die Lifecycle-Tests
+  brauchen `python3.12-venv` auf dem Host (apt kommt im gehärteten Zustand
+  nicht mehr durch den Egress-Proxy – Pakete als `.deb` hereinkopieren und
+  `dpkg -i`), und sie dürfen nicht gegen die produktive Last laufen: ein
+  Suite-Lauf bei 6-fach verlangsamter VM ließ 29 Tests in Timeouts kippen,
+  dieselben Tests sind einzeln grün. Außerdem gehören in die Testumgebung
+  keine Vault-Pfade: die produktive `.env` (`BOT_HUB_KEY_FILE`) darf im
+  Testprozess nicht wirksam werden, sonst finden
+  Klartext-Erwartungs-Assertions umgeschlagene Werte vor.
+- **Nach jedem Wechsel an `apply-docker-egress.py` beide Kopien aktualisieren**:
+  `/opt/bot-hub/deploy/discord-egress/` UND das installierte
+  `/usr/local/sbin/bot-hub-docker-egress` – der Hub-Preflight prüft über die
+  installierte Kopie, und eine Regeländerung ohne `install` lässt den Hub mit
+  „Host-Firewall sperrt die Docker-Bridges nicht nachweislich“ abstürzen
+  (boot-loop). Heilt: `install -m 0755 … && bot-hub-docker-egress --check`.
+
+- **Startordner schlägt Datei-Editor**: Hat ein Bot einen Startordner,
   synchronisiert der Hub beim Start `startordner/` → `workspace/`
   (`start-sync.json` mit Größe + SHA-256 pro Datei). Direkt ins Workspace
   kopierte Dateien sind damit nach dem nächsten Start weg. Richtig patchen:
   beide Kopien ersetzen und den Hash-Eintrag in `start-sync.json`
   aktualisieren (Größe, sha256, `stand`; Kompakt-JSON, Mode 0600).
-* Hub-Neustart nie parallel zum Bot-Start: ein mittendrin abgebrochenes
+- Hub-Neustart nie parallel zum Bot-Start: ein mittendrin abgebrochenes
   `docker create/start` hinterlässt einen Container ohne Netzwerk-Endpoint
   (`EndpointID` leer, kein IP). Symptom: Bot-Container „Up“, aber keine
   Discord-Connection. Heilt: Container löschen und im Hub neu starten.
-* Verbindungstest aus dem Bot-Netz (DNS-Scheitern ist Absicht, Auflösung
+- Verbindungstest aus dem Bot-Netz (DNS-Scheitern ist Absicht, Auflösung
   passiert im Proxy per CONNECT): `docker run --rm --network
-  bot-hub-discord <Bot-Image> python3 -c "import socket;
-  print(socket.create_connection(('172.30.250.1', 8788), 4))"` – auch
+bot-hub-discord <Bot-Image> python3 -c "import socket;
+print(socket.create_connection(('172.30.250.1', 8788), 4))"` – auch
   Port 3128 (Squid) testen.
 
 ## Digest-Pinning der Bot-Images (Produktions-Pflicht)
@@ -447,7 +555,6 @@ docker exec bot-hub-vm grep -cE "vault:v[12]:" /opt/bot-hub/data/secrets/*.env
 **Pflicht: Master-Key sichern.** Ohne `/etc/bot-hub/master.key` sind alle Vault-Umschläge unwiederbringlich verloren (AES, kein Backdoor-Zugang). Backup: `docker exec bot-hub-vm cat /etc/bot-hub/master.key` in einen Passwortmanager (außerhalb der VM) legen; niemals ins Repo (`*.key` ist gitignoret). Danach aufräumen: Nach dem Umzug können `DISCORD_CLIENT_SECRET` (und `DISCORD_CLIENT_ID`, `DISCORD_REDIRECT_URI`) aus `/opt/bot-hub/.env` gelöscht werden – der Hub liest sie jetzt aus `data/secrets/hub.env`. Funktionstest danach: `curl -sk -o /dev/null -w "%{http_code}" https://127.0.0.1/api/auth/discord/login` muss 302 liefern (beide Werte aus dem Vault aufgelöst).
 
 Rollback: Die `BOT_HUB_KEY_FILE`-Zeile kann nur entfernt werden, solange noch keine Umschläge geschrieben wurden – sobald Werte versiegelt sind, ist der Key zum Lesen zwingend nötig.
-
 
 ## Sprach-Matrix: alle unterstützten Sprachen live prüfen
 

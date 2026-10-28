@@ -32,6 +32,7 @@ sudo bash deploy-full.sh
 ```
 
 **Das Skript installiert automatisch:**
+
 - ✅ System-Updates
 - ✅ Docker & Docker Compose
 - ✅ Node.js 22
@@ -80,6 +81,7 @@ sudo bash setup-tls.sh ihre-domain.de
 ```
 
 **Das Skript:**
+
 - ✅ Installiert certbot
 - ✅ Beantragt Let's Encrypt Zertifikat
 - ✅ Konfiguriert nginx für HTTPS

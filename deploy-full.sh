@@ -72,6 +72,19 @@ apt install -y \
 
 log_success "Grundpakete installiert"
 
+# Maßnahme 41 (Audit SC-11): fail2ban ohne Jail installiert nur Luft. Der
+# sshd-Jail kommt aktiv, sonst steht das Paket nur als Beruhigung da.
+cat > /etc/fail2ban/jail.d/bot-hub-sshd.conf <<'EOF'
+[sshd]
+enabled = true
+maxretry = 5
+findtime = 10m
+bantime = 1h
+EOF
+systemctl enable fail2ban >/dev/null 2>&1 || true
+systemctl restart fail2ban >/dev/null 2>&1 || true
+log_success "fail2ban sshd-Jack aktiv"
+
 # ============================================
 # 3. Docker installieren
 # ============================================
@@ -114,6 +127,13 @@ if ! command -v node &> /dev/null; then
     log_info "Node.js wird installiert..."
     
     # NodeSource Repository hinzufügen
+    # Maßnahme 41 (Audit SC-09): curl | bash auf root ist per Definition
+    # Blindvertrauen in den Auslieferer. Getragen wird das bewusst: die
+    # Nodesource-Domäne ist der einzige offizielle Weg, der Key landet als
+    # apt-keyring (nachträglich prüfbar: `apt-key fingerprint` bzw.
+    # `/etc/apt/keyrings/nodesource.gpg`), und alle weiteren Pakete kommen
+    # signiert aus dem so angebundenen Repo. Ein Hash-Pin würde bei jedem
+    # Upstream-Update brechen.
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
     
     apt install -y nodejs
@@ -167,6 +187,10 @@ cd "$PROJECT_DIR"
 
 # Abhängigkeiten installieren
 log_info "Node.js Abhängigkeiten installieren..."
+# Audit SC-14: `--ignore-scripts` wäre hier falsch – das Frontend-Build
+# braucht esbuilds postinstall-Binary. Der Schutzweg ist die Kette aus
+# verbindlicher Lockdatei (`npm ci`), `npm audit`-Gate in der CI und dem
+# SBOM-Inventar; neue postinstall-Haker müssen als Audit-Fund sichtbar werden.
 sudo -u bot-hub npm ci --include=dev
 log_success "Abhängigkeiten installiert"
 
@@ -196,9 +220,12 @@ fi
 # liest den Pfad über BOT_HUB_KEY_FILE (aus der .env via EnvironmentFile).
 mkdir -p /etc/bot-hub
 if [ ! -f /etc/bot-hub/master.key ]; then
-    umask 077
-    node -e 'process.stdout.write(require("crypto").randomBytes(32).toString("hex")+"\n")' > /tmp/master.key.$$
-    mv /tmp/master.key.$$ /etc/bot-hub/master.key
+    # Maßnahme 41 (Audit SC-06): vorher ging der Key über /tmp/master.key.$$
+    # (PID-Name = erratbar; ein vorgelegter Symlink wurde als root gefolgt →
+    # beliebiger Dateiüberschreib). Jetzt: Direktanlage im root-eigenen
+    # /etc/bot-hub unter Umask 077 – kein Welt-lesbarer Zwischenablage-Pfad.
+    ( umask 077
+      node -e 'process.stdout.write(require("crypto").randomBytes(32).toString("hex")+"\n")' > /etc/bot-hub/master.key )
     chmod 640 /etc/bot-hub/master.key
     chown root:bot-hub /etc/bot-hub/master.key
     log_success "Vault-Key /etc/bot-hub/master.key erzeugt (root:bot-hub 0640)"
@@ -265,6 +292,14 @@ EnvironmentFile=-$PROJECT_DIR/.env
 ExecStart=/usr/bin/node server/index.js
 Restart=always
 RestartSec=10
+# Maßnahme 41 (Audit SC-10): Grundhärtung. Kein setuid-Spielraum, /usr//boot/
+# /etc read-only für den Prozess (der Master-Key wird nur GELESEN), eigener
+# /tmp (Exec-env-Dateien bleiben privat), kein Home-Zugriff. PrivateUsers/
+# ProtectKernel* bleiben aus: der Docker-Socket braucht die echte Gruppe.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

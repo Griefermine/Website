@@ -688,7 +688,9 @@ describe('Das Einrichten', () => {
     const docker = fakeDocker();
     const { provisioner } = setup({ dir, docker });
     await provisioner.provision();
-    const netz = docker.calls.find((args) => args[0] === 'network' && args[1] === 'create');
+    const netz = docker.calls.find(
+      (args) => args[0] === 'network' && args[1] === 'create',
+    );
     assert.ok(netz, 'Netz wurde nicht angelegt');
     assert.equal(netz[netz.indexOf('--subnet') + 1], '172.30.252.0/24');
     assert.equal(netz[netz.indexOf('--gateway') + 1], '172.30.252.1');

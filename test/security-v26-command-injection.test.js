@@ -1,6 +1,6 @@
 /**
  * Security Test V26: Command Injection Prevention
- * 
+ *
  * Verifiziert, dass Bot-Startkommandos nicht für Shell-Injection missbraucht werden können.
  */
 
@@ -34,7 +34,7 @@ describe('Security V26: Command Injection Prevention', () => {
       assert.strictEqual(
         hasShellMeta,
         true,
-        `Pattern "${pattern}" should be detected as containing shell metacharacters`
+        `Pattern "${pattern}" should be detected as containing shell metacharacters`,
       );
     }
   });
@@ -58,7 +58,7 @@ describe('Security V26: Command Injection Prevention', () => {
       assert.strictEqual(
         hasShellMeta,
         false,
-        `Pattern "${pattern}" should be considered safe`
+        `Pattern "${pattern}" should be considered safe`,
       );
     }
   });
@@ -75,10 +75,10 @@ describe('Security V26: Command Injection Prevention', () => {
     for (const exec of unsafeExecutables) {
       const isAbsolute = exec.startsWith('/');
       const hasTraversal = exec.includes('..');
-      
+
       assert(
         isAbsolute || hasTraversal,
-        `Executable "${exec}" should be flagged as unsafe`
+        `Executable "${exec}" should be flagged as unsafe`,
       );
     }
   });
@@ -95,10 +95,10 @@ describe('Security V26: Command Injection Prevention', () => {
     for (const exec of safeExecutables) {
       const isAbsolute = exec.startsWith('/');
       const hasTraversal = exec.includes('..');
-      
+
       assert(
         !isAbsolute && !hasTraversal,
-        `Executable "${exec}" should be considered safe`
+        `Executable "${exec}" should be considered safe`,
       );
     }
   });
@@ -106,17 +106,17 @@ describe('Security V26: Command Injection Prevention', () => {
   it('should validate argument list separately from executable', () => {
     // This test verifies that arguments are treated as separate entities
     // and not concatenated into a shell command string
-    
+
     const executable = 'node';
     const args = ['server.js', '--port', '8080'];
-    
+
     // Arguments should not be interpreted as shell commands
     for (const arg of args) {
       const hasShellMeta = /[;&|`$(){}\n\r<>]/.test(arg);
       assert.strictEqual(
         hasShellMeta,
         false,
-        `Argument "${arg}" should not contain shell metacharacters`
+        `Argument "${arg}" should not contain shell metacharacters`,
       );
     }
   });
@@ -134,7 +134,7 @@ describe('Security V26: Command Injection Prevention', () => {
       assert.strictEqual(
         hasShellMeta,
         true,
-        `Argument "${arg}" should be detected as malicious`
+        `Argument "${arg}" should be detected as malicious`,
       );
     }
   });

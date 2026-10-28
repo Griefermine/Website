@@ -4,8 +4,11 @@ import {
   closeSync,
   existsSync,
   fchmodSync,
+  lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
+  renameSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -43,6 +46,60 @@ const MAVEN_SETTINGS_CONTENT =
     )
     .join('\n') +
   '\n  </proxies>\n</settings>\n';
+
+/* Maßnahme 36 (Audit SEC-01/02): Der Bot läuft mit derselben UID wie der Hub
+ * und darf im Workspace jederzeit Dateien und Ordner durch Symlinks ersetzen.
+ * Jeder Hub-Schreibgriff in den Workspace darf solchen Verweisen NICHT
+ * folgen – sonst schreibt der Hub bekannten Inhalt auf Host-Pfade außerhalb
+ * des Workspace (bots.json, sessions.json, Master-Key …). Deshalb: Verweis
+ * auf dem Pfad wird als Verweis selbst entfernt (sein Ziel bleibt
+ * unangetastet), geschrieben wird atomar über Temporärdatei + rename. */
+
+/** `basis/…teile` als echtes Verzeichnis sichern; Verweise werden ersetzt. */
+export const ensureWorkspaceDirNoFollow = (basis, ...teile) => {
+  let pfad = basis;
+  for (const teil of teile) {
+    pfad = join(pfad, teil);
+    try {
+      const stat = lstatSync(pfad);
+      if (!stat.isDirectory()) unlinkSync(pfad);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    try {
+      // bewusst ohne `recursive`: kein Pfadstück wird durchwandert.
+      mkdirSync(pfad, { mode: 0o755 });
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
+  }
+  return pfad;
+};
+
+/** Datei atomar und ohne Symlink-Folge an `pfad` ablegen. */
+export const writeWorkspaceFileNoFollow = (pfad, inhalt) => {
+  try {
+    const stat = lstatSync(pfad);
+    if (!stat.isFile()) unlinkSync(pfad);
+  } catch {
+    /* Ziel existiert (noch) nicht */
+  }
+  const tmp = `${pfad}.tmp-${randomUUID()}`;
+  try {
+    const fd = openSync(tmp, 'wx', 0o644);
+    writeFileSync(fd, inhalt);
+    closeSync(fd);
+    renameSync(tmp, pfad);
+  } catch (error) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* der ursprüngliche Fehler zählt */
+    }
+    throw error;
+  }
+};
+
 const containerNetwork = () => {
   const configured = String(process.env.BOT_HUB_CONTAINER_NETWORK ?? '').trim();
   const production = process.env.NODE_ENV === 'production';
@@ -535,6 +592,30 @@ export const removeContainer = async (bot) => {
  * fertig ist (`cleanupExecEnvFile`). Gibt den Pfad zurück oder null,
  * wenn nichts zu übergeben ist.
  */
+/* Maßnahme 38 (Audit SEC-07): Die env-Dateien enthalten Bot- und Laufzeit-
+ * Tokens und werden normalerweise beim Prozess-Exit gelöscht. Stirbt der Hub
+ * hart (OOM, SIGKILL), bleiben sie im /tmp liegen – beim Start wird das
+ * Muster deshalb vollständig abgeräumt, bevor irgendetwas spawned. */
+export const sweepStaleExecEnvFiles = () => {
+  let removed = 0;
+  try {
+    for (const entry of readdirSync(tmpdir())) {
+      if (!/^bot-hub-exec-env-[0-9a-f-]{36}$/.test(entry)) continue;
+      try {
+        unlinkSync(join(tmpdir(), entry));
+        removed += 1;
+      } catch {
+        /* fremde Datei oder schon weg */
+      }
+    }
+  } catch {
+    /* kein /tmp – nichts zu räumen */
+  }
+  if (removed)
+    console.warn(`[hub] ${removed} verwaiste Exec-Umgebungsdateien geräumt.`);
+  return removed;
+};
+
 const writeExecEnvFile = (env) => {
   const lines = [];
   for (const [key, value] of Object.entries(env)) {
@@ -640,8 +721,9 @@ export const execArgs = (bot, projectRoot, dir, command, env = {}) => {
   containerEnv.GOTMPDIR = '/workspace/.cache/tmp';
   containerEnv.DOTNET_CLI_HOME = '/workspace/.cache/dotnet-cli-home';
   try {
-    // go akzeptiert kein fehlendes GOTMPDIR – Ordner vorab anlegen.
-    mkdirSync(join(workspace, '.cache', 'tmp'), { recursive: true });
+    // go akzeptiert kein fehlendes GOTMPDIR – Ordner vorab anlegen, ohne
+    // einem Bot-Symlink zu folgen (Maßnahme 36).
+    ensureWorkspaceDirNoFollow(workspace, '.cache', 'tmp');
   } catch {
     /* bleibt read-only, meldet go den Fehler selbst */
   }
@@ -700,6 +782,25 @@ export const execArgs = (bot, projectRoot, dir, command, env = {}) => {
  * Lösch-Cleanup blockieren (Maßnahme 32/35). */
 export const ensureDotnetCliHome = async (bot, projectRoot) => {
   const workspace = workspacePath(bot, projectRoot);
+  // Vor dem root-Lauf die Ziele symlinksicher machen (Maßnahme 36): root
+  // würde einem vom Bot gelegten Verweis sonst bis ins Ziel folgen.
+  try {
+    ensureWorkspaceDirNoFollow(
+      workspace,
+      '.cache',
+      'dotnet-cli-home',
+      '.dotnet',
+    );
+    ensureWorkspaceDirNoFollow(
+      workspace,
+      '.cache',
+      'xdg-data',
+      'NuGet',
+      'Migrations',
+    );
+  } catch {
+    /* unbeschreibbarer Workspace: der root-Lauf schlägt fehl, der Build meldet es */
+  }
   const args = [
     'run',
     '--rm',
@@ -813,12 +914,16 @@ export const dependencyRunArgs = (bot, projectRoot, dir, command, env = {}) => {
   // akzeptiert, ist eine settings.xml. Sie enthält keine Geheimnisse (nur
   // die interne Paket-Proxy-Adresse) und liegt im Workspace, das Verzeichnis
   // ist dem Container ohnehin als /workspace bekannt.
-  mkdirSync(join(workspace, '.bot-hub'), { recursive: true });
-  mkdirSync(join(workspace, '.cache', 'tmp'), { recursive: true });
-  writeFileSync(
-    join(workspace, '.bot-hub', 'maven-settings.xml'),
-    MAVEN_SETTINGS_CONTENT,
-  );
+  try {
+    ensureWorkspaceDirNoFollow(workspace, '.bot-hub');
+    ensureWorkspaceDirNoFollow(workspace, '.cache', 'tmp');
+    writeWorkspaceFileNoFollow(
+      join(workspace, '.bot-hub', 'maven-settings.xml'),
+      MAVEN_SETTINGS_CONTENT,
+    );
+  } catch {
+    /* read-only Workspace: Maven meldet den Fehler selbst ins Bot-Protokoll */
+  }
   containerEnv.MAVEN_ARGS = '-s /workspace/.bot-hub/maven-settings.xml';
   const envFile = writeExecEnvFile(containerEnv);
   const containerName = `bot-hub-deps-${randomUUID()}`;

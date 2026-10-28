@@ -290,7 +290,10 @@ const saveSessions = () => {
     } catch {
       /* Ein TempFile-Rest ist harmlos; der Schreibfehler wird gemeldet. */
     }
-    console.error('[hub] Sessions konnten nicht gespeichert werden:', error.message);
+    console.error(
+      '[hub] Sessions konnten nicht gespeichert werden:',
+      error.message,
+    );
   }
 };
 const loadSessions = () => {
@@ -299,7 +302,12 @@ const loadSessions = () => {
     const raw = readFileSync(sessionFile, 'utf8');
     let content = raw;
     if (raw.trim().startsWith('vault:')) {
-      content = decryptValue('sessions', 'file', raw.trim(), projectRootOfSessionFile());
+      content = decryptValue(
+        'sessions',
+        'file',
+        raw.trim(),
+        projectRootOfSessionFile(),
+      );
     }
     const parsed = JSON.parse(content);
     const now = Date.now();
@@ -313,10 +321,16 @@ const loadSessions = () => {
         sessions.set(key, value);
     }
     // Klartext-Altbestand einmalig in den Umschlag hochziehen.
-    if (!raw.trim().startsWith('vault:') && vaultEnabled(projectRootOfSessionFile()))
+    if (
+      !raw.trim().startsWith('vault:') &&
+      vaultEnabled(projectRootOfSessionFile())
+    )
       saveSessions();
   } catch (error) {
-    console.error('[hub] Sessions konnten nicht geladen werden:', error.message);
+    console.error(
+      '[hub] Sessions konnten nicht geladen werden:',
+      error.message,
+    );
   }
 };
 export const configureSessionStore = (file) => {
@@ -416,9 +430,12 @@ const effectivePermissions = (entry, botId) => {
     allowed.has(permission),
   );
   if (!botId) return global;
+  // Per-Bot-Rechte sind eine ERWEITERUNG, keine Untermenge der Rolle:
+  // Wer als viewer: [] nur auf Bot A berechtigt werden soll, kann ohne
+  // Bot-Bezug nichts, mit Bot A genau das Eingetragene. Ein Rollen-Deckel
+  // hier machte die Bot-Rechte-UI zu Dekor (Audit WEB-01, Maßnahme 37).
   const perBot = entry.bots?.[botId]?.permissions ?? [];
-  const merged = [...new Set([...global, ...perBot])];
-  return merged.filter((permission) => allowed.has(permission));
+  return [...new Set([...global, ...perBot])];
 };
 
 export const publicAccess = (userId, botId) => {

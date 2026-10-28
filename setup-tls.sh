@@ -44,6 +44,13 @@ if [ -z "$1" ]; then
 fi
 
 DOMAIN="$1"
+# Maßnahme 41 (Audit SC-07): die Domain wandert in nginx-Konfigurationen und
+# sed-Ausdrücke. Erlaubt sind ausschließlich DNS-Zeichen — alles andere (
+# Leerzeichen, Zeilenumbrüche, `;`, `"` …) wäre Konfig-Injektion.
+if ! printf '%s' "$DOMAIN" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'; then
+    log_error "Ungültige Domain: '$DOMAIN'"
+    exit 1
+fi
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log_info "Let's Encrypt TLS Setup für: $DOMAIN"
@@ -197,7 +204,14 @@ if [ -f "$PROJECT_DIR/.env" ]; then
     sed -i "s|^DISCORD_REDIRECT_URI=.*|DISCORD_REDIRECT_URI=https://$DOMAIN/api/auth/discord/callback|" "$PROJECT_DIR/.env"
     
     # BOT_HUB_SECURE_COOKIES setzen
-    sed -i "s|^BOT_HUB_SECURE_COOKIES=.*|BOT_HUB_SECURE_COOKIES=1|" "$PROJECT_DIR/.env"
+    # Maßnahme 41 (Audit SC-05): echtes Upsert – das alte sed war ein
+    # No-op, wenn die Zeile fehlte, und der Hub lief mit TLS und un-
+    # gesicherten Cookies weiter.
+    if grep -q '^BOT_HUB_SECURE_COOKIES=' "$PROJECT_DIR/.env"; then
+        sed -i "s|^BOT_HUB_SECURE_COOKIES=.*|BOT_HUB_SECURE_COOKIES=1|" "$PROJECT_DIR/.env"
+    else
+        printf 'BOT_HUB_SECURE_COOKIES=1\n' >> "$PROJECT_DIR/.env"
+    fi
     
     chown bot-hub:bot-hub "$PROJECT_DIR/.env"
     chmod 600 "$PROJECT_DIR/.env"
