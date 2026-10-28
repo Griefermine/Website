@@ -490,14 +490,15 @@ dieser Liste.
 - **Test-Suite auf der VM ist umgebungsabhängig**: Die Lifecycle-Tests
   brauchen `python3.12-venv` auf dem Host (apt kommt im gehärteten Zustand
   nicht mehr durch den Egress-Proxy – Pakete als `.deb` hereinkopieren und
-  `dpkg -i`), und sie dürfen nicht gegen die produktive Last laufen: ein
-  Suite-Lauf bei 6-fach verlangsamter VM ließ 29 Tests in Timeouts kippen,
-  dieselben Tests sind einzeln grün. Die eigentliche Vault-Falle (Maßnahme 42):
-  `server/auth.js` injizierte beim Import die `.env` des **Arbeitsordners**
-  in `process.env` – ein Testlauf aus `/opt/bot-hub` erbte so den
-  produktiven `BOT_HUB_KEY_FILE` und fand in `data/secrets` Umschläge statt
-  Klartext vor. Der Test-Modus (`BOT_HUB_TEST_MODE=1`) lädt die `.env`
-  jetzt grundsätzlich nicht mehr; Dev- und systemd-Betrieb sind unberührt.
+  `dpkg -i`), Pip/npm des Hosts brauchen den Paket-Proxy (in
+  `~bot-hub/.config/pip/pip.conf` und `~bot-hub/.npmrc` hinterlegt – der
+  Squid-Listener 127.0.0.1:3131 ist genau dafür da). Die
+  MySQL-Container-/phpMyAdmin-Tests kollidieren mit der laufenden
+  Produktiv-Instanz (gleiche Netzwerknamen/-CIDR) und laufen nur auf einer
+  frischen Maschine oder im CI-Runner; auf der VM sind sie als bekannte
+  Umweltgrenze erwartet grün-im-Einzellauf. `release-scan` benötigt ein
+  `.git` – die VM ist Laufzeit-Deployment ohne Versionsgeschichte.
+  Offizielles Gate bleibt `npm test` auf Entwickler-Checkout/CI.
 - **Nach jedem Wechsel an `apply-docker-egress.py` beide Kopien aktualisieren**:
   `/opt/bot-hub/deploy/discord-egress/` UND das installierte
   `/usr/local/sbin/bot-hub-docker-egress` – der Hub-Preflight prüft über die
