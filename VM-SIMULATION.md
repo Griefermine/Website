@@ -43,7 +43,7 @@ docker exec -d bot-hub-vm bash -c \
 | Deploy-Fortschritt           | `docker exec bot-hub-vm tail -f /var/log/deploy-run9.log`                                                                                                       |
 | **Bot-Hub im Browser**       | **https://localhost:8443** (Self-Signed → Zertifikatswarnung mit „Fortgeschritten → fortfahren" bestätigen)                                                     |
 | HTTP-Variante (nur Redirect) | http://localhost:8080                                                                                                                                           |
-| SSH in die VM                | `ssh root@localhost -p 2222` (Passwort im persönlichen Vault; stand bis Maßnahme 41 in dieser Zeile und wurde aus dem Repo entfernt — Rotation nicht vergessen) |
+| SSH in die VM                | `ssh root@localhost -p 2222` (Passwort im persönlichen Vault; stand bis Maßnahme 41 in dieser Zeile und wurde entfernt — die VM ist eine wegwerfbare Testumgebung, nur auf Loopback erreichbar und wird am Ende gelöscht, daher keine Rotation nötig) |
 | Hub-Status (in der VM)       | `systemctl status bot-hub`                                                                                                                                      |
 | Hub-Logs (in der VM)         | `journalctl -u bot-hub -f`                                                                                                                                      |
 | VM stoppen / starten         | `docker stop bot-hub-vm` / `docker start bot-hub-vm`                                                                                                            |
