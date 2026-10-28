@@ -71,6 +71,14 @@ let accessFile = null;
 let access = { users: {} };
 
 const loadDotenv = () => {
+  // Maßnahme 42: Der Test-Modus erbt keine Produktiv-Konfiguration über den
+  // Arbeitsordner. Wer die Suite im Projektordner startet, holte sich sonst
+  // die `.env` des Dienstes in den Prozess – inkl. BOT_HUB_KEY_FILE: Tests,
+  // die Klartext in data/secrets erwarten, fanden plötzlich mit dem
+  // Master-Key verschlüsselte Umschläge vor (auf der VM reproduziert).
+  // Tests setzen ihre Konfiguration selbst; das systemd EnvironmentFile
+  // versorgt den echten Dienst.
+  if (process.env.BOT_HUB_TEST_MODE === '1') return;
   try {
     const content = readFileSync(join(process.cwd(), '.env'), 'utf8');
     for (const line of content.split(/\r?\n/)) {

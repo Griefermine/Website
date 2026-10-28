@@ -459,6 +459,17 @@ gehalten.
     rotieren!); Matrix-Harness schaltet `NODE_TLS_REJECT_UNAUTHORIZED`
     nur noch bei Loopback-`HUB_URL` ab.
 
+42. **`.env`-Injektion vergiftete Tests (Audit-Nachlese, VM-Reproduktion)**:
+    `auth.js` rief beim Import `loadDotenv()` über den CWD – im Projektordner
+    gestartet landete die produktive Konfiguration (`BOT_HUB_KEY_FILE`) im
+    Testprozess, und Klartext-Erwartungen trafen vault:v2-Umschläge. Jetzt
+    bleibt die Auto-`.env`-Lesehilfe dem Dev-Start ohne systemd vorbehalten;
+    bei `BOT_HUB_TEST_MODE=1` wird sie übersprungen. Die verbleibenden
+    VM-Suiten-Fehlschläge sind Umweltgrenzen: der gehärtete Host hat kein
+    DNS, Host-seitiges `pip` (nur die Tests, nicht der Bot-Betrieb) findet
+    daher keinen PyPI-Weg – der Produktionspfad läuft über Container und
+    freigegebenen Proxy (9/9-Matrix).
+
 **Bewusst zurückgestellt (mit Begründung):** Audit WEB-05 (Ticket-Login kann
 identität seitlich wechseln – benötigt Pre-Auth-Bindung über den OAuth-Flow,
 kein schneller Patch ohne Login-Regression; Panel-Tickets sind
@@ -475,10 +486,12 @@ dieser Liste.
   nicht mehr durch den Egress-Proxy – Pakete als `.deb` hereinkopieren und
   `dpkg -i`), und sie dürfen nicht gegen die produktive Last laufen: ein
   Suite-Lauf bei 6-fach verlangsamter VM ließ 29 Tests in Timeouts kippen,
-  dieselben Tests sind einzeln grün. Außerdem gehören in die Testumgebung
-  keine Vault-Pfade: die produktive `.env` (`BOT_HUB_KEY_FILE`) darf im
-  Testprozess nicht wirksam werden, sonst finden
-  Klartext-Erwartungs-Assertions umgeschlagene Werte vor.
+  dieselben Tests sind einzeln grün. Die eigentliche Vault-Falle (Maßnahme 42):
+  `server/auth.js` injizierte beim Import die `.env` des **Arbeitsordners**
+  in `process.env` – ein Testlauf aus `/opt/bot-hub` erbte so den
+  produktiven `BOT_HUB_KEY_FILE` und fand in `data/secrets` Umschläge statt
+  Klartext vor. Der Test-Modus (`BOT_HUB_TEST_MODE=1`) lädt die `.env`
+  jetzt grundsätzlich nicht mehr; Dev- und systemd-Betrieb sind unberührt.
 - **Nach jedem Wechsel an `apply-docker-egress.py` beide Kopien aktualisieren**:
   `/opt/bot-hub/deploy/discord-egress/` UND das installierte
   `/usr/local/sbin/bot-hub-docker-egress` – der Hub-Preflight prüft über die
