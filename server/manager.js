@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import {
+  chmodSync,
   closeSync,
   cpSync,
   existsSync,
@@ -83,6 +84,7 @@ import {
   cleanupExecEnvFile,
   dependencyRunArgs,
   ensureContainer,
+  ensureDotnetCliHome,
   execArgs,
   stopContainer,
   removeContainer,
@@ -1440,8 +1442,10 @@ const parseCommand = (command) => {
 };
 
 /**
- * Ein Programm im eigenen Ordner des Bots, z.B. der Gradle-Wrapper
- * `./gradlew`.
+ * Ein Programm im eigenen Ordner des Bots: beim Bauen der Gradle-Wrapper
+ * `./gradlew`, beim Start zusätzlich das vom Sprach-Preset erzeugte Programm
+ * selbst – Rusts Standard-Startbefehl heißt `./target/release/bot`, und ohne
+ * diese Freigabe könnte der Hub sein eigenes Preset nicht ausführen.
  *
  * Dafür gilt mehr als "beginnt mit ./": das Ziel muss eine reguläre Datei im
  * Workspace sein, ausführbar, und nach `realpath` immer noch darin liegen. Ein
@@ -1449,8 +1453,13 @@ const parseCommand = (command) => {
  */
 const WORKSPACE_PROGRAMS = new Set(['./gradlew', './mvnw', './gradlew.bat']);
 
-const workspaceProgram = (executable, dir) => {
-  if (!WORKSPACE_PROGRAMS.has(executable)) return null;
+const workspaceProgram = (executable, dir, allowAny = false) => {
+  if (
+    allowAny
+      ? !executable.startsWith('./')
+      : !WORKSPACE_PROGRAMS.has(executable)
+  )
+    return null;
   const candidate = resolve(dir, executable);
   let info;
   let real;
@@ -1473,7 +1482,9 @@ const commandSpec = (bot, command, dir, purpose = 'start') => {
   const [executable, ...args] = tokens;
   // `./gradlew` ist der einzige erlaubte Pfad: eine Datei im eigenen Ordner des
   // Bots, nicht irgendwo im Dateisystem.
-  const local = workspaceProgram(executable, dir);
+  // Beim Start ist jede ausführbare Datei im Workspace zulässig (Presets wie
+  // `./target/release/bot`); beim Bauen bleibt die Liste eng auf die Wrapper.
+  const local = workspaceProgram(executable, dir, purpose === 'start');
   if (
     !local &&
     (isAbsolute(executable) ||
@@ -1711,6 +1722,10 @@ const installDependencies = async (bot, dir, { state, force = false } = {}) => {
     depsStatus: 'installing',
     depsCommand: installLabel(plan),
   });
+  // Maßnahme 35: ohne Erststart-Sentinel im DOTNET_CLI_HOME crasht jeder
+  // dotnet-Befehl als Nicht-Root im Container (NuGet-Migrations-Mutex).
+  if (containerRuntimeEnabled() && bot.language === 'csharp')
+    await ensureDotnetCliHome(bot, PROJECT_ROOT);
   pushLine(
     bot.id,
     'system',
@@ -2315,6 +2330,30 @@ const normaliseConfig = (input, existing) => {
 const auditTag = (id, actor) =>
   `[hub] BOT_DELETE bot=${id} actor=${actor ?? '-'} ts=${new Date().toISOString()}`;
 
+/* Go-Modul-Cache & Co. lagern ihre Dateien in Verzeichnissen mit Modus
+ * 0555 – bewusst schreibgeschützt. Ohne Owner-Schreibbit scheitern dort
+ * sowohl unlink als auch rmdir, und die Bot-Löschung blieb mit EACCES
+ * stehen (Maßnahme 32). Vor dem Entfernen erhalten deshalb alle
+ * Verzeichnisse im (längst validierten) Bot-Ordner das Owner-Schreibbit;
+ * symlinks und tiefer als 64 Ebenen wird nicht gefolgt. Einzelpfade
+ * scheitern still – die folgende rm-Spur entscheidet über Erfolg oder
+ * Cleanup-Fehler. */
+export const openDirsForRemoval = (root, depth = 0) => {
+  if (depth > 64) return;
+  try {
+    const st = lstatSync(root);
+    if (!st.isDirectory()) return;
+    chmodSync(root, st.mode | 0o700);
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      if (entry.isDirectory() && !entry.isSymbolicLink())
+        openDirsForRemoval(join(root, entry.name), depth + 1);
+    }
+  } catch {
+    /* restlos ignorieren: wenn schon das Begehen klemmt, muss rm selbst
+     * sehen, ob es ohne weiterkommt – der attempt-Wrapper meldet es. */
+  }
+};
+
 const deleteBotCompletely = async (bot, actor) => {
   const id = bot.id;
   // Fail-fast vor jeder irreversiblen Aktion: eine ungültige ID darf nicht
@@ -2426,6 +2465,7 @@ const deleteBotCompletely = async (bot, actor) => {
         throw new Error('Bot-Verzeichnis ist ungültig');
       try {
         lstatSync(botDirectory);
+        openDirsForRemoval(botDirectory);
         rmSync(botDirectory, { recursive: true });
       } catch (error) {
         if (error?.code !== 'ENOENT') throw error;

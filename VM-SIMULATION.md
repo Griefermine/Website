@@ -296,6 +296,85 @@ einem Root-Hub (Container dann als Image-Benutzer 999 statt Demotion).
      Provisionierer eine Wegwerf-env-file an (0600, im Finally immer gelöscht);
      Fake-Modelle können das nicht fangen (sie erzwingen keine env-file), die
      Live-VM schon – Regressionstest hält immerhin das neue Verhalten fest.
+ 29. **Der Hub konnte seine eigenen Sprach-Presets nicht starten**: Rusts
+     vorgegebener Startbefehl `./target/release/bot` ist ein Pfadprogramm –
+     die Befehlsprüfung ließ als ausführbares Programm aber nur die
+     Sprach-Runtime und die drei Build-Wrapper (`./gradlew` & Co.) zu. Folge:
+     jeder Rust-Bot (und jedes Preset mit eigenem Binary) starb mit
+     „Das Programm muss aus der freigegebenen Runtime stammen“, noch ehe der
+     Container lief. Zwei Fehlerstellen: (a) die Prüfung erlaubte
+     Workspace-Programme nicht beim Startzweck, (b) `execArgs` gab den
+     Host-Pfad des Prüfers direkt an `docker exec` weiter, wo er nicht
+     existiert. Fix: beim Zweck `start` ist jede ausführbare Datei im
+     Workspace zulässig (identische Wachen: reguläre Datei, Ausführbit,
+     `realpath` bleibt im Workspace – ein SymLink nach `/bin/sh` scheitert
+     weiterhin); Bauen bleibt auf die Wrapper-Liste eng. `execArgs` bildet
+     Host-Pfade jetzt auf `/workspace/…` ab, analog zum Paket-Runner.
+     Regressionstests: drei in `commands.test.js`, zwei in
+     `containers.test.js` (520/520 gesamt).
+ 30. **Go-Sumdb-Ablage lag auf der read-only-Rootfs**: Das golang-Bild setzt
+     `GOPATH=/go`; `go get` verifiziert Modulsummen unter `/go/pkg/sumdb` und
+     scheiterte dort mit „no such file or directory“ – jede Go-Anlage war
+     damit baunfähig, obwohl `GOMODCACHE`/`GOCACHE` bereits in den Workspace
+     zeigten. Fix: `GOPATH=/workspace/.cache/go` in Paket-Runner UND
+     Bot-Container (die golang-Standardpfade bleiben als Cache-Ziele
+     konsistent). Regressionstest prüft jetzt alle drei Go-Cache-Variablen.
+ 31. **Maven brauchte eine settings.xml – JVM-Props und Env fielen ins
+     Leere**: Im DNS-freien Paketnetz wollte Maven `repo.maven.apache.org`
+     selbst auflösen („Temporary failure in name resolution“), Java- und
+     Kotlin-Bau unmöglich. Erst startskript-bedingt JAVA_TOOL_OPTIONS
+     vermutet (MRELEASE-1073), dann per Probe auf dem Paketnetz bestätigt:
+     Maven 3.9s Native-Transport ignoriert JVM-Proxy-Properties (MAVEN_OPTS
+     und JAVA_TOOL_OPTIONS, selbst wenn die JVM sie pickt) UND
+     HTTP(S)-PROXY-Variablen – einzig `-s settings.xml` wirkt. Fix: Der
+     Paket-Runner schreibt `.bot-hub/maven-settings.xml` (nur interne
+     Proxy-Adresse, keine Geheimnisse) in den Workspace und übergibt sie
+     über `MAVEN_ARGS` (Maven ≥ 3.9.7), ohne Installations-Kommandos
+     anzufassen. Regressionstest prüft Datei-Inhalt und MAVEN_ARGS.
+ 32. **Der Go-Modul-Cache blockierte die Bot-Löschung**: `go` legt seine
+     Cache-Verzeichnisse bewusst mit Modus 0555 an – ohne Owner-Schreibbit
+     scheitern dort unlink wie rmdir, und der `files`-Cleanup-Schritt des
+     Löschens blieb mit EACCES stehen (DELETE 500, `cleanup_failed`,
+     wiederholt am selben Punkt). Fix: vor `rmSync` öffnet ein beherzter
+     Rundgang (`openDirsForRemoval`) allen Verzeichnissen im bereits
+     validierten Bot-Ordner das Owner-Schreibbit – Symlinks werden nicht
+     gefolgt, Tiefen über 64 Ebenen abgebrochen; Einzelpfade scheitern
+     still, die rm-Spur meldet echte Fehler. Zwei Regressionstests
+     (EACCES-Fall + Symlink-Nichtbefolgung). Nebenbefund aus demselben
+     Lauf: die Härtung `nosuid,nodev` auf dem Workspace-Bind lehnt dieser
+     Docker-Daemon für `--volume` ab („invalid mode“) und blieb daher aus –
+     wirkungslos ohnehin, da alle Container `no-new-privileges` +
+     `cap-drop ALL` tragen.
+ 33. **JDA-Proxy: `WebSocketFactory.setProxy` existiert nicht** – der
+     Matrix-Java-Bau scheiterte mit „cannot find symbol“. Per javap am
+     echten Jar (nv-websocket-client 2.14, JDA 5.0.0-beta.13) verifiziert:
+     Die API heißt `factory.getProxySettings().setServer(host).setPort(port)`
+     (HTTP-CONNECT), REST separat via `setHttpClientBuilder(OkHttpClient…
+     .proxy(java.net.Proxy))`; einen `GatewayProxyBuilder` gibt es in
+     beta.13 nicht mehr. Harness (Java + Kotlin) accordingly berichtigt –
+     lokaler javac-Smoke-Test gegen die Original-Jars ist grün.
+ 34. **Docker erzwingt `noexec` auf jedem `--tmpfs`** – selbst wenn man nur
+     `rw,nosuid` übergibt, mountet der Daemon `nodev,noexec` dazu (im
+     Vergleichscontainer per /proc/mounts belegt). `go run` baut seine
+     Binary nach /tmp und starb dort mit „fork/exec …: permission denied“.
+     Fix: `TMPDIR`/`GOTMPDIR` zeigen jetzt in den ausführbaren Workspace
+     (`.cache/tmp`), der Ordner wird beim Planen von Bot-Start und
+     Paket-Runner vorgelegt. Regressionstests prüfen beide Env-Dateien.
+ 35. **NuGets „NuGet-Migrations“-Mutex kann in dieser Laufzeit nie
+     gelingen**: Erster Verdacht (Capabilities/seccomp/IPC) widerlegte sich
+     per Gegenprobe – selbst `seccomp=unconfined` + `--ipc host` änderte
+     nichts. Der wahre Grund, aus dem .NET-Runtime- und NuGet-Quellcode
+     belegt: .NET 8s benannte Mutexe sind eine reine Prozess-Tabelle, aber
+     NuGet übergibt den Namen ohne führenden Slash; die Laufzeit mappt ihn
+     auf das Windows-Gerät `/dev/Null→NuGet-Migrations` → ENXIO, der
+     Konstruktion wirft immer. Vor jedem Restore hilft nur, den
+     Migrations-Marker `$XDG_DATA_HOME/NuGet/Migrations/1` vorzuhalten
+     (existiert er, ist der Läufer no-op) – zusätzlich zu den
+     Erststart-Sentinels des Bildes (Punkt 1, sonst crasht vorher schon der
+     CLI-Konfigurator). Ein interner root-Lauf `ensureDotnetCliHome` legt
+     beides vor dem ersten Build an und `chown`t auf den
+     Workspace-Eigentümer; `XDG_DATA_HOME`/`DOTNET_CLI_HOME` zeigen in den
+     Workspace. Gegenprobe im Paket-Netz: „Restored Bot.csproj (7 s)“ ✓.
 
 ### Betriebslehre
 
@@ -369,3 +448,84 @@ docker exec bot-hub-vm grep -cE "vault:v[12]:" /opt/bot-hub/data/secrets/*.env
 
 Rollback: Die `BOT_HUB_KEY_FILE`-Zeile kann nur entfernt werden, solange noch keine Umschläge geschrieben wurden – sobald Werte versiegelt sind, ist der Key zum Lesen zwingend nötig.
 
+
+## Sprach-Matrix: alle unterstützten Sprachen live prüfen
+
+`tools/language-matrix.mjs` legt pro Sprache (Python, JavaScript, TypeScript,
+Java, Kotlin, Go, C#, Rust, Sonstiges) einen Testbot an, startet ihn und
+prüft drei Beweise: Discord-Gateway-Login (Logzeile `READY <sprache>`),
+KV-Schreiben über `PUT /api/hub/db/matrix/probe:<sprache>` und Panel-
+Lebenszeichen (`POST /api/hub/state`). Bots laufen **seriell** – ein
+Discord-Token verträgt keine gleichzeitigen Sitzungen. Der Test-Token wird
+nur über die Umgebungsvariable `DISCORD_TEST_TOKEN` übergeben (landet als
+`secretEnv` im Vault, wird nie gedruckt).
+
+```
+# einmalig: Bilder vorziehen, damit die Matrix nicht an langen Pulls hängt.
+# Die VM-Docker-Daemons pullen über das systemd-Drop-in-Proxy (Squid 3128);
+# stabile Referenzen sind die Digests aus docker inspect der Hub-Images:
+#   docker exec bot-hub-vm docker pull <name>@sha256:<digest>
+DISCORD_TEST_TOKEN=$(cat /tmp/opencode/.discord_test_token) \
+BOT_SESSION=<id aus data/sessions.json> \
+node tools/language-matrix.mjs                 # alle Sprachen
+# --only=go,csharp | --keep | --list | --cleanup
+# --signature: lege meinen Auswahl-Bot „Kommandante“ (Go, /status mit KV-Zähler) an
+```
+
+KV-Nachweis direkt in MySQL (während des Laufs – Zeilen fallen mit dem Bot):
+
+```
+# /tmp/opencode/kv-check.sh in die VM kopieren; das Passwort wird darin aus
+# dem Vault (db/BOT_HUB_DB_PASSWORD) gelöst, der mysql-Client läuft im
+# Container bot-hub-mysql (im VM-Host selbst ist kein mysql installiert):
+docker exec bot-hub-vm bash /tmp/kv-check.sh
+# Kern der Abfrage: SELECT … FROM bot_hub.bot_store WHERE collection IN
+# ('matrix','commander')   – Datenbank heißt bot_hub, Tabelle bot_store.
+```
+
+Besonderheiten beim Bot-Code (alle vom Hub gesetzt, nur vom Bot-Code zu
+nutzen): Discord geht im Bot-Netz **nur über den Squid-CONNECT-Proxy**
+(`HTTPS_PROXY`/`BOT_HUB_DISCORD_PROXY`): discord.py `proxy=`, discordgo
+`Dialer.Proxy`, JDA beta.13 hat KEIN `setDefaultProxy` mehr – Gateway über
+`WebSocketFactory.setProxy`, REST über `setHttpClientBuilder(OkHttpClient…)` –
+Achtung: der Factory-Proxy heißt `getProxySettings().setHost(…).setPort(…)`
+(nackte Hosts; `setServer(String)` will eine URI und setzt still leer);
+.NET: Env-Proxy wird ignoriert, Discord.Net 3.x verlangt explizit
+`DefaultRestClientProvider.Create(true, proxy)` +
+`DefaultWebSocketProvider.Create(proxy)`; Rust manuell CONNECT + rustls –
+der dortige „tls handshake eof“ war KEIN rustls-/Post-Quantum-Problem
+(Gegenproben mit identischer Config handshakten durch denselben Squid),
+sondern eine Escape-Falle: aus JS-Template-Literalen geschriebenes
+einfaches `\r\n` wird zu ECHTEN CRLFs im Rust-Quelltext, und rustc
+normalisiert CRLF in String-Literals zu LF – der Bot sandte ein
+LF-only-CONNECT, das Squid mit 200 beantwortete, OHNE auf Tunnel zu
+schalten. Vorlagen daher immer mit doppelten Backslashes (`\\r\\n`)
+schreiben; ein lokaler Sink-Proxy (HTTP 200 + Byte-Dump) überführt solche
+Fälle in Minuten. Die
+Hub-API (`BOT_HUB_URL`) ist davon ausgenommen (`NO_PROXY`).
+
+**discord.js-Falle (Bibliotheks-, kein Hub-Fehler):** 14.27 verbindet den
+Gateway im WS-Worker über `globalThis.WebSocket` (undici) – ohne jede
+Agent-Unterstützung; `ws.agent`-Optionen verpuffen, die Verbindung stirbt
+lautlos mit Close-Code 1006 (kein DNS im Bot-Netz). Der Harness startet JS/TS
+darum über einen Boot-Shim (`ws-boot.cjs`/`ws-boot.mts` – auf .ts endet der
+tsx-Transform mit Top-Level-Await-Fehler, nur .mts läuft als ESM), der VOR dem Laden
+der Bibliothek die Module auf der Platte patcht (und damit Main-Thread und
+Worker erwischt): undici-Zweig abgeschaltet, `ws` der
+`HttpsProxyAgent` untergeschoben. Tückischster Teil: der `ws`-Wrapper muss
+seine Selbstreferenz auf sich selbst umbiegen (`ProxyWebSocket.WebSocket =
+ProxyWebSocket`), denn ESM-Named-Import `{ WebSocket } from 'ws'` liest
+`module.exports.WebSocket` – die kopierte Original-Klasse hätte den
+undici-Pfad trotz Patch wieder offen gelassen. Diskussionswürdig für
+upstream: Proxy-Doku von discord.js aktualisiert sich nicht zu
+@discordjs/ws 1.x.
+
+„Sonstiges“ (ubuntu-Basis, kein Python/Node, kein apt-Archiv
+im Paketnetz) beweist nur die Hub-Schiene per `/dev/tcp` – Discord ist damit
+in dieser Sprache realistisch nicht prüfbar. Rust nutzt bewusst ein
+schlankes Cargo-Setup (`tokio-tungstenite` + rustls) statt Serenity: der
+Serenity-Bau wäre in der VM (2 CPU) ein 20-Minuten-Monster; die Schiene
+(Cargo-Build → Workspace-Binary → Start) ist identisch geprüft.
+
+**Bug 29** (siehe Bug-Liste) war Voraussetzung: ohne ihn startet kein
+Rust-Preset-Bot.

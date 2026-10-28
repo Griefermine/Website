@@ -11,8 +11,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   chmodSync,
+  existsSync,
+  mkdirSync,
   mkdtempSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -20,7 +23,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { LANGUAGES, fillDeps } from '../server/languages.js';
-import { __testing } from '../server/manager.js';
+import { __testing, openDirsForRemoval } from '../server/manager.js';
 
 const { commandSpec, resolveInstallPlan } = __testing;
 
@@ -191,6 +194,59 @@ test('Befehlsprüfung: Programme aus dem freigegebenen Runtime', async (t) => {
     );
   });
 
+  await t.test('./Programme des eigenen Baus sind beim Start erlaubt', () => {
+    // Das Rust-Preset startet `./target/release/bot` – der Hub muss seine
+    // eigenen Sprach-Presets ausführen können (Bug 29).
+    const rust = {
+      language: 'rust',
+      framework: 'Serenity',
+      command: '',
+      depsCheck: '',
+      depsInstall: '',
+    };
+    const built = workspace();
+    mkdirSync(join(built, 'target', 'release'), { recursive: true });
+    writeFileSync(join(built, 'target', 'release', 'bot'), '#!/bin/sh\n', {
+      mode: 0o755,
+    });
+    const spec = commandSpec(rust, './target/release/bot', built, 'start');
+    assert.equal(spec.executable, join(built, 'target', 'release', 'bot'));
+  });
+
+  await t.test('ein fehlendes ./Programm bleibt beim Start abgelehnt', () => {
+    const rust = {
+      language: 'rust',
+      framework: 'Serenity',
+      command: '',
+      depsCheck: '',
+      depsInstall: '',
+    };
+    assert.throws(
+      () => commandSpec(rust, './target/release/bot', workspace(), 'start'),
+      /freigegebenen Runtime/,
+    );
+  });
+
+  await t.test('./SymLink nach draußen wird beim Start abgelehnt', () => {
+    const linked = workspace();
+    try {
+      symlinkSync('/bin/sh', join(linked, 'bot'));
+    } catch {
+      return;
+    }
+    const custom = {
+      language: 'custom',
+      framework: 'Shell',
+      command: '',
+      depsCheck: '',
+      depsInstall: '',
+    };
+    assert.throws(
+      () => commandSpec(custom, './bot', linked, 'start'),
+      /freigegebenen Runtime/,
+    );
+  });
+
   await t.test('absolute Pfade bleiben abgelehnt', () => {
     assert.throws(
       () => commandSpec(bot, '/bin/sh -c ls', dir, 'dependency'),
@@ -237,4 +293,44 @@ test('Befehlsprüfung: Programme aus dem freigegebenen Runtime', async (t) => {
 test('fillDeps lässt leere Platzhalter nicht als Text stehen', () => {
   assert.equal(fillDeps('x {package}', { package: '' }), 'x ');
   assert.equal(fillDeps('x {missing}', {}), 'x {missing}');
+});
+
+test('read-only Cache-Verzeichnisse blockieren die Löschung nicht (Maßnahme 32)', () => {
+  // Go-Modul-Cache legt Verzeichnisse im Modus 0555 an – ohne Öffnung
+  // scheitert rmSync mit EACCES (als root-Prozess hingegen nicht, deshalb
+  // läuft der Erwartungsteil nur unter unprivilegierten Usern).
+  const root = mkdtempSync(join(tmpdir(), 'bot-hub-open-'));
+  const cache = join(root, 'workspace', '.cache');
+  const kalt = join(cache, 'go-mod', 'x@v1', '.github');
+  mkdirSync(kalt, { recursive: true });
+  writeFileSync(join(kalt, 'workflows.yml'), 'x');
+  writeFileSync(join(cache, 'readme'), 'x');
+  chmodSync(join(cache, 'go-mod', 'x@v1'), 0o555);
+  chmodSync(kalt, 0o555);
+  if (typeof process.getuid === 'function' && process.getuid() !== 0) {
+    assert.throws(
+      () => rmSync(join(root, 'workspace'), { recursive: true }),
+      /EACCES/,
+      '0555-Verzeichnis muss rmSync ohne Öffnung blockieren',
+    );
+  }
+  openDirsForRemoval(join(root, 'workspace'));
+  rmSync(join(root, 'workspace'), { recursive: true, force: true });
+  assert.ok(!existsSync(join(root, 'workspace')));
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('openDirsForRemoval folgt keinen Symlinks (Maßnahme 32)', () => {
+  const root = mkdtempSync(join(tmpdir(), 'bot-hub-link-'));
+  const innen = join(root, 'workspace');
+  const gezielt = join(root, 'fremd');
+  mkdirSync(join(innen, 'd'), { recursive: true });
+  mkdirSync(gezielt);
+  symlinkSync(gezielt, join(innen, 'd', 'zeiger'));
+  chmodSync(gezielt, 0o555);
+  openDirsForRemoval(innen);
+  // Der Zielordner des Symlinks bleibt unverändert 0555 – es wurde nur
+  // der Symlink-Eintrag selbst (nicht sein Ziel) begangen.
+  assert.equal(statSync(gezielt).mode & 0o777, 0o555);
+  rmSync(root, { recursive: true, force: true });
 });

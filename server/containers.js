@@ -4,6 +4,7 @@ import {
   closeSync,
   existsSync,
   fchmodSync,
+  mkdirSync,
   openSync,
   unlinkSync,
   writeFileSync,
@@ -21,6 +22,27 @@ export const PRODUCTION_BOT_GATEWAY = '172.30.250.1';
 export const PRODUCTION_BOT_HUB_PORT = 8788;
 const DISCORD_EGRESS_PROXY = 'http://172.30.250.1:3128';
 const DEPENDENCY_EGRESS_PROXY = 'http://172.30.251.1:3128';
+
+/* Maven 3.9s Native-Transport ignoriert JVM-Proxy-Properties UND
+ * Umgebungsvariablen – eine Probe auf dem Paketnetz ließ nur eine
+ * settings.xml über `-s` gelten (Maßnahme 31). Die Datei legt der
+ * Paket-Runner in den Workspace; Maven 3.9.7+ liest zusätzliche
+ * Kommandoargumente aus MAVEN_ARGS, wodurch kein Installations-Kommando
+ * angefasst werden muss. */
+const dependencyProxyUrl = new URL(DEPENDENCY_EGRESS_PROXY);
+const MAVEN_SETTINGS_CONTENT =
+  `<?xml version="1.0" encoding="UTF-8"?>\n` +
+  '<settings>\n  <proxies>\n' +
+  ['https', 'http']
+    .map(
+      (protocol) =>
+        `    <proxy><id>bot-hub-${protocol}</id><active>true</active>` +
+        `<protocol>${protocol}</protocol>` +
+        `<host>${dependencyProxyUrl.hostname}</host>` +
+        `<port>${dependencyProxyUrl.port}</port></proxy>`,
+    )
+    .join('\n') +
+  '\n  </proxies>\n</settings>\n';
 const containerNetwork = () => {
   const configured = String(process.env.BOT_HUB_CONTAINER_NETWORK ?? '').trim();
   const production = process.env.NODE_ENV === 'production';
@@ -271,6 +293,10 @@ export const containerCreateArgs = (bot, projectRoot) => [
   `bot-hub.config=${containerSignature(bot, projectRoot)}`,
   ...hostMapping(),
   '--volume',
+  // Hinweis: nosuid/nodev hier abgelehnt – dieser Docker-Daemon kennt die
+  // Modi für --volume nicht („invalid mode“); setuid-Bits sind ohnehin
+  // wirkungslos, weil der Container mit no-new-privileges + cap-drop ALL
+  // läuft (Maßnahme-29-Sicherheitsprüfung).
   `${workspacePath(bot, projectRoot)}:/workspace`,
   ...sharedVolume(projectRoot),
   // Wichtiger Fix: vorher lief hier `tail tail -f /dev/null` (ein 'tail' zu
@@ -605,6 +631,20 @@ export const execArgs = (bot, projectRoot, dir, command, env = {}) => {
   containerEnv.CARGO_TARGET_DIR = '/workspace/target';
   containerEnv.GOMODCACHE = '/workspace/.cache/go-mod';
   containerEnv.GOCACHE = '/workspace/.cache/go-build';
+  containerEnv.GOPATH = '/workspace/.cache/go';
+  // Docker erzwingt auf JEDEM --tmpfs zusätzlich noexec (daemon-verifiziert)
+  // – 'go run' baut seine Binary nach /tmp und kann sie dort nicht starten
+  // („fork/exec …: permission denied“). TMPDIR/GOTMPDIR verlegen Baurüste
+  // in den Workspace, der ausführbar eingebunden ist (Maßnahme 34).
+  containerEnv.TMPDIR = '/workspace/.cache/tmp';
+  containerEnv.GOTMPDIR = '/workspace/.cache/tmp';
+  containerEnv.DOTNET_CLI_HOME = '/workspace/.cache/dotnet-cli-home';
+  try {
+    // go akzeptiert kein fehlendes GOTMPDIR – Ordner vorab anlegen.
+    mkdirSync(join(workspace, '.cache', 'tmp'), { recursive: true });
+  } catch {
+    /* bleibt read-only, meldet go den Fehler selbst */
+  }
   containerEnv.GRADLE_USER_HOME = '/workspace/.cache/gradle';
   containerEnv.MAVEN_OPTS = '-Dmaven.repo.local=/workspace/.cache/maven';
   containerEnv.NUGET_PACKAGES = '/workspace/.cache/nuget';
@@ -627,10 +667,60 @@ export const execArgs = (bot, projectRoot, dir, command, env = {}) => {
     // Older runtimes ignore this and will fail closed on the internal network.
     containerEnv.NODE_USE_ENV_PROXY = '1';
   }
+  // Ein im Workspace gefundenes Programm (Wrapper oder Preset-Binary wie
+  // `./target/release/bot`) liegt im Container unter /workspace – der
+  // Host-Pfad, den die Prüfung ergibt, gilt dort nicht. Die Prüfung muss
+  // vor der Secret-Datei laufen: wirft sie, kennt der Aufrufer den
+  // envFile-Pfad nie und die Datei bliebe in /tmp zurück.
+  let executable = command.executable;
+  if (isAbsolute(executable)) {
+    const executableRelative = relative(workspace, executable);
+    if (executableRelative.startsWith('..') || isAbsolute(executableRelative))
+      throw new Error('Startprogramm liegt außerhalb des Bot-Workspace.');
+    executable = `/workspace/${executableRelative}`;
+  }
   const envFile = writeExecEnvFile(containerEnv);
   if (envFile) args.push('--env-file', envFile);
-  args.push(nameOf(bot), command.executable, ...command.args);
+  args.push(nameOf(bot), executable, ...command.args);
   return { args, envFile };
+};
+
+/* dotnet SDK: Zwei Fallen in der Sandbox. (1) Das Bild trägt sein
+ * Erststart-Sentinel unter /root – ein Runner mit anderer UID würde den
+ * CLI-Konfigurator starten. (2) NuGet prüft vor jeder Aktion einen globalen
+ * Mutex „NuGet-Migrations“; dem Namen fehlt der führende Slash, .NET mappt
+ * ihn auf /dev/Null→NuGet-Migrations → ENXIO („cannot open the device or
+ * file specified“) – in dieser Laufzeit kann der Aufruf NIEMALS gelingen,
+ * weder mit Capabilities noch ohne Seccomp. Einziger Ausweg: existiert der
+ * Migrations-Marker $XDG_DATA_HOME/NuGet/Migrations/1, ist der Läufer
+ * komplett no-op (NuGet-Quellcode belegt). Beide Dateien legt ein
+ * interner root-Lauf vor dem ersten Build an: versionstreue Sentinel aus
+ * dem Bild, Marker als leere Datei; cp -n idempotent und chown gibt alles
+ * an den Workspace-Eigentümer – root-eigene Reste würden sonst den
+ * Lösch-Cleanup blockieren (Maßnahme 32/35). */
+export const ensureDotnetCliHome = async (bot, projectRoot) => {
+  const workspace = workspacePath(bot, projectRoot);
+  const args = [
+    'run',
+    '--rm',
+    '--name',
+    `bot-hub-dotnet-init-${randomUUID()}`,
+    '--entrypoint',
+    'sh',
+    '--network',
+    'none',
+    '-v',
+    `${workspace}:/workspace`,
+    imageOf(bot),
+    '-c',
+    'mkdir -p /workspace/.cache/dotnet-cli-home/.dotnet && find /root/.dotnet -maxdepth 1 \\( -name "*.dotnetFirstUseSentinel" -o -name "*.toolpath.sentinel" \\) -exec cp -n {} /workspace/.cache/dotnet-cli-home/.dotnet/ \\; && mkdir -p /workspace/.cache/xdg-data/NuGet/Migrations && touch /workspace/.cache/xdg-data/NuGet/Migrations/1 && chown -R "$(stat -c %u /workspace)":$(stat -c %g /workspace) /workspace/.cache/dotnet-cli-home /workspace/.cache/xdg-data',
+  ];
+  try {
+    await run(args);
+  } catch {
+    /* Kein Sentinel oder Docker-Fehler: weiterlaufen lassen, das nächste
+     * dotnet-Kommando meldet den echten Grund ins Bot-Protokoll. */
+  }
 };
 
 /**
@@ -692,6 +782,17 @@ export const dependencyRunArgs = (bot, projectRoot, dir, command, env = {}) => {
     CARGO_TARGET_DIR: '/workspace/target',
     GOMODCACHE: '/workspace/.cache/go-mod',
     GOCACHE: '/workspace/.cache/go-build',
+    TMPDIR: '/workspace/.cache/tmp',
+    GOTMPDIR: '/workspace/.cache/tmp',
+    DOTNET_CLI_HOME: '/workspace/.cache/dotnet-cli-home',
+    // NuGet schreibt Migrations-Marker nach $XDG_DATA_HOME (siehe
+    // ensureDotnetCliHome); ohne Marker crasht jede Restore-Aktion am
+    // namenslosen Unix-Mutex.
+    XDG_DATA_HOME: '/workspace/.cache/xdg-data',
+    // Das golang-Bild setzt GOPATH=/go (read-only Rootfs) – die Sumdb-Ablage
+    // (/go/pkg/sumdb) braucht ein schreibbares Ziel, sonst scheitert jede
+    // Modulverifikation (Bug 30).
+    GOPATH: '/workspace/.cache/go',
     GOPROXY: 'https://proxy.golang.org',
     GOSUMDB: 'sum.golang.org',
     GRADLE_USER_HOME: '/workspace/.cache/gradle',
@@ -708,6 +809,17 @@ export const dependencyRunArgs = (bot, projectRoot, dir, command, env = {}) => {
     'BOT_HUB_RUNTIME_TOKEN',
   ])
     delete containerEnv[key];
+  // Maßnahme 31: einziger Proxy-Kanal, den Maven 3.9s Native-Transport
+  // akzeptiert, ist eine settings.xml. Sie enthält keine Geheimnisse (nur
+  // die interne Paket-Proxy-Adresse) und liegt im Workspace, das Verzeichnis
+  // ist dem Container ohnehin als /workspace bekannt.
+  mkdirSync(join(workspace, '.bot-hub'), { recursive: true });
+  mkdirSync(join(workspace, '.cache', 'tmp'), { recursive: true });
+  writeFileSync(
+    join(workspace, '.bot-hub', 'maven-settings.xml'),
+    MAVEN_SETTINGS_CONTENT,
+  );
+  containerEnv.MAVEN_ARGS = '-s /workspace/.bot-hub/maven-settings.xml';
   const envFile = writeExecEnvFile(containerEnv);
   const containerName = `bot-hub-deps-${randomUUID()}`;
   const args = [
