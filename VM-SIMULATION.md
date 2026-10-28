@@ -461,14 +461,20 @@ gehalten.
 
 42. **`.env`-Injektion vergiftete Tests (Audit-Nachlese, VM-Reproduktion)**:
     `auth.js` rief beim Import `loadDotenv()` über den CWD – im Projektordner
-    gestartet landete die produktive Konfiguration (`BOT_HUB_KEY_FILE`) im
-    Testprozess, und Klartext-Erwartungen trafen vault:v2-Umschläge. Jetzt
-    bleibt die Auto-`.env`-Lesehilfe dem Dev-Start ohne systemd vorbehalten;
-    bei `BOT_HUB_TEST_MODE=1` wird sie übersprungen. Die verbleibenden
-    VM-Suiten-Fehlschläge sind Umweltgrenzen: der gehärtete Host hat kein
-    DNS, Host-seitiges `pip` (nur die Tests, nicht der Bot-Betrieb) findet
-    daher keinen PyPI-Weg – der Produktionspfad läuft über Container und
-    freigegebenen Proxy (9/9-Matrix).
+    gestartet landete die produktive Konfiguration (`BOT_HUB_KEY_FILE`,
+    `BOT_HUB_DB=mysql-container`) im Testprozess: Klartext-Erwartungen trafen
+    vault:v2-Umschläge, und ein Startschutz-Test-Hub wollte den echten
+    MySQL-Container übernehmen (im Extremfall als `BOT_HUB_MYSQL_RESET=1`-
+    Löscher). Gegenmaßnahmen: der Test-Modus überspringt die Auto-`.env`,
+    und `startup.test.js` pinnt `BOT_HUB_DB=sqlite` für seine Spawns.
+    Nebenbei überführt: SC-08 hatte mit `bots/**` auch die getrackte
+    Vorlagen-Bibliothek `bots/shared/api.js` (Tests + Container-Mount) aus
+    dem Index geworfen – sie bleibt per `!/bots/shared/` getrackt, nur die
+    Bot-UUID-Ordner sind ignoriert. Verbleibende VM-Suiten-Grenzen:
+    `release-scan` braucht ein `.git` (die VM ist Laufzeit-Deployment ohne
+    Versionsgeschichte), und Host-`pip`-Tests brauchen einen PyPI-Weg (der
+    gehärtete Host hat bewusst kein DNS; der Bot-Betrieb läuft über
+    Container und freigegebenen Proxy, 9/9-Matrix).
 
 **Bewusst zurückgestellt (mit Begründung):** Audit WEB-05 (Ticket-Login kann
 identität seitlich wechseln – benötigt Pre-Auth-Bindung über den OAuth-Flow,

@@ -46,5 +46,8 @@ release/
 # Maßnahme 41 (Audit SC-08/13): Bot-Startordner und -Workspaces sind
 # Laufzeitdaten – Bot-Namen, UUIDs und Inhalte haben in einem öffentlichen
 # Repo nichts verloren. Der Hub schreibt sie zur Laufzeit unter bots/.
-/bots/
+# Ausnahme (Maßnahme 42): bots/shared/ ist die getrackte Beispiel-Bibliothek
+# der Vorlagen – Tests und der Container-Mount (`/shared/api.js`) brauchen sie.
+/bots/*
+!/bots/shared/
 .devin/
