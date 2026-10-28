@@ -1,0 +1,28 @@
+# Gitleaks (OSS v8) für den CI-Historiengate (Maßnahme 43).
+# Der ACTION gitleaks-action@v2 verlangt von Organisations-Repos eine
+# Kauf-Lizenz; der Gate läuft deshalb als v8.18.4-Container (die letzte MIT-
+# Version) mit diesem Config. Alle vier Funde der echten Historie sind
+# Selbstreferenzen des eigenen Scanners bzw. synthetische Testwerte – die
+# Allowlist ist kuratiert, nicht pauschal:
+
+title = "Bot-Hub Historien-Scan"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Scanner-Selbstreferenzen und synthetische Testwerte"
+paths = [
+  '''scripts/scan-rules\.mjs''',
+  '''scripts/release-scan\.mjs''',
+  '''server/mysql\.js''',
+  '''test/secrets\.test\.js''',
+  '''test/api\.test\.js''',
+  '''test/security-audit\.test\.js''',
+]
+regexes = [
+  # Der Zufallsalphabet-Konstante in mysql.js fehlt jeder Geheimnis-Kontext.
+  '''PASSWORD_ALPHABET''',
+  # Synthetisches Token-Gerüst „123456789012345678“ in Tests – nie echt.
+  '''MTIzNDU2Nzg5MDEyMzQ1Njc4\.[A-Za-z0-9._-]+''',
+]

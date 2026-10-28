@@ -193,11 +193,17 @@ jobs:
 
       # Zusätzlich ein gepflegtes Tool: Mustererkennung im eigenen Code beweist
       # keine Secret-Freiheit, weil die eigene Musterliste das ist, was man
-      # zufällig schon kannte.
+      # zufällig schon kannte. Maßnahme 43: `gitleaks-action@v2` verlangt von
+      # Org-Repos eine Kauf-Lizenz („is an organization. License key is
+      # required“) – der Gate lief deshalb nie. Er fährt jetzt als Container
+      # mit v8.18.4, der letzten MIT-lizenzierten Version, und der kuratierten
+      # `.gitleaks.toml` (Selbstreferenzen des Scanners, synthetische Tests).
       - name: Historien-Scan (Gitleaks)
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          docker run --rm -v "$PWD:/repo" \
+            ghcr.io/gitleaks/gitleaks:v8.18.4 \
+            detect --source /repo --config /repo/.gitleaks.toml \
+            --redact --no-banner --exit-code 1
 
       - uses: actions/upload-artifact@v4
         with:

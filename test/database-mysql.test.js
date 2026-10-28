@@ -76,24 +76,12 @@ const put = async (bot, collection, key, value) => {
   return { bot, collection, key };
 };
 
-const freePort = async () =>
-  new Promise((done) => {
-    const server = createServer();
-    server.listen(0, '127.0.0.1', () => {
-      const { port } = server.address();
-      server.close(() => done(port));
-    });
-  });
-
 /** Hub-MySQL für diesen Lauf aufsetzen und die Zugangsdaten zurückgeben. */
 const eigenerContainer = async () => {
   const { provisionManagedMySql } = await import('../server/mysql.js');
-  const { readSecretValues } = await import('../server/secrets.js');
   const dir = mkdtempSync(join(tmpdir(), 'bot-hub-mysql-suite-'));
-  const port = await freePort();
   const projekt = {
     BOT_HUB_CONTAINER_PREFIX: `bothub-test${process.pid.toString(36)}`,
-    BOT_HUB_DB_PORT: String(port),
     BOT_HUB_MYSQL_STARTUP_TIMEOUT_MS: '300000',
   };
   const ergebnis = await provisionManagedMySql({
@@ -101,16 +89,20 @@ const eigenerContainer = async () => {
     projectRoot: dir,
   });
   const config = ergebnis.config;
+  // Maßnahme 43: der verwaltete Container veröffentlicht bewusst keinen
+  // Host-Port (Docker leitet auf internen Netzen nichts durch) – erreichbar
+  // ist er nur über seine feste Netzadresse, genau wie im Hub-Betrieb. Der
+  // Test verband sich bisher mit 127.0.0.1 auf einen nie veröffentlichten
+  // Port, deshalb meldete der CI-Gate seit je „MySQL nicht erreichbar“.
+  // Die Verbindung leitet der Hub selbst aus dem verwalteten Modus ab
+  // (BOT_HUB_DB=mysql-container): dasselbe Bild wie in der produktiven .env.
   return {
     dir,
     config,
     env: {
-      BOT_HUB_DB: 'mysql',
-      BOT_HUB_DB_HOST: '127.0.0.1',
-      BOT_HUB_DB_PORT: String(port),
-      BOT_HUB_DB_NAME: config.database,
-      BOT_HUB_DB_USER: config.user,
-      BOT_HUB_DB_PASSWORD: readSecretValues(dir, 'db').BOT_HUB_DB_PASSWORD,
+      BOT_HUB_DB: 'mysql-container',
+      BOT_HUB_CONTAINER_PREFIX: projekt.BOT_HUB_CONTAINER_PREFIX,
+      BOT_DASHBOARD_ROOT: dir,
     },
   };
 };
@@ -144,13 +136,27 @@ before(async () => {
   const { createTestStore, resolveDatabaseConfig } =
     await import('../server/database.js');
   store = createTestStore(resolveDatabaseConfig({ env }));
-  try {
-    await store.list('bereitheit', { collection: 'test' });
-    reachable = true;
-  } catch (error) {
-    console.error(
-      `[hub] MySQL nicht erreichbar, die MySQL-Tests laufen nicht: ${error.message}`,
-    );
+  // Maßnahme 43 (CI-Befund): der Provisionierer meldet „bereit“, aber die
+  // Härtung prüft von innen, während die Hafen-Weiterleitung nach außen
+  // Sekunden später greift. Auf dem Runner war der erste Connect Versuch ein
+  // ECONNREFUSED – und der Gate wurde rot, obwohl MySQL hochkam. Also:
+  // nachhostbare Bereitschaft mit Frist, nur für den selbstgestellten
+  // Container (eine extern gesetzte MySQL soll schnell fehlschlagen).
+  const frist = Date.now() + (withContainer ? 90_000 : 0);
+  for (;;) {
+    try {
+      await store.list('bereitheit', { collection: 'test' });
+      reachable = true;
+      break;
+    } catch (error) {
+      if (Date.now() >= frist) {
+        console.error(
+          `[hub] MySQL nicht erreichbar, die MySQL-Tests laufen nicht: ${error.message}`,
+        );
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
   }
 });
 
@@ -289,16 +295,28 @@ describe('Bot-Speicher über die API auf MySQL', () => {
 
   before(async () => {
     if (!reachable) return;
-    hubRoot = mkdtempSync(join(tmpdir(), 'bot-hub-db-mysql-'));
+    // Maßnahme 43: im Container-Lauf ist das Projekt desselben Bilds wie in
+    // der produktiven .env (BOT_HUB_DB=mysql-container) – das Datenverzeichnis
+    // des Provisionierers ist zugleich Hub-Wurzel, dort liegt das Secret.
+    hubRoot = withContainer
+      ? aufraeumenDir
+      : mkdtempSync(join(tmpdir(), 'bot-hub-db-mysql-'));
     Object.assign(process.env, {
       BOT_DASHBOARD_ROOT: hubRoot,
-      BOT_HUB_DB: 'mysql',
-      BOT_HUB_DB_HOST: env.BOT_HUB_DB_HOST,
-      BOT_HUB_DB_PORT: env.BOT_HUB_DB_PORT,
-      BOT_HUB_DB_NAME: env.BOT_HUB_DB_NAME,
-      BOT_HUB_DB_USER: env.BOT_HUB_DB_USER,
-      BOT_HUB_DB_PASSWORD: env.BOT_HUB_DB_PASSWORD,
       BOT_HUB_TEST_MYSQL: '1',
+      ...(withContainer
+        ? {
+            BOT_HUB_DB: 'mysql-container',
+            BOT_HUB_CONTAINER_PREFIX: env.BOT_HUB_CONTAINER_PREFIX,
+          }
+        : {
+            BOT_HUB_DB: 'mysql',
+            BOT_HUB_DB_HOST: env.BOT_HUB_DB_HOST,
+            BOT_HUB_DB_PORT: env.BOT_HUB_DB_PORT,
+            BOT_HUB_DB_NAME: env.BOT_HUB_DB_NAME,
+            BOT_HUB_DB_USER: env.BOT_HUB_DB_USER,
+            BOT_HUB_DB_PASSWORD: env.BOT_HUB_DB_PASSWORD,
+          }),
     });
     const { createServer: createApp } = await import('../server/manager.js');
     hub = createServer(createApp());

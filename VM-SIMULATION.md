@@ -376,7 +376,7 @@ einem Root-Hub (Container dann als Image-Benutzer 999 statt Demotion).
     Workspace-Eigentümer; `XDG_DATA_HOME`/`DOTNET_CLI_HOME` zeigen in den
     Workspace. Gegenprobe im Paket-Netz: „Restored Bot.csproj (7 s)“ ✓.
 
-### Sicherheitsaudit durch drei autonome Agenten (Maßnahmen 36–41)
+### Sicherheitsaudit durch drei autonome Agenten (Maßnahmen 36–43)
 
 Vor der Abnahme liefen drei read-only Security-Agenten über je eine Domäne
 (Web/API/Auth, Sandbox/Ausführung, Tooling/Supply-Chain). Befunde wurden
@@ -475,6 +475,27 @@ gehalten.
     Versionsgeschichte), und Host-`pip`-Tests brauchen einen PyPI-Weg (der
     gehärtete Host hat bewusst kein DNS; der Bot-Betrieb läuft über
     Container und freigegebenen Proxy, 9/9-Matrix).
+
+43. **Der CI-Gate lief zum ersten Mal wirklich — und fand zwei eigene Fehler
+    (Push 5c25cf3, Run 40657342530)**: Erst der neue `pr/**`-Trigger machte
+    sichtbar, was nie gelaufen war. (a) _Gitleaks-Lizenzfalle_:
+    `gitleaks-action@v2` verlangt von Organisations-Repos einen gekauften
+    `GITLEAKS_LICENSE`-Schlüssel — der Historien-Gate war damit von Anfang an
+    toter Code. Er fährt jetzt als Container mit `v8.18.4` (der letzten
+    MIT-Version) und kuratierter `.gitleaks.toml`; die vier Funde der echten
+    Historie sind ausnahmslos Selbstreferenzen des eigenen Scanners
+    (`scan-rules.mjs`, `release-scan.mjs` enthalten die Regex-Literale) bzw.
+    synthetische Testwerte — Allowlist nach Datei und Wert, nicht pauschal.
+    (b) _Der MySQL-Job prüfte nie MySQL_: `database-mysql.test.js` verband sich
+    mit `127.0.0.1` auf einen frei gewählten Host-Port — aber der verwaltete
+    Container veröffentlicht bewusst nie einen (`mysql.js`: „Kein --publish“,
+    Docker leitet auf internen Netzen nichts durch; der Hub geht über die
+    feste Netzadresse). Seit je war der Job deshalb ein stiller Skip mit
+    nachgeschaltetem Gate — jetzt verbindet er im Produktionsbild
+    (`BOT_HUB_DB=mysql-container`, Provisionierer-Ordner als Hub-Wurzel) und
+    hat eine nachhostbare Bereitschafts-Frist, weil die Hafen-Weiterleitung
+    nach außen später greift als die interne Härtungsprüfung. Lokal bewiesen:
+    7/7 MySQL-Tests echt grün (vorher: 7 Skip). Suite 526/526, Format grün.
 
 **Bewusst zurückgestellt (mit Begründung):** Audit WEB-05 (Ticket-Login kann
 identität seitlich wechseln – benötigt Pre-Auth-Bindung über den OAuth-Flow,
