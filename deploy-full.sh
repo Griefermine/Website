@@ -45,8 +45,8 @@ PROJECT_DIR="$SCRIPT_DIR"
 
 # TLS ist beim Standard-Deployment verpflichtend. Domain und Kontaktadresse
 # werden vor Systemänderungen abgefragt bzw. aus der Umgebung übernommen.
-BOT_HUB_DOMAIN="$BOT_HUB_DOMAIN"
-BOT_HUB_LE_EMAIL="$BOT_HUB_LE_EMAIL"
+BOT_HUB_DOMAIN="${BOT_HUB_DOMAIN:-}"
+BOT_HUB_LE_EMAIL="${BOT_HUB_LE_EMAIL:-}"
 if [ -z "$BOT_HUB_DOMAIN" ]; then
     if [ -r /dev/tty ]; then
         read -r -p "Öffentliche Bot-Hub-Domain (z. B. hub.example.org): " BOT_HUB_DOMAIN </dev/tty
