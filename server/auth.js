@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
   chmodSync,
   closeSync,
@@ -14,7 +14,30 @@ import {
 import { dirname, join } from 'node:path';
 import { decryptValue, encryptValue, vaultEnabled } from './vault.js';
 
-const DISCORD_API = 'https://discord.com/api/v10';
+/**
+ * Maßnahme 48 (Auftrag 5.6): dieselbe, bereits in server/panel.js geprüfte
+ * Test-Öse für die Hub-Anmeldung. Ohne sie konnte die Anmeldekette – State,
+ * PKCE-Verifizierer, Ticket-Vergleich, Rollenvergabe – nie gegen eine echte
+ * HTTP-Gegenstelle getestet werden, weil `https://discord.com` fest einkompiliert
+ * war und die Suite deshalb vollständig an der Authentifizierung vorbeilief.
+ *
+ * Bewusst kein neuer Produktions-Schalter:
+ *  - nur mit NODE_ENV=test,
+ *  - nur auf eine Schleifenadresse (http/https, 127.0.0.1/localhost/::1),
+ *  - sonst hart `https://discord.com/api/v10` – jede andere Angabe, auch eine
+ *    mitgesetzte, wird ignoriert.
+ * Ein beliebig konfigurierbarer OAuth-Endpunkt wäre ein eigener
+ * Angriffsvektor; das ist er hier nicht.
+ */
+const DISCORD_API_LOOPBACK =
+  /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/;
+const discordApiBasis = () =>
+  process.env.NODE_ENV === 'test' &&
+  DISCORD_API_LOOPBACK.test(
+    String(process.env.BOT_HUB_DISCORD_API ?? '').trim(),
+  )
+    ? String(process.env.BOT_HUB_DISCORD_API).trim().replace(/\/+$/, '')
+    : 'https://discord.com/api/v10';
 // Nur bekannte Discord-Codes zurückgeben, niemals den Parameterwert spiegeln.
 const KNOWN_DISCORD_ERRORS = new Set([
   'access_denied',
@@ -24,7 +47,79 @@ const KNOWN_DISCORD_ERRORS = new Set([
 ]);
 const SESSION_COOKIE = 'bot_hub_session';
 const STATE_TTL = 10 * 60 * 1000;
-const SESSION_TTL = 7 * 24 * 60 * 60 * 1000;
+
+/* ------------------------------------------------------------------ *
+ * Maßnahme 45 (V27-A): Sitzungs-Lebensdauer und Speicherung.
+ *
+ * Vorher: jede Sitzung lief starr sieben Tage durch – ohne Idle-Frist, also
+ * auch dann noch, wenn der Rechner seit Wochen in der Tasche lag, und die
+ * Datei `data/sessions.json` enthielt die Session-IDs im Klartext (wer den
+ * `data/`-Ordner kopierte, war angemeldet; nur mit Vault-Key wurde die ganze
+ * Datei versiegelt).
+ *
+ * Jetzt:
+ *  - Auf der Platte steht nur der SHA-256-Abdruck der ID (`sha256:<hex>`).
+ *    Der Wert im Cookie bleibt die ID selbst – die Datei ist damit ohne
+ *    zugehörigen laufenden Browser nichts wert, auch ohne Vault-Key. Der
+ *    Abdruck ist keine eigene Konstruktion, sondern `node:crypto`.
+ *  - Absolute Obergrenze (`BOT_HUB_SESSION_TTL_HOURS`, Default 168 = wie
+ *    bisher) und Idle-Frist (`BOT_HUB_SESSION_IDLE_HOURS`, Default 72).
+ *  - Zugangsentfernung widerruft die Sitzungen dieses Benutzers
+ *    (`revokeUserSessions` in `removeAccess`).
+ * Rollen-/Rechteänderungen waren schon vorher sofort wirksam, weil
+ * `hasPermission` die Rechte bei jeder Anfrage neu aus `access.json` löst.
+ * ------------------------------------------------------------------ */
+const SESSION_TTL_HOURS_DEFAULT = 168;
+const SESSION_IDLE_HOURS_DEFAULT = 72;
+const SESSION_HASH_PREFIX = 'sha256:';
+/* Die letzte Schreibdiskretion für Idle-Fortschreibung: `session()` läuft bei
+ * jeder API-Anfrage – ohne Schwelle würde jede Anfrage die Sitzungsdatei
+ * neu schreiben. */
+const SESSION_TOUCH_PERSIST_MS = 15_000;
+const invalidHoursWarned = new Set();
+
+/**
+ * Stunden-Angabe aus der Umgebung in Millisekunden. Ungültige Werte werden
+ * einmalig gemeldet und auf den Default gesetzt – ein Tippfehler darf nicht
+ * stillschweigend in „läuft nie ab“ oder „läuft sofort ab“ kippen.
+ */
+const hoursToMs = (name, fallbackHours) => {
+  const raw = String(process.env[name] ?? '').trim();
+  if (!raw) return fallbackHours * 60 * 60_000;
+  const hours = Number(raw);
+  if (!Number.isFinite(hours) || hours <= 0) {
+    if (!invalidHoursWarned.has(name)) {
+      invalidHoursWarned.add(name);
+      console.error(
+        `[hub] ${name}="${raw}" ist keine gültige Stundenzahl – es gilt der Default ${fallbackHours}.`,
+      );
+    }
+    return fallbackHours * 60 * 60_000;
+  }
+  return hours * 60 * 60_000;
+};
+
+/* Bewusst als Funktion (nicht beim Modul-Load): `loadDotenv()` läuft erst nach
+ * diesen Deklarationen, sonst sähe die Konfiguration die `.env`-Werte nicht. */
+const sessionTtlMs = () =>
+  hoursToMs('BOT_HUB_SESSION_TTL_HOURS', SESSION_TTL_HOURS_DEFAULT);
+/** Die Idle-Frist kann die absolute Laufzeit nie verlängern. */
+const sessionIdleMs = () =>
+  Math.min(
+    hoursToMs('BOT_HUB_SESSION_IDLE_HOURS', SESSION_IDLE_HOURS_DEFAULT),
+    sessionTtlMs(),
+  );
+
+/** Speicher-Schlüssel einer Sitzung: immer der Abdruck, niemals die ID. */
+const sessionKey = (value) =>
+  String(value).startsWith(SESSION_HASH_PREFIX)
+    ? String(value)
+    : `${SESSION_HASH_PREFIX}${createHash('sha256')
+        .update(String(value), 'utf8')
+        .digest('hex')}`;
+
+/** Frische Session-ID: 256 Bit aus dem CSPRNG, URL-sicher kodiert. */
+const newSessionToken = () => randomBytes(32).toString('base64url');
 const PREAUTH_COOKIE = 'bot_hub_preauth';
 const states = new Map();
 const sessions = new Map();
@@ -158,7 +253,7 @@ const configured = () => {
 };
 
 const discordRequest = async (path, accessToken) => {
-  const response = await fetch(`${DISCORD_API}${path}`, {
+  const response = await fetch(`${discordApiBasis()}${path}`, {
     headers: { authorization: `Bearer ${accessToken}` },
   });
   if (!response.ok)
@@ -173,14 +268,43 @@ const publicUser = (user) => ({
   avatar: user.avatar ?? null,
 });
 
+/* Dünnes Nachschreiben vermeiden: `session()` läuft bei jeder API-Anfrage,
+ * ohne Schwelle würde jede einzelne Anfrage die Sitzungsdatei neu schreiben
+ * (inkl. fsync). Pro Sitzung wird der Fortschritt höchstens alle 15 Sekunden
+ * festgehalten; der Buchungsstand hängt am Objekt, nicht in der Datei, eine
+ * neu geladene Sitzung wird beim ersten Zugriff sofort fortgeschrieben. */
+const touchPersistedAt = new WeakMap();
 const session = (req) => {
   const value = cookieValue(req, SESSION_COOKIE);
-  const current = sessions.get(value);
+  if (!value) return null;
+  const key = sessionKey(value);
+  const current = sessions.get(key);
   if (!current) return null;
-  if (current.expiresAt <= Date.now()) {
-    sessions.delete(value);
+  const now = Date.now();
+  if (current.expiresAt <= now) {
+    sessions.delete(key);
     saveSessions();
     return null;
+  }
+  /* Idle-Frist. Altbestand aus einer Datei vor Maßnahme 45 hat weder
+   * `lastSeenAt` noch `createdAt`; ihn nachträglich abzumelden würde alle
+   * bestehenden Anmeldungen beim ersten Start nach dem Update kappen, also
+   * gilt er als „gerade gesehen“ und läuft ganz normal aus. */
+  const idleSince =
+    typeof current.lastSeenAt === 'number'
+      ? current.lastSeenAt
+      : typeof current.createdAt === 'number'
+        ? current.createdAt
+        : now;
+  if (now - idleSince > sessionIdleMs()) {
+    sessions.delete(key);
+    saveSessions();
+    return null;
+  }
+  current.lastSeenAt = now;
+  if (now - (touchPersistedAt.get(current) ?? 0) > SESSION_TOUCH_PERSIST_MS) {
+    touchPersistedAt.set(current, now);
+    saveSessions();
   }
   return current;
 };
@@ -263,11 +387,12 @@ const saveAccess = (strict = false) => {
 };
 
 /* Sessions leben im Speicher, überleben aber einen Neustart: Sie werden in
- * `data/sessions.json` ausgelagert (Mode 0600). Die Datei enthält gültige
- * Session-Tokens – wer den data/-Ordner kopiert, wäre sonst angemeldet. Mit
- * Vault-Key liegt die Datei deshalb als ein einziger AES-256-GCM-Umschlag
- * (v2, fest an Dateiname+Schlüsselname gebunden) auf der Platte; ohne Key
- * bleibt das alte Klartext-Verhalten. */
+ * `data/sessions.json` ausgelagert (Mode 0600). Seit Maßnahme 45 sind die
+ * Schlüssel die SHA-256-Abdrücke der Session-ID, nicht die IDs selbst – die
+ * Datei enthält also keine auslieferbaren Anmeldemerkmale mehr. Zusätzlich
+ * liegt sie mit Vault-Key als ein einziger AES-256-GCM-Umschlag (v2, fest an
+ * Dateiname+Schlüsselname gebunden) auf der Platte; ohne Key schützt der
+ * Abdruck. */
 let sessionFile = null;
 const projectRootOfSessionFile = () => dirname(dirname(sessionFile));
 const saveSessions = () => {
@@ -319,19 +444,30 @@ const loadSessions = () => {
     }
     const parsed = JSON.parse(content);
     const now = Date.now();
+    let rawKeyFound = false;
     for (const [key, value] of Object.entries(parsed ?? {})) {
       if (
         value &&
         typeof value.expiresAt === 'number' &&
         value.expiresAt > now &&
         value.user?.id
-      )
-        sessions.set(key, value);
+      ) {
+        /* Altbestand (vor Maßnahme 45) speicherte die rohe ID als Schlüssel.
+         * Beim Laden wird der Schlüssel auf seinen Abdruck umgestellt; der
+         * Cookie-Wert bleibt identisch, bestehende Anmeldungen laufen also
+         * weiter – nur die Datei enthält beim nächsten Schreiben keine
+         * auslieferbaren IDs mehr. */
+        if (!String(key).startsWith(SESSION_HASH_PREFIX)) rawKeyFound = true;
+        sessions.set(sessionKey(key), value);
+      }
     }
-    // Klartext-Altbestand einmalig in den Umschlag hochziehen.
+    // Klartext-Altbestand einmalig hochziehen: rohe Schlüssel -> Abdrücke,
+    // und unversiegelte Datei -> Umschlag, falls ein Vault-Key existiert.
     if (
-      !raw.trim().startsWith('vault:') &&
-      vaultEnabled(projectRootOfSessionFile())
+      (rawKeyFound ||
+        (!raw.trim().startsWith('vault:') &&
+          vaultEnabled(projectRootOfSessionFile()))) &&
+      sessions.size
     )
       saveSessions();
   } catch (error) {
@@ -394,6 +530,14 @@ export const configureAccess = (file) => {
   loadAccess();
 };
 
+/* Legt bei einer erfolgreichen Anmeldung einen Basis-Zugang an, falls noch
+ * keiner existiert – das ist die bewusste Selbstregistrierung des Projekts,
+ * keine Lücke (Maßnahme 45 / Auftrag 5.7: geprüft, absichtlich). Wichtig für
+ * den Widerruf: `removeAccess` widerruft zusätzlich die Sitzungen, ein
+ * entfernter Benutzer kann diesen Pfad also nicht mehr mit einer alten
+ * Sitzung betreten. Eine *neue* Anmeldung erzeugt ihn mit der Basisrolle
+ * `viewer` und leeren Rechten neu – eine frische Registrierung, keine
+ * Auferstehung ehemaliger Rechte. */
 export const ensureAccessUser = (user) => {
   if (!user) return null;
   if (!access.users[user.id]) {
@@ -516,6 +660,17 @@ export const updateAccess = (id, input, actorId) => {
   const permissions = [...new Set(requestedPermissions)].filter((permission) =>
     allowed.has(permission),
   );
+  /* Maßnahme 45 (Auftrag 5.7): botbezogene Rechte richteten sich bisher nach
+   * der Rechte-Menge der *Zielrolle* – für `viewer` (= []) heißt das, dass
+   * gar kein botbezogenes Recht setzbar war, obwohl die Laufzeit es seit
+   * Maßnahme 37 (Audit WEB-01) ausdrücklich unterstützt und der einzige Weg,
+   * jemanden auf genau einem Bot zu berechtigen, darin bestand, ihm global
+   * die weitergehende Rolle `operator` zu geben. Grenze ist jetzt, was der
+   * Handelnde auf genau diesem Bot selbst darf: "niemand vergibt mehr, als er
+   * selbst hat" bleibt erhalten, eine Elevation über die eigene Rolle hinaus
+   * ist weiterhin ausgeschlossen. Globale Rechte bleiben auf die Zielrolle
+   * begrenzt. */
+  const grantableFor = (botId) => new Set(effectivePermissions(actor, botId));
   const requestedBots =
     input.bots && typeof input.bots === 'object'
       ? input.bots
@@ -530,14 +685,40 @@ export const updateAccess = (id, input, actorId) => {
           ),
         ]
       : [];
-    botsClean[bid] = { permissions: perms.filter((p) => allowed.has(p)) };
+    const grantable = grantableFor(bid);
+    botsClean[bid] = {
+      permissions: perms.filter((p) => grantable.has(p)),
+    };
   }
   existing.role = role;
   existing.permissions = permissions;
   existing.bots = botsClean;
   existing.updatedAt = Date.now();
-  saveAccess();
+  // strict (Maßnahme 45): Eine nicht geschriebene Rechteänderung wäre nach
+  // einem Neustart weg – bei entzogenen Rechten wäre das ein stillschweigend
+  // wieder auflebender Zugang, also als Fehler melden statt verschlucken.
+  saveAccess(true);
   return publicAccess(id);
+};
+
+/**
+ * Widerruft alle Sitzungen eines Benutzers (Maßnahme 45). Wird beim Entfernen
+ * eines Zugangs gebraucht: ohne das bliebe die bereits ausgestellte Sitzung
+ * bis zur absoluten Laufzeit gültig.
+ * Gibt die Zahl widerrufener Sitzungen zurück.
+ */
+export const revokeUserSessions = (userId) => {
+  const id = String(userId ?? '');
+  if (!id) return 0;
+  let revoked = 0;
+  for (const [key, value] of sessions) {
+    if (value?.user?.id === id) {
+      sessions.delete(key);
+      revoked += 1;
+    }
+  }
+  if (revoked) saveSessions();
+  return revoked;
 };
 
 export const removeAccess = (id, actorId) => {
@@ -554,7 +735,15 @@ export const removeAccess = (id, actorId) => {
   if (owners.length === 1 && owners[0].id === id)
     throw new Error('Der letzte Eigentümer kann nicht entfernt werden');
   delete access.users[id];
-  saveAccess();
+  /* Maßnahme 45: zuerst die Sitzungen weg – das ist die unmittelbare Wirkung,
+   * die auch dann bleibt, wenn das Schreiben der Rechte später scheitert.
+   * Ohne diesen Schritt wäre die Datei zwar bereinigt, die lebende Sitzung
+   * des Entfernten aber gültig geblieben und hätte ihn beim nächsten Request
+   * als Viewer neu angelegt. */
+  revokeUserSessions(id);
+  // strict: ein Schreibfehler wäre ein stillschweigend unwiderrufener Zugang
+  // (nach einem Neustart wäre der Benutzer wieder da) – also melden.
+  saveAccess(true);
 };
 
 /**
@@ -648,9 +837,17 @@ export const handleAuthRoutes = async (req, res, url, sendJson, httpError) => {
     // verschiedenen Gründe bekommen eigene Meldungen, sonst ist ein
     // fehlgeschlagener Login nicht nachvollziehbar.
     let reason;
-    if (discordError && KNOWN_DISCORD_ERRORS.has(discordError))
-      reason = ['abgebrochen', `von Discord abgelehnt (${discordError})`];
-    else if (!state || state.used)
+    if (discordError) {
+      /* Ein Fehlerparameter bedeutet: von Discord kommt kein Code. Auch ein
+       * unbekannter Wert bricht ab – würde er nur in der bekannten Liste
+       * abgreifen, machte ein frei erfundener Parameter (z. B. `<script>…`)
+       * aus einer abgelehnten Anmeldung eine ganz normale Rückkehr, und die
+       * Kette lief weiter, als wäre nichts gewesen. Unbekannte Werte werden
+       * außerdem nicht zurückgegeben, sonst spiegelte die Antwort Eingaben. */
+      reason = KNOWN_DISCORD_ERRORS.has(discordError)
+        ? ['abgebrochen', `von Discord abgelehnt (${discordError})`]
+        : ['abgebrochen', 'von Discord abgelehnt (Grund unbekannt)'];
+    } else if (!state || state.used)
       reason = [
         'abgelaufen',
         'der Hub wurde zwischen Anmeldung und Rückkehr neu gestartet oder der Link ist zu alt – bitte erneut anmelden',
@@ -676,7 +873,7 @@ export const handleAuthRoutes = async (req, res, url, sendJson, httpError) => {
     }
     state.used = true;
 
-    const tokenResponse = await fetch(`${DISCORD_API}/oauth2/token`, {
+    const tokenResponse = await fetch(`${discordApiBasis()}/oauth2/token`, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
@@ -694,8 +891,11 @@ export const handleAuthRoutes = async (req, res, url, sendJson, httpError) => {
       discordRequest('/users/@me', token.access_token),
       discordRequest('/users/@me/guilds', token.access_token),
     ]);
-    const sessionId = randomUUID();
-    sessions.set(sessionId, {
+    /* Maßnahme 45: 256-Bit-ID, gespeichert wird nur ihr Abdruck. */
+    const sessionId = newSessionToken();
+    const issuedAt = Date.now();
+    const ttlMs = sessionTtlMs();
+    sessions.set(sessionKey(sessionId), {
       user: publicUser(user),
       guilds: guilds.map(({ id, name, icon, owner, permissions }) => ({
         id,
@@ -704,13 +904,15 @@ export const handleAuthRoutes = async (req, res, url, sendJson, httpError) => {
         owner: Boolean(owner),
         permissions: String(permissions ?? '0'),
       })),
-      expiresAt: Date.now() + SESSION_TTL,
+      createdAt: issuedAt,
+      lastSeenAt: issuedAt,
+      expiresAt: issuedAt + ttlMs,
     });
     saveSessions();
     res.writeHead(302, {
       location: '/',
       'set-cookie': [
-        cookie(sessionId, SESSION_TTL / 1000),
+        cookie(sessionId, Math.floor(ttlMs / 1000)),
         preAuthCookie('', 0),
       ],
       'cache-control': 'no-store',
@@ -719,7 +921,7 @@ export const handleAuthRoutes = async (req, res, url, sendJson, httpError) => {
   }
 
   if (url.pathname === '/api/auth/logout' && req.method === 'POST') {
-    sessions.delete(cookieValue(req, SESSION_COOKIE));
+    sessions.delete(sessionKey(cookieValue(req, SESSION_COOKIE)));
     saveSessions();
     res.setHeader('set-cookie', cookie('', 0));
     return sendJson(res, 200, { ok: true });
@@ -753,3 +955,10 @@ export const requiresAuthentication = (req, url) => {
 };
 
 export { SESSION_COOKIE, secureCookies };
+
+/**
+ * Test-Zugang (Maßnahme 48): die Endpunkt-Wahl selbst ist sicherheitsrelevant –
+ * sie darf nur im Testbetrieb und nur auf die Schleife zeigen. Gepürt wird
+ * das Verhalten, nicht eine nachgebildete Kopie der Regel.
+ */
+export const __testing = { discordApiBasis };

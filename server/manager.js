@@ -92,6 +92,7 @@ import {
   sweepStaleExecEnvFiles,
 } from './containers.js';
 import { database } from './database.js';
+import { capacityGuard } from './disk.js';
 import { ensurePanelScaffold, migrateScaffold } from './panelScaffold.js';
 
 const PROJECT_ROOT = resolve(process.env.BOT_DASHBOARD_ROOT || process.cwd());
@@ -128,19 +129,40 @@ const uploadBytes = new Map();
 const concurrentUploads = new Map();
 let activeUploadCount = 0;
 const rateBuckets = new Map();
+/**
+ * Maßnahme 47 (Auftrag 5.5): IPv4-Verbindungen meldet Node je nach
+ * Socket-Familie als `127.0.0.1` ODER als `::ffff:127.0.0.1`. Verglichen wurde
+ * bisher zeichengetreu, ein Betreiber mit `BOT_HUB_TRUSTED_PROXIES=127.0.0.1`
+ * – naheliegend, weil nginx auf demselben Rechner läuft – traf die Prüfung
+ * damit nie: `X-Forwarded-For` wurde verworfen und jeder Besucher landete im
+ * selben Eimer auf die Proxy-Adresse (ein gemeinsames Login-Limit von 30 pro
+ * Minute für die gesamte Installation). Verglichen und ausgegeben wird
+ * deshalb eine kanonische Form; `::ffff:` wird nur für ein echtes
+ * Vieren-Punkt-Pattern abgestreift, damit kein anderer Wert kollidiert.
+ */
+const canonicalAddress = (value) => {
+  const text = String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/g, '');
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(text);
+  if (mapped && mapped[1].split('.').every((teil) => Number(teil) <= 255))
+    return mapped[1];
+  return text;
+};
 const trustedProxyAddresses = () =>
   new Set(
     String(process.env.BOT_HUB_TRUSTED_PROXIES ?? '')
       .split(',')
-      .map((value) => value.trim().toLowerCase())
+      .map(canonicalAddress)
       .filter(Boolean),
   );
 const clientAddress = (req) => {
-  const remote = String(req.socket.remoteAddress ?? '').toLowerCase();
+  const remote = canonicalAddress(req.socket.remoteAddress);
   if (!trustedProxyAddresses().has(remote)) return remote;
   const forwarded = String(req.headers['x-forwarded-for'] ?? '')
     .split(',')
-    .map((value) => value.trim().toLowerCase())
+    .map(canonicalAddress)
     .filter(Boolean);
   // Walk from the directly connected proxy toward the client. Ignore only
   // explicitly trusted proxy hops; never accept a client-supplied leftmost
@@ -341,7 +363,9 @@ const rateCleanup = setInterval(() => {
 rateCleanup.unref();
 
 const uploadKeyOf = (req, url) => {
-  const remote = String(req.socket.remoteAddress ?? '');
+  // Kanonische Form (Maßnahme 47): sonst existierten für denselben Besucher
+  // zwei Eimer, je nachdem welche Familie sein Socket zufällig hatte.
+  const remote = canonicalAddress(req.socket.remoteAddress) || 'unknown';
   const cookie = String(req.headers.cookie ?? '');
   const session =
     cookie
@@ -1759,6 +1783,16 @@ const installDependencies = async (bot, dir, { state, force = false } = {}) => {
     setStatus(bot, 'stopped', { depsStatus: 'missing' });
     return { ...info, installed: false, ok: false };
   }
+  /* Maßnahme 49 (Auftrag 5.4): Installationen sind der größte Schreiber
+   * (pip/npm laden Hunderte MB in den Workspace). Lieber vorher abbrechen,
+   * als die Installation bei halb heruntergeladenen Abhängigkeiten vom vollen
+   * Datenträger stoppen zu lassen – und dabei alle anderen Bots mitzureißen. */
+  const platz = capacityGuard(PROJECT_ROOT);
+  if (!platz.ok) {
+    pushLine(bot.id, 'system', `✗ ${platz.grund}`);
+    setStatus(bot, 'stopped', { depsStatus: 'failed' });
+    return { ...info, installed: false, ok: false };
+  }
 
   setStatus(bot, 'installing', {
     depsStatus: 'installing',
@@ -2812,7 +2846,9 @@ const handleApi = async (req, res, url) => {
   if (resource === 'events') {
     permission('bots.read');
     if (process.env.BOT_HUB_TEST_MODE !== '1') {
-      const ip = String(req.socket.remoteAddress ?? 'unknown');
+      // Kanonische Form, aber bewusst OHNE X-Forwarded-For: die Kaps gegen
+      // Verbindungs-Hortung dürfen nicht von einem Header abhängen (47).
+      const ip = canonicalAddress(req.socket.remoteAddress) || 'unknown';
       const cookie = String(req.headers.cookie ?? '');
       const sessionMatch =
         cookie
@@ -2907,6 +2943,17 @@ const handleApi = async (req, res, url) => {
         // nicht während des gesamten Body-Uploads reservieren.
         const body = await readBody(req);
         const config = normaliseConfig(body, null);
+        /* Maßnahme 49 (Auftrag 5.4): vor jeder Anlage, die einen Workspace
+         * und später eine Installation nach sich zieht, muss der Datenträger
+         * messbar Platz haben. Eine volle Platte trifft nicht nur diesen Bot:
+         * Datenbank, Sitzungsdatei und jeder andere Workspace brechen dann
+         * ebenfalls weg. Synchron (statfs), reiht sich also vor das
+         * Slot-Reservieren, ohne die Atomarität der Zeile darunter zu stören.
+         * Status 422 (nicht 507): dieser Handler versteckt 5xx-Meldungen
+         * bewusst hinter „Interner Serverfehler“ – der Betreiber soll den
+         * Grund hier aber lesen können, so wie bei 413 und 429 auch. */
+        const platz = capacityGuard(PROJECT_ROOT);
+        if (!platz.ok) throw httpError(422, platz.grund);
         // P1-H: Prüfen und Reserven in einem Synchronzug – zwischen `if` und
         // `+=` darf kein await liegen, sonst sehen parallele Requests erneut
         // dieselbe freie Kapazität.
@@ -3507,6 +3554,11 @@ export const __testing = {
   publicBot,
   isDeleteLocked,
   deletePending,
+  // Maßnahme 47: Client-Identität hinter einem Proxy ist selbst geprüft,
+  // damit die Bucket-Verdichtung nicht per HTTP erraten werden muss.
+  clientAddress,
+  canonicalAddress,
+  trustedProxyAddresses,
   deletingBots,
   pendingCreations: () => pendingBotCreations,
   flush,

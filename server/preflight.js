@@ -5,8 +5,18 @@
  * genau wie im Betrieb.
  */
 
-import { existsSync, lstatSync, readFileSync, statSync } from 'node:fs';
+import {
+  existsSync,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  statfsSync,
+} from 'node:fs';
 import { join, resolve } from 'node:path';
+import { parseDotenv } from './util.js';
+import { capacityGuard } from './disk.js';
+import { isVaultValue, vaultStatus } from './vault.js';
 
 export const LOOPBACK_HOSTS = new Set([
   '127.0.0.1',
@@ -63,6 +73,9 @@ export const collectSecurityFindings = ({
   read = readFileSync,
   stat = statSync,
   lstat = lstatSync,
+  list = readdirSync,
+  statfs = statfsSync,
+  secretSchutz = undefined,
   aktuelleBenutzerkennung = typeof process.getuid === 'function'
     ? process.getuid()
     : undefined,
@@ -70,6 +83,12 @@ export const collectSecurityFindings = ({
   const errors = [];
   const warnings = [];
   const production = env.NODE_ENV === 'production';
+  /* Schutz-Status wird hier einmal erhoben und sowohl für die Vorprüfung als
+   * auch für die Laufzeit-Meldung verwendet; `vaultStatus()` wirft nicht. */
+  const schutz =
+    typeof secretSchutz === 'function'
+      ? secretSchutz(projectRoot, env)
+      : (secretSchutz ?? vaultStatus(projectRoot, env));
 
   // 1) Der Hub darf in Produktion nicht als root laufen. Sonst bekommen auch
   //    die Container root, und die Trennung zwischen fremdem Bot-Code und dem
@@ -193,6 +212,116 @@ export const collectSecurityFindings = ({
     } catch {
       warnings.push(`${label} ist nicht prüfbar – bitte Rechte kontrollieren.`);
     }
+  }
+
+  // 6) Maßnahme 46 (Auftrag 5.1): Verschlüsselung im Ruhezustand darf in
+  //    Produktion nicht unbemerkt ausbleiben.
+  //
+  //    Der gefährliche Fall ist nicht „Betreiber hat an den Schlüssel nicht
+  //    gedacht“, sondern „Schlüssel ist gesetzt, aber unbrauchbar“: Die
+  //    root-eigene Datei, die der Hub-Benutzer nicht lesen darf, ließ
+  //    `vaultEnabled()` bisher still auf Klartext zurückschreiben – mitten im
+  //    Betrieb, ohne jede Meldung. Deshalb:
+  //      - gesetzter, aber unbrauchbarer Schlüssel  -> Abbruch ( egal wieviele
+  //        Secrets schon offen sind: die Absicht war Verschlüsselung),
+  //      - kein Schlüssel, aber offene Geheimnisse  -> Abbruch,
+  //      - kein Schlüssel, noch nichts offen        -> Warnung (frische
+  //        Installation, gleich beim ersten Bot würde es aber offen).
+  if (production && !schutz.aktiv) {
+    let offen = 0;
+    const verzeichnis = join(projectRoot, 'data', 'secrets');
+    try {
+      if (exists(verzeichnis)) {
+        for (const name of list(verzeichnis)) {
+          if (!String(name).endsWith('.env')) continue;
+          try {
+            const werte = parseDotenv(read(join(verzeichnis, name), 'utf8'));
+            for (const [schluessel, wert] of Object.entries(werte)) {
+              if (String(wert ?? '').trim() === '' || isVaultValue(wert))
+                continue;
+              // Der leere Platzhalter eines gelöschten Werts ist keins.
+              if (String(schluessel).trim() === '') continue;
+              offen += 1;
+            }
+          } catch {
+            // Nicht lesbar: lieber wie „offen“ behandeln, als zu schweigen.
+            offen += 1;
+          }
+        }
+      }
+    } catch {
+      warnings.push(
+        'data/secrets/ ist nicht aufzählbar – Vault-Zustand nicht prüfbar.',
+      );
+    }
+    const text = schutz.konfiguriert
+      ? `Vault-Key ist konfiguriert, aber nicht verwertbar: ${schutz.grund} ` +
+        'In Produktion werden Geheimnisse sonst unverschlüsselt gespeichert – ' +
+        'Bitte Leserecht (z. B. 0640 root:<Hub-Benutzer>) und Inhalt ' +
+        '(64-stelliges Hex) prüfen.'
+      : offen > 0
+        ? `data/secrets/ enthält ${offen} unverschlüsselte Geheimnis-Werte und ` +
+          'es ist kein Vault-Key vorhanden. Bitte BOT_HUB_KEY_FILE setzen ' +
+          '(deploy-full.sh legt /etc/bot-hub/master.key an); beim nächsten ' +
+          'Start werden die Werte in den Vault umgeschlagen.'
+        : '';
+    if (text) errors.push(text);
+    else
+      warnings.push(
+        'Kein Vault-Key: Secret-Dateien in data/secrets/ würden ' +
+          'unverschlüsselt geschrieben. Bitte BOT_HUB_KEY_FILE setzen ' +
+          '(siehe server/vault.js).',
+      );
+  }
+
+  // 7) Maßnahme 47 (Auftrag 5.5): Rate-Limits brauchen die echte Besucher-
+  //    adresse. Der Hub vertraut `X-Forwarded-For` ausschließlich dann, wenn
+  //    die direkt verbundene Adresse in BOT_HUB_TRUSTED_PROXIES steht –
+  //    richtig so, sonst könnte jeder Besucher seine Quell-Adress frei
+  //    erfinden. In Produktion MUSS der Hub an Loopback binden (Regel 1/1D),
+  //    vor ihm steht also der TLS-Proxy der Deployment-Anleitung. Ist die
+  //    Liste leer, landen alle Besucher im selben Eimer: das Login-Limit
+  //    (30/Min) gilt dann für die ganze Installation, und ein einzelner
+  //    Angreifer meldet die übrigen ab. Kein Abbruch – die Anlage funktioniert
+  //    weiter, nur die Schutzwirkung der Limits ist nicht die vorgesehene.
+  if (production) {
+    const konfigurierteProxys = String(
+      env.BOT_HUB_TRUSTED_PROXIES ?? '',
+    ).trim();
+    const offentlichErreichbar = (() => {
+      const basis = String(env.BOT_HUB_URL ?? '').trim();
+      if (!basis) return false;
+      try {
+        const { hostname } = new URL(basis);
+        const ohneKlammer = hostname.replace(/^\[|\]$/g, '');
+        return !LOOPBACK_HOSTS.has(ohneKlammer);
+      } catch {
+        // Unparsbare URL: lieber melden als schweigen – die Anlage ist
+        // sowieso fehlerhaft, die Frage ist nur, ob der Hinweis passt.
+        return true;
+      }
+    })();
+    if (offentlichErreichbar && !konfigurierteProxys) {
+      warnings.push(
+        'BOT_HUB_URL zeigt auf einen öffentlich erreichbaren Namen, aber ' +
+          'BOT_HUB_TRUSTED_PROXIES ist leer: alle Besucher hinter dem Proxy ' +
+          'teilen sich einen Rate-Limit-Eimer auf die Proxy-Adresse. Bitte die ' +
+          'Adresse des Proxies eintragen (gleicher Rechner: ' +
+          'BOT_HUB_TRUSTED_PROXIES=127.0.0.1).',
+      );
+    }
+  }
+
+  // 8) Maßnahme 49 (Auftrag 5.4): freier Platz auf dem Datenträger. Der Hub
+  //    kann ohne Dateisystem-Quota keine harte Grenze je Workspace setzen
+  //    (bewusste Entscheidung, documents/sicherheit.md) – aber er kann beim
+  //    Start sehen, ob der Datenträger, auf dem `bots/` und die Datenbank
+  //    liegen, überhaupt noch Raum hat. Warnung, kein Abbruch: ein knapper
+  //    Datenträger ist eine Meldung wert, aber kein Grund, die bestehende
+  //    Installation auszusperren. Nicht messbare Datenträger bleiben still.
+  if (production) {
+    const platz = capacityGuard(projectRoot, { env, statfs });
+    if (!platz.ok) warnings.push(platz.grund);
   }
 
   return { errors, warnings };

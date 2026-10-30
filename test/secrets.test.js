@@ -484,3 +484,114 @@ describe('Reste abgebrochener Schreibvorgänge', () => {
     rmSync(root, { recursive: true, force: true });
   });
 });
+
+describe('Produktion ohne Vault-Key (Maßnahme 46, Auftrag 5.1)', () => {
+  /** NODE_ENV/Key-Umgebung für einen Block setzen und danach zurückgeben. */
+  const imModus = async (werte, aufgabe) => {
+    const vorher = new Map(
+      Object.keys(werte).map((name) => [name, process.env[name]]),
+    );
+    for (const [name, wert] of Object.entries(werte)) {
+      if (wert === undefined) delete process.env[name];
+      else process.env[name] = String(wert);
+    }
+    try {
+      await aufgabe();
+    } finally {
+      for (const [name, wert] of vorher) {
+        if (wert === undefined) delete process.env[name];
+        else process.env[name] = wert;
+      }
+    }
+  };
+
+  it('verweigert das Schreiben von Klartext-Geheimnissen', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bot-hub-secrets-prod-'));
+    try {
+      await imModus(
+        { NODE_ENV: 'production', BOT_HUB_KEY_FILE: undefined },
+        async () => {
+          const { storeSecretValues } = await import('../server/secrets.js');
+          assert.throws(
+            () => storeSecretValues(root, BOT_ID, { DISCORD_BOT_TOKEN: TOKEN }),
+            /Vault-Key/,
+          );
+          // Nicht nur gemeldet: es darf NOTHING auf der Platte landen.
+          assert.ok(
+            !existsSync(join(root, 'data', 'secrets', `${BOT_ID}.env`)),
+            'Verweigerter Schreibvorgang hat eine Datei hinterlassen',
+          );
+        },
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('löschen bleibt auch ohne Schlüssel möglich', async () => {
+    // Der Löschpfad eines Bots darf nicht an einer fehlenden Verschlüsselung
+    // scheitern – sonst bleibt ein Secret gerade dann stehen, wenn es weg soll.
+    const root = mkdtempSync(join(tmpdir(), 'bot-hub-secrets-loeschen-'));
+    try {
+      await imModus(
+        { NODE_ENV: 'production', BOT_HUB_KEY_FILE: undefined },
+        async () => {
+          const { storeSecretValues } = await import('../server/secrets.js');
+          assert.equal(
+            typeof storeSecretValues(root, BOT_ID, {}, { merge: false }),
+            'string',
+          );
+        },
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('schreibt mit eingerichtem Schlüssel verschrieben und liest wieder', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bot-hub-secrets-mit-key-'));
+    try {
+      await imModus(
+        { NODE_ENV: 'production', BOT_HUB_KEY_FILE: undefined },
+        async () => {
+          const { ensureVaultKey } = await import('../server/vault.js');
+          const { readSecretValues, storeSecretValues } =
+            await import('../server/secrets.js');
+          ensureVaultKey(root, {});
+          storeSecretValues(root, BOT_ID, { DISCORD_BOT_TOKEN: TOKEN });
+          const roh = readFileSync(
+            join(root, 'data', 'secrets', `${BOT_ID}.env`),
+            'utf8',
+          );
+          assert.match(roh, /vault:v2:/, 'Erwartet einen Umschlag.');
+          assert.ok(
+            !roh.includes(TOKEN),
+            'Der Klartext-Wert steht in der Secret-Datei.',
+          );
+          assert.equal(readSecretValues(root, BOT_ID).DISCORD_BOT_TOKEN, TOKEN);
+        },
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('Development und Test bleiben vom Klartext-Verbot ausgenommen', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bot-hub-secrets-dev-'));
+    try {
+      for (const modus of ['development', 'test']) {
+        await imModus(
+          { NODE_ENV: modus, BOT_HUB_KEY_FILE: undefined },
+          async () => {
+            const { storeSecretValues } = await import('../server/secrets.js');
+            // Ohne Schlüssel darf hier geschrieben werden – sonst wäre jede
+            // Suite und jeder Entwickler-Start blockiert.
+            storeSecretValues(root, BOT_ID, { DISCORD_BOT_TOKEN: TOKEN });
+          },
+        );
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

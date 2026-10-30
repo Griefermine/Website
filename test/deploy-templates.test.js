@@ -1,0 +1,207 @@
+/**
+ * Maßnahme 47 (Auftrag 5.5/5.9): die nginx-Vorlagen der Deployment-Skripte.
+ *
+ * Anlass ist ein realer Fehler, kein Verdacht: `setup-tls.sh` schrieb seine
+ * nginx-Konfiguration mit einem UNZITIERTEN Heredoc (`<<EOF`), ohne die
+ * nginx-Variablen zu escapeiren. Bash expandierte `$host`, `$remote_addr`,
+ * `$proxy_add_x_forwarded_for`, `$scheme` und `$http_upgrade` damit zu leeren
+ * Strings – die geschriebene Datei enthielt Zeilen wie
+ * `proxy_set_header Host ;`. Mit echtem nginx 1.27 nachgeprüft:
+ *
+ *     [emerg] invalid number of arguments in "proxy_set_header" directive
+ *     nginx: configuration file /etc/nginx/nginx.conf test failed
+ *
+ * `setup-tls.sh` macht `nginx -t && systemctl reload nginx`, bricht bei
+ * Misserfolg aber nicht ab: die TLS-Umstellung meldete Erfolg, während der
+ * Traffic auf der alten Konfiguration blieb (praktisch reproduziert, siehe
+ * Abschlussbericht).
+ *
+ * Geprüft wird das GERENDERTE Ergebnis – mit demselben bash, das auch der
+ * Betreiber ausführt – und nicht ein Quelltext-Verdacht.
+ */
+
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { test } from 'node:test';
+
+const WURZEL = join(import.meta.dirname, '..');
+const SKRIPTE = ['deploy-full.sh', 'setup-tls.sh'];
+
+/**
+ * Alle `cat > /etc/nginx/… <<[']MARKER[…]`-Blöcke, so wie bash sie schreibt.
+ * Zitierter Marker (`<<'EOF'`) heißt „keine Expansion“, unzitierter heißt
+ * „expandieren“ – genau wie im Skript.
+ */
+const nginxBloecke = (pfad) => {
+  const zeilen = readFileSync(pfad, 'utf8').split('\n');
+  const blöcke = [];
+  for (let index = 0; index < zeilen.length; index += 1) {
+    const treffer =
+      /^cat > (\/etc\/nginx\/[^\s]+) <<(-?)(['"]?)([A-Za-z_]+)\3$/.exec(
+        zeilen[index],
+      );
+    if (!treffer) continue;
+    const [, ziel, , zitierung, marker] = treffer;
+    const ende = zeilen.findIndex((zeile, j) => j > index && zeile === marker);
+    assert.notEqual(ende, -1, `${pfad}: Heredoc ohne schließendes ${marker}`);
+    const inhalt = zeilen.slice(index + 1, ende).join('\n');
+    blöcke.push({ pfad, ziel, zitierung: Boolean(zitierung), inhalt });
+    index = ende;
+  }
+  return blöcke;
+};
+
+/** bash-getreues Ergebnis eines Blocks: Expandieren, wenn nicht zitiert. */
+const gerendert = (blok) => {
+  if (blok.zitierung) return blok.inhalt;
+  const root = mkdtempSync(join(tmpdir(), 'nginx-template-'));
+  const ziel = join(root, 'bot-hub.conf');
+  try {
+    const skript = [
+      'set -e',
+      // Der einzige Platzhalter, den die Skripte bewusst einsetzen.
+      'DOMAIN=bot.example',
+      `cat > '${ziel}' <<MARKER`,
+      blok.inhalt,
+      'MARKER',
+    ].join('\n');
+    execFileSync('bash', ['-c', skript], { stdio: 'pipe' });
+    return readFileSync(ziel, 'utf8');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+};
+
+const alleBloecke = SKRIPTE.flatMap((name) =>
+  nginxBloecke(join(WURZEL, name)),
+).map((blok) => ({ ...blok, gerendert: gerendert(blok) }));
+
+const mitProxy = (blok) => blok.gerendert.includes('proxy_pass');
+
+test('die Deployment-Skripte schreiben nginx-Konfigurationen mit Proxy', () => {
+  assert.ok(
+    alleBloecke.filter(mitProxy).length >= 2,
+    `erwartet mindestens zwei Proxy-Vorlagen, gefunden: ${alleBloecke
+      .map((blok) => `${blok.pfad} → ${blok.ziel}`)
+      .join(', ')}`,
+  );
+});
+
+test('keine Vorlage hinterlässt eine Direktive ohne Wert', () => {
+  for (const blok of alleBloecke) {
+    // Gemeint ist die Form `irgendwas  ;` (Argument durch Expansion verloren)
+    // und `https://;` (leere Ziel-URL im Redirect). Beides schreibt bash, wenn
+    // eine nginx-Variable nicht escapeiert war.
+    const leer = blok.gerendert
+      .split('\n')
+      .map((zeile, nr) => [nr + 1, zeile.trim()])
+      .filter(
+        ([, zeile]) =>
+          /[^;"]\s+;\s*$/.test(zeile) ||
+          /:\/\/\s*;/.test(zeile) ||
+          /\$\s*;/.test(zeile),
+      );
+    assert.deepEqual(
+      leer,
+      [],
+      `${blok.pfad} → ${blok.ziel} schreibt Direktiven ohne Argument: ` +
+        leer.map(([nr, zeile]) => `${nr}: "${zeile}"`).join(' | ') +
+        ' – nginx -t bricht dazu mit „invalid number of arguments“ ab.',
+    );
+  }
+});
+
+test('der HTTP→HTTPS-Verweis behält Ziel und Anfrage', () => {
+  const umleitungen = alleBloecke.filter((blok) =>
+    /\breturn\s+301\b/.test(blok.gerendert),
+  );
+  assert.ok(umleitungen.length >= 1, 'Erwartet den HTTP→HTTPS-Verweis.');
+  for (const blok of umleitungen) {
+    assert.match(
+      blok.gerendert,
+      /return\s+301\s+https:\/\/\S*\$request_uri\s*;/,
+      `${blok.pfad} → ${blok.ziel}: Der Verweis verliert Ziel oder ` +
+        'Anfragepfad – `return 301 https://;` ist zwar gültige Syntax, leitet ' +
+        'aber ins Leere.',
+    );
+  }
+});
+
+test('Proxy-Kopfzeilen bleiben als nginx-Variablen erhalten', () => {
+  const erwartet = [
+    // $http_host statt $host: der Hostname erreicht den Hub inklusive Port.
+    // Mit $host wäre aus `https://example.org:8443/…` `example.org` geworden,
+    // und jede Herkunfts-Prüfung lief auf einer anderen Adresse als der, unter
+    // der der Hub wirklich erreicht wird. Beide Vorlagen verwenden dasselbe.
+    ['Host', /\bproxy_set_header\s+Host\s+\$http_host\s*;/],
+    ['X-Real-IP', /\bproxy_set_header\s+X-Real-IP\s+\$remote_addr\s*;/],
+    [
+      'X-Forwarded-For',
+      /\bproxy_set_header\s+X-Forwarded-For\s+\$proxy_add_x_forwarded_for\s*;/,
+    ],
+    [
+      'X-Forwarded-Proto',
+      /\bproxy_set_header\s+X-Forwarded-Proto\s+\$scheme\s*;/,
+    ],
+  ];
+  for (const blok of alleBloecke.filter(mitProxy)) {
+    for (const [name, muster] of erwartet) {
+      assert.match(
+        blok.gerendert,
+        muster,
+        `${blok.pfad} → ${blok.ziel} verliert die Kopfzeile ${name}. Ohne ` +
+          'sie kennt der Hub weder echte Besucher-Adresse noch HTTPS – und ' +
+          'ohne X-Forwarded-For landen alle Besucher in einem Rate-Limit-Eimer.',
+      );
+    }
+  }
+});
+
+test('der WebSocket-Hochstieg überlebt die Vorlage', () => {
+  for (const blok of alleBloecke.filter(mitProxy)) {
+    assert.match(
+      blok.gerendert,
+      /\bproxy_set_header\s+Upgrade\s+\$http_upgrade\s*;/,
+      `${blok.pfad} → ${blok.ziel}: ohne Upgrade-Kopfzeile scheitert der ` +
+        'WebSocket-Handshake (Discord-Gateway der Bots läuft über WebSocket).',
+    );
+  }
+});
+
+test('Uploads haben eine bewusste Körpergrenze, nicht die nginx-Standardgrenze', () => {
+  for (const blok of alleBloecke.filter(mitProxy)) {
+    assert.match(
+      blok.gerendert,
+      /\bclient_max_body_size\s+2m\s*;/,
+      `${blok.pfad} → ${blok.ziel} setzt keine Körpergrenze. Der ` +
+        'nginx-Standard (1m) kollidiert mit der hub-eigenen Grenze von 1 MiB ' +
+        'und liefert eine nginx-Fehlerseite statt der Hub-Meldung.',
+    );
+  }
+});
+
+test('Deployment schreibt Proxy-Vertrauen und Vault-Key in die .env', () => {
+  const text = readFileSync(join(WURZEL, 'deploy-full.sh'), 'utf8');
+  assert.match(
+    text,
+    /grep -q '\^BOT_HUB_TRUSTED_PROXIES='/,
+    'BOT_HUB_TRUSTED_PROXIES fehlt in der .env-Anlage: der Hub darf ' +
+      'X-Forwarded-For nicht auswerten und alle Besucher teilen sich einen ' +
+      'Rate-Limit-Eimer (Maßnahme 47).',
+  );
+  assert.match(
+    text,
+    /BOT_HUB_TRUSTED_PROXIES=127\.0\.0\.1/,
+    'nginx läuft in dieser Installation auf demselben Rechner – 127.0.0.1 ' +
+      'ist die tatsächliche, nicht eine geratenes Adresse.',
+  );
+  assert.match(
+    text,
+    /BOT_HUB_KEY_FILE=\/etc\/bot-hub\/master\.key/,
+    'Ohne Vault-Key-Eintrag würde die Produktion ohne Verschlüsselung ' +
+      'starten (Maßnahme 46).',
+  );
+});

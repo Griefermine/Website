@@ -528,19 +528,21 @@ sind Sache des Betriebs – siehe `container-bots.md`.
 
 ## Was nicht abgesichert ist
 
-- **Der freie Platz auf der Platte wird nicht geprüft.** Der Hub prüft beim Anlegen, wie viele
-  Bots es werden (`BOT_HUB_MAX_BOTS`), aber nicht, wie viel Platz ihr Workspace
-  noch bekommt. Zwei Bots, die mit `pip` oder `npm` ihre Abhängigkeiten in den
-  Workspace holen, füllen die Platte des Hosts – und eine volle Platte legt nicht
-  nur diesen Hub lahm, sondern alles darauf. Eine harte Kontingentgrenze
-  (Quota je Workspace) ist bewusst nicht eingebaut: sie wäre nur mit
+- **Der freie Platz auf der Platte wird seit Maßnahme 49 immerhin gemessen.**
+  Der Hub prüft beim Anlegen eines Bots und vor jeder Installation den für ihn
+  schreibbaren freien Platz samt freier Inodes (`BOT_HUB_MIN_FREE_MB`,
+  `BOT_HUB_MIN_FREE_INODES`) und lehnt bei Mangel mit einer lesbaren Meldung (HTTP 422, denn 5xx-Antworten versteckt der Hub absichtlich hinter „Interner Serverfehler“) ab, statt eine
+  Installation bei halb heruntergeladenen Abhängigkeiten vom vollen Datenträger
+  stoppen zu lassen. Was er weiterhin nicht kann, ist eine **harte
+  Kontingentgrenze (Quota) je Workspace**: sie wäre nur mit
   Dateisystem-Quota (`btrfs`/`xfs`-Projekte, `dm-setup`) tragfähig, und das ist
-  Sache des Betriebs, nicht des Hubs. Was der Hub tut, begrenzt den Schaden im Einzelfall:
-  Installationen laufen im Container mit Speicher- und Prozessgrenzen, und ein
-  voller Datenträger bricht die Installation mit einer deutlichen Meldung ab,
-  statt den Hub halbfertig zurückzulassen. **Wer fremde Bots
-  betreibt, muss das Kontingent außerhalb setzen** (eigenes Loop-Device oder
-  Dateisystem-Quota für `bots/`) – siehe `documents/container-bots.md`.
+  Sache des Betriebs, nicht des Hubs. Ein laufender Bot-Prozess schreibt
+  ungeachtet jeder Hub-Prüfung in seinen Workspace, solange der Datenträger
+  Raum hat. Zwei Bots, die mit `pip` oder `npm` ihre Abhängigkeiten in den
+  Workspace holen, können die Platte des Hosts weiter füllen – und eine volle
+  Platte legt nicht nur diesen Hub lahm, sondern alles darauf. **Wer fremde
+  Bots betreibt, muss das Kontingent außerhalb setzen** (eigenes Loop-Device
+  oder Dateisystem-Quota für `bots/`) – siehe `documents/container-bots.md`.
 
 - **Container ohne Netzwerk-Firewall.** Die Grenzen sind Benutzer, Rechte,
   Prozesse, Ressourcen und Mounts (siehe `container-bots.md`). Docker kann

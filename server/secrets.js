@@ -32,6 +32,7 @@ import {
   isLegacyVaultValue,
   isVaultValue,
   vaultEnabled,
+  vaultStatus,
 } from './vault.js';
 
 /** Verzeichnis 0700, Datei 0600 – mit Absicht, nicht mit Vorgabe. */
@@ -160,6 +161,22 @@ export const storeSecretValues = (
     ? { ...readSecretValues(projectRoot, id), ...values }
     : Object.fromEntries(Object.entries(values));
   if (!Object.keys(merged).length) return fileOf(projectRoot, id);
+  /* Maßnahme 46 (Auftrag 5.1): In Produktion landen keine unverschlüsselten
+   * Geheimnisse auf der Platte. Ohne verwertbaren Vault-Key ist das ein
+   * Abbruch mit Ansage, kein schleichender Rückfall – der Vorprüfung-Check
+   * dieselbe Lage beim Start meldet, dieser hier erwischt auch eine
+   * Konfiguration, die erst zur Laufzeit fehlt oder unbrauchbar wird (z. B.
+   * die root-eigene Key-Datei, die der Hub-Benutzer nicht lesen darf). */
+  if (process.env.NODE_ENV === 'production' && !vaultEnabled(projectRoot)) {
+    const status = vaultStatus(projectRoot);
+    throw new Error(
+      'Secret-Speicher in Produktion ohne Vault-Key gesperrt: ' +
+        (status.konfiguriert
+          ? `Vault-Key nicht verwertbar – ${status.grund}`
+          : 'BOT_HUB_KEY_FILE ist nicht gesetzt') +
+        '. Bitte Schlüssel einrichten, dann werden die Werte verschrieben.',
+    );
+  }
   // Liegt ein Vault-Key an, wandert jeder Wert umgeschlagen in die Datei;
   // ohne Key bleibt das alte Klartext-Verhalten (Tests, Entwickler).
   const sealed = Object.fromEntries(

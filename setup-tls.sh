@@ -92,15 +92,18 @@ server {
     listen 80;
     server_name $DOMAIN;
 
+    # Maßnahme 47 (Audit 5.9): bewusste Körpergrenze statt nginx-Standard 1m.
+    client_max_body_size 2m;
+
     location / {
         proxy_pass http://127.0.0.1:8787;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
         
         proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
     }
 }
@@ -156,17 +159,26 @@ server {
     add_header X-XSS-Protection "1; mode=block" always;
     add_header Referrer-Policy "no-referrer-when-downgrade" always;
 
+    # Maßnahme 47 (Audit 5.9): eigene Obergrenze statt nginx-Standard 1m.
+    # Der Hub lehnt Dateikörper über 1 MiB selbst ab (413 mit eigener Meldung) –
+    # 2m sorgt dafür, dass diese Antwort beim Besucher ankommt und nicht die
+    # HTML-Fehlerseite von nginx, ohne dass ein Body unbegrenzt wird.
+    # Kein limit_req hier: Besucher-Adressen kennt der Hub (er zählt pro Client
+    # aus X-Forwarded-For, siehe BOT_HUB_TRUSTED_PROXIES); eine Zählung auf der
+    # Proxy-Adresse würde in dieser Installation alle Teilnehmer treffen.
+    client_max_body_size 2m;
+
     # Proxy zu Bot-Hub
     location / {
         proxy_pass http://127.0.0.1:8787;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
         
         # WebSocket support
         proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
         
         # Timeouts
@@ -180,7 +192,7 @@ server {
 server {
     listen 80;
     server_name $DOMAIN;
-    return 301 https://$server_name$request_uri;
+    return 301 https://\$server_name\$request_uri;
 }
 EOF
 

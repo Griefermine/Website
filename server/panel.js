@@ -27,9 +27,13 @@ import { lookup } from 'node:dns/promises';
 import { BlockList, isIP } from 'node:net';
 import {
   chmodSync,
+  constants,
+  closeSync,
   createReadStream,
   existsSync,
+  fstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
   statSync,
@@ -1098,30 +1102,60 @@ const readManifest = (bot) => {
   } catch {
     return null;
   }
-  const path = MANIFEST_NAMES.map((name) => join(dir, name)).find((file) =>
-    existsSync(file),
-  );
-  if (!path) return null;
-
-  let stat;
-  try {
-    stat = statSync(path);
-  } catch {
-    return null;
+  const kandidaten = MANIFEST_NAMES.map((name) => join(dir, name));
+  /* Maßnahme 53 (Gegenprüfung NF-1): dasselbe Muster wie bei der
+   * Datei-Auslieferung (Maßnahme 50) – früher erst `existsSync`/`statSync`
+   * und dann `readFileSync(NACH PFAD)`. Der Bot konnte die geprüfte Stelle
+   * im Fenster gegen einen Symlink tauschen, und der Hub las die fremde
+   * Datei. Jetzt: Kandidaten der Reihe nach mit `O_NOFOLLOW` öffnen; erst
+   * der Deskriptor entscheidet, ob es eine echte Datei ist, und Größe wie
+   * Inhalt zählen ausschließlich für DAS geöffnete Objekt. Ein Symlink wird
+   * wie ein fehlender Kandidat behandelt – die Suche läuft weiter. */
+  let geoeffnet = null;
+  let pfadKandidat = '';
+  for (const kandidat of kandidaten) {
+    try {
+      geoeffnet = openPanelFile(kandidat, MANIFEST_MAX_BYTES);
+      pfadKandidat = kandidat;
+      break;
+    } catch (error) {
+      if (error.status === 413) {
+        pfadKandidat = kandidat;
+        geoeffnet = { fehler: error };
+        break;
+      }
+    }
   }
-  const cacheKey = `${bot.id}:${path}`;
-  const cached = manifestCache.get(cacheKey);
-  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size)
-    return cached.value;
+  if (!geoeffnet) return null;
+  const path = pfadKandidat;
+  let stat;
+  if (geoeffnet.fehler) {
+    /* Zu groß: kein Inhalt gelesen. Cached wird trotzdem – gegen denselben
+     * Inhalt gemessen würde die Prüfung sonst bei jeder Manifest-Anfrage
+     * erneut die Platte anfassen. */
+    stat = { mtimeMs: Number.MAX_SAFE_INTEGER, size: Number.MAX_SAFE_INTEGER };
+  } else {
+    stat = geoeffnet.stat;
+    const cached = manifestCache.get(`${bot.id}:${path}`);
+    if (
+      cached &&
+      cached.mtimeMs === stat.mtimeMs &&
+      cached.size === stat.size
+    ) {
+      closeSync(geoeffnet.fd);
+      return cached.value;
+    }
+  }
 
   let value = null;
   try {
-    if (stat.size > MANIFEST_MAX_BYTES)
-      throw new Error('Manifest ist zu groß (max. 128 KB)');
-    const raw = JSON.parse(readFileSync(path, 'utf8'));
+    if (geoeffnet.fehler) throw geoeffnet.fehler;
+    // Alles, was gezählt und gehasht wird, kommt aus DEM EINEN Lesevorgang
+    // am geöffneten Deskriptor – kein zweiter Zugriff über den Pfad weit mehr.
+    const content = readFileSync(geoeffnet.fd);
+    const raw = JSON.parse(content.toString('utf8'));
     const source = raw?.hub?.panel ?? raw?.panel ?? raw;
     const manifest = normalisePanel(source);
-    const content = readFileSync(path);
     value = {
       manifest,
       path,
@@ -1134,8 +1168,10 @@ const readManifest = (bot) => {
     };
   } catch (error) {
     value = { manifest: null, path, signature: '', error: error.message };
+  } finally {
+    if (!geoeffnet.fehler) closeSync(geoeffnet.fd);
   }
-  manifestCache.set(cacheKey, {
+  manifestCache.set(`${bot.id}:${path}`, {
     mtimeMs: stat.mtimeMs,
     size: stat.size,
     value,
@@ -2455,16 +2491,60 @@ const panelAssetOrigin = (req) => {
  * gelesen (OOM = Totalausfall aller Bots). Dazu Streaming statt readFileSync. */
 const MAX_PANEL_FILE_BYTES = 8 * 1024 * 1024;
 
-const sendFile = (res, path, assetOrigin = '') => {
-  let stat;
+/* Maßnahme 50 (V27-E, Auftrag 5.2): Prüf-und-Öffnen in einem Schritt.
+ *
+ * Vorher waren es zwei getrennte Pfad-Auflösungen: erst `statSync(path)`
+ * (Größe, isFile) und danach `createReadStream(path)`. Dazwischen – und
+ * zwischen dem vorausgehenden `realpathSync` in `servePanelFile` – lag ein
+ * Zeitfenster, in dem der Bot (er schreibt seinen Workspace selbst) die
+ * Datei durch einen Symlink auf beliebige vom Hub-Benutzer lesbare Dateien
+ * tauschen konnte: geprüft wurde die eine Datei, gelesen die andere. Das
+ * Fenster ist mikrosekundengroß und praktisch schwer trafbar – die Abwehr
+ * kostet aber nichts: EINmal öffnen mit `O_NOFOLLOW` (Symlink beim Öffnen =
+ * Abbruch), danach zählt ausschließlich der Deskriptor. `fstat` gibt Größe
+ * und Typ DES GEÖFFNETEN Objekts, und der Stream liest den Deskriptor –
+ * ein späterer Tausch am Pfad geht ihn nichts mehr an.
+ *
+ * `O_NOFOLLOW` ist POSIX; unter Windows (nur Entwicklerbetrieb) fehlt die
+ * Konstante, dann entfällt dieser Teilerschutz ersatzlos – `servePanelFile`
+ * prüft weiterhin Realpfad-Eingrenzung und Namenslisten. */
+const openPanelFile = (path, maxBytes = MAX_PANEL_FILE_BYTES) => {
+  let fd;
   try {
-    stat = statSync(path);
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   } catch {
+    // Nicht gefunden, Berechtigung, oder ein Symlink (ELOOP) – nach außen
+    // immer dasselbe 404, aus dem Response darf nichts über den Grund
+    //ablesbar sein.
     throw httpError(404, 'Datei nicht gefunden');
   }
-  if (!stat.isFile()) throw httpError(404, 'Datei nicht gefunden');
-  if (stat.size > MAX_PANEL_FILE_BYTES)
-    throw httpError(413, 'Panel-Datei größer als 8 MiB');
+  let stat;
+  try {
+    stat = fstatSync(fd);
+  } catch {
+    closeSync(fd);
+    throw httpError(404, 'Datei nicht gefunden');
+  }
+  if (!stat.isFile()) {
+    closeSync(fd);
+    throw httpError(404, 'Datei nicht gefunden');
+  }
+  if (stat.size > maxBytes) {
+    const fehler =
+      maxBytes === MAX_PANEL_FILE_BYTES
+        ? httpError(413, 'Panel-Datei größer als 8 MiB')
+        : httpError(
+            413,
+            `Manifest ist zu groß (max. ${Math.floor(maxBytes / 1024)} KB)`,
+          );
+    closeSync(fd);
+    throw fehler;
+  }
+  return { fd, stat };
+};
+
+const sendFile = (res, path, assetOrigin = '') => {
+  const { fd, stat } = openPanelFile(path);
   const ext = path.slice(path.lastIndexOf('.')).toLowerCase();
   res.writeHead(200, {
     'content-type': MIME[ext] ?? 'application/octet-stream',
@@ -2485,7 +2565,9 @@ const sendFile = (res, path, assetOrigin = '') => {
       "frame-ancestors 'self'",
     ].join('; '),
   });
-  createReadStream(path)
+  // Stream am Deskriptor, nicht am Pfad: autoClose gibt den Deskriptor frei,
+  // auch im Fehlerfall (destroy schließt ihn).
+  createReadStream(null, { fd })
     .on('error', () => res.destroy())
     .pipe(res);
 };
@@ -3169,3 +3251,9 @@ const handleStoreRoutes = async (req, res, url, bot, identity) => {
 
   throw httpError(404, 'Unbekannter Bot-Speicher-Endpunkt');
 };
+
+/* Maßnahme 50 (Auftrag 5.2) und 53 (Gegenprüfung NF-1): Test-Zugang auf die
+ * Datei-Auslieferung und den Manifest-Leser. Beide entscheiden, ob ein
+ * getauschter Pfad (Symlink nach der Prüfung) noch an den Deskriptor des
+ * geprüften Objekts gebunden bleibt – das lässt sich direkt beweisen. */
+export const __testing = { openPanelFile, sendFile, readManifest };
