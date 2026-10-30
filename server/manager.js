@@ -128,19 +128,40 @@ const uploadBytes = new Map();
 const concurrentUploads = new Map();
 let activeUploadCount = 0;
 const rateBuckets = new Map();
+/**
+ * Maßnahme 47 (Auftrag 5.5): IPv4-Verbindungen meldet Node je nach
+ * Socket-Familie als `127.0.0.1` ODER als `::ffff:127.0.0.1`. Verglichen wurde
+ * bisher zeichengetreu, ein Betreiber mit `BOT_HUB_TRUSTED_PROXIES=127.0.0.1`
+ * – naheliegend, weil nginx auf demselben Rechner läuft – traf die Prüfung
+ * damit nie: `X-Forwarded-For` wurde verworfen und jeder Besucher landete im
+ * selben Eimer auf die Proxy-Adresse (ein gemeinsames Login-Limit von 30 pro
+ * Minute für die gesamte Installation). Verglichen und ausgegeben wird
+ * deshalb eine kanonische Form; `::ffff:` wird nur für ein echtes
+ * Vieren-Punkt-Pattern abgestreift, damit kein anderer Wert kollidiert.
+ */
+const canonicalAddress = (value) => {
+  const text = String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/g, '');
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(text);
+  if (mapped && mapped[1].split('.').every((teil) => Number(teil) <= 255))
+    return mapped[1];
+  return text;
+};
 const trustedProxyAddresses = () =>
   new Set(
     String(process.env.BOT_HUB_TRUSTED_PROXIES ?? '')
       .split(',')
-      .map((value) => value.trim().toLowerCase())
+      .map(canonicalAddress)
       .filter(Boolean),
   );
 const clientAddress = (req) => {
-  const remote = String(req.socket.remoteAddress ?? '').toLowerCase();
+  const remote = canonicalAddress(req.socket.remoteAddress);
   if (!trustedProxyAddresses().has(remote)) return remote;
   const forwarded = String(req.headers['x-forwarded-for'] ?? '')
     .split(',')
-    .map((value) => value.trim().toLowerCase())
+    .map(canonicalAddress)
     .filter(Boolean);
   // Walk from the directly connected proxy toward the client. Ignore only
   // explicitly trusted proxy hops; never accept a client-supplied leftmost
@@ -341,7 +362,9 @@ const rateCleanup = setInterval(() => {
 rateCleanup.unref();
 
 const uploadKeyOf = (req, url) => {
-  const remote = String(req.socket.remoteAddress ?? '');
+  // Kanonische Form (Maßnahme 47): sonst existierten für denselben Besucher
+  // zwei Eimer, je nachdem welche Familie sein Socket zufällig hatte.
+  const remote = canonicalAddress(req.socket.remoteAddress) || 'unknown';
   const cookie = String(req.headers.cookie ?? '');
   const session =
     cookie
@@ -2812,7 +2835,9 @@ const handleApi = async (req, res, url) => {
   if (resource === 'events') {
     permission('bots.read');
     if (process.env.BOT_HUB_TEST_MODE !== '1') {
-      const ip = String(req.socket.remoteAddress ?? 'unknown');
+      // Kanonische Form, aber bewusst OHNE X-Forwarded-For: die Kaps gegen
+      // Verbindungs-Hortung dürfen nicht von einem Header abhängen (47).
+      const ip = canonicalAddress(req.socket.remoteAddress) || 'unknown';
       const cookie = String(req.headers.cookie ?? '');
       const sessionMatch =
         cookie
@@ -3507,6 +3532,11 @@ export const __testing = {
   publicBot,
   isDeleteLocked,
   deletePending,
+  // Maßnahme 47: Client-Identität hinter einem Proxy ist selbst geprüft,
+  // damit die Bucket-Verdichtung nicht per HTTP erraten werden muss.
+  clientAddress,
+  canonicalAddress,
+  trustedProxyAddresses,
   deletingBots,
   pendingCreations: () => pendingBotCreations,
   flush,

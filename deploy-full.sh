@@ -235,6 +235,14 @@ fi
 grep -q '^BOT_HUB_KEY_FILE=' .env || printf '\nBOT_HUB_KEY_FILE=/etc/bot-hub/master.key\n' >> .env
 grep -q '^BOT_HUB_KEY_FILE=' .env && log_info "BOT_HUB_KEY_FILE in .env eingetragen"
 
+# Maßnahme 47 (Audit 5.5): nginx läuft in dieser Installation auf demselben
+# Rechner und lauscht öffentlich, der Hub nur auf 127.0.0.1. Ohne diesen
+# Eintrag kann der Hub X-Forwarded-For nicht auswerten und alle Besucher
+# teilen sich einen Rate-Limit-Eimer auf die Adresse von nginx (das
+# Login-Limit von 30/Min gilt dann für die ganze Installation).
+grep -q '^BOT_HUB_TRUSTED_PROXIES=' .env || printf '\nBOT_HUB_TRUSTED_PROXIES=127.0.0.1\n' >> .env
+grep -q '^BOT_HUB_TRUSTED_PROXIES=' .env && log_info "BOT_HUB_TRUSTED_PROXIES in .env eingetragen"
+
 # ============================================
 # 6. Docker-Netzwerk einrichten
 # ============================================
@@ -363,6 +371,15 @@ server {
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
+
+    # Maßnahme 47 (Audit 5.9): eigene Obergrenze statt nginx-Standard 1m.
+    # Der Hub selbst lehnt Dateikörper über 1 MiB ab (413 mit eigener
+    # Meldung); 2m lässt genau genug Spiel, damit die Antwort vom Hub kommt
+    # und nicht von nginx – und ein Body trotzdem nie unbegrenzt läuft.
+    # Kein limit_req: die Besucher-Adressen kennt der Hub (er zählt pro
+    # Client aus X-Forwarded-For, siehe BOT_HUB_TRUSTED_PROXIES); eine Zählung
+    # auf der Proxy-Adresse würde hier alle Teilnehmer treffen.
+    client_max_body_size 2m;
     
     # Temporary redirect to HTTPS (wird später konfiguriert)
     location / {

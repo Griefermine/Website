@@ -271,5 +271,43 @@ export const collectSecurityFindings = ({
       );
   }
 
+  // 7) Maßnahme 47 (Auftrag 5.5): Rate-Limits brauchen die echte Besucher-
+  //    adresse. Der Hub vertraut `X-Forwarded-For` ausschließlich dann, wenn
+  //    die direkt verbundene Adresse in BOT_HUB_TRUSTED_PROXIES steht –
+  //    richtig so, sonst könnte jeder Besucher seine Quell-Adress frei
+  //    erfinden. In Produktion MUSS der Hub an Loopback binden (Regel 1/1D),
+  //    vor ihm steht also der TLS-Proxy der Deployment-Anleitung. Ist die
+  //    Liste leer, landen alle Besucher im selben Eimer: das Login-Limit
+  //    (30/Min) gilt dann für die ganze Installation, und ein einzelner
+  //    Angreifer meldet die übrigen ab. Kein Abbruch – die Anlage funktioniert
+  //    weiter, nur die Schutzwirkung der Limits ist nicht die vorgesehene.
+  if (production) {
+    const konfigurierteProxys = String(
+      env.BOT_HUB_TRUSTED_PROXIES ?? '',
+    ).trim();
+    const offentlichErreichbar = (() => {
+      const basis = String(env.BOT_HUB_URL ?? '').trim();
+      if (!basis) return false;
+      try {
+        const { hostname } = new URL(basis);
+        const ohneKlammer = hostname.replace(/^\[|\]$/g, '');
+        return !LOOPBACK_HOSTS.has(ohneKlammer);
+      } catch {
+        // Unparsbare URL: lieber melden als schweigen – die Anlage ist
+        // sowieso fehlerhaft, die Frage ist nur, ob der Hinweis passt.
+        return true;
+      }
+    })();
+    if (offentlichErreichbar && !konfigurierteProxys) {
+      warnings.push(
+        'BOT_HUB_URL zeigt auf einen öffentlich erreichbaren Namen, aber ' +
+          'BOT_HUB_TRUSTED_PROXIES ist leer: alle Besucher hinter dem Proxy ' +
+          'teilen sich einen Rate-Limit-Eimer auf die Proxy-Adresse. Bitte die ' +
+          'Adresse des Proxies eintragen (gleicher Rechner: ' +
+          'BOT_HUB_TRUSTED_PROXIES=127.0.0.1).',
+      );
+    }
+  }
+
   return { errors, warnings };
 };
