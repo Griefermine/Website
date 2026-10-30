@@ -21,15 +21,25 @@ on:
 permissions:
   contents: read
 
+# Maßnahme 52 (Auftrag 5.11): Jede Aktion steht hier auf ihrer vollen
+# Commit-SHA, nicht auf dem verschiebbaren Tag `v4` – wer `v4` schreibt, holt
+# sich bei jedem Lauf die aktuelle Spitze, und die kann jemand mit
+# Schreibrecht auf der Aktions-Repository ändern, ohne dass ein Diff hier
+# etwas zeigt. Der Digest des Gitleaks-Containers ist dasselbe Argument in
+# andere Richtung: ein Tag auf einer Registry ist ein Name, der jederzeit
+# woanders zeigen kann; der Digest ist die unveränderliche Adresse.
+# Aktualisieren = bewusst: neue Version prüfen, SHA/Digest nachziehen,
+# `git ls-remote`/`imagetools inspect` als Beweis im Commit-Text.
+
 jobs:
   pruefen:
     name: Format, Tests und Build
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
           cache: npm
@@ -118,7 +128,7 @@ jobs:
       - name: Prüfsumme ablegen
         run: sha256sum release/*.tar.gz | tee release-sha256.txt
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bot-hub-release
           path: |
@@ -142,9 +152,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
           cache: npm
@@ -175,7 +185,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
@@ -201,11 +211,11 @@ jobs:
       - name: Historien-Scan (Gitleaks)
         run: |
           docker run --rm -v "$PWD:/repo" \
-            ghcr.io/gitleaks/gitleaks:v8.18.4 \
+            ghcr.io/gitleaks/gitleaks@sha256:75bdb2b2f4db213cde0b8295f13a88d6b333091bbfbf3012a4e083d00d31caba # v8.18.4 \
             detect --source /repo --config /repo/.gitleaks.toml \
             --redact --no-banner --exit-code 1
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: historien-scan
           path: historien-scan.txt

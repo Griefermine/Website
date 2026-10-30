@@ -480,3 +480,68 @@ describe('CLI: Exit-Codes und Unabhängigkeit der Modi', () => {
     assert.match(stdout, /--artifact/);
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * Maßnahme 52 (Auftrag 5.11): CI-Aktionen und -Container sind auf
+ * unveränderliche Adressen festgelegt. Ein `uses: …@v4` holt bei jedem
+ * Lauf die aktuelle Spitze eines verschiebbaren Tags; ein Registry-Tag
+ * ist dasselbe Problem mit anderen Mitteln. Getestet wird die Regel,
+ * nicht ein Momentwert – die konkreten SHAs pflegt der Wartende nach.
+ * ------------------------------------------------------------------ */
+describe('CI-Pinning: keine verschiebbaren Referenzen', () => {
+  const ci = readFileSync(join(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
+
+  it('jede Aktion läuft auf einer vollen Commit-SHA', () => {
+    const nutzungen = [...ci.matchAll(/^\s*(?:-\s+)?uses:\s*(\S+)/gm)].map(
+      ([, referenz]) => referenz,
+    );
+    assert.ok(
+      nutzungen.length >= 5,
+      `erwartet die bekannten Aktionen, fand ${nutzungen.length}`,
+    );
+    const vage = nutzungen.filter(
+      (referenz) => !/@[0-9a-f]{40}$/.test(referenz),
+    );
+    assert.deepEqual(
+      vage,
+      [],
+      `Diese Referenzen sind Tags, keine festen Commits: ${vage.join(', ')} – ` +
+        'ein Tag-Autor kann unter der laufenden Pipeline den Boden tauschen.',
+    );
+  });
+
+  it('jeder gepinnte Bezug nennt seine Version als Kommentar', () => {
+    // Ohne Lesespur ist ein SHA-Wechsel nicht prüfbar: der Kommentar ist der
+    // Abgleich mit `git ls-remote`.
+    const zeilen = ci
+      .split('\n')
+      .filter((zeile) => /uses:\s*\S+@[0-9a-f]{40}/.test(zeile));
+    for (const zeile of zeilen)
+      assert.match(
+        zeile,
+        /#\s*v[0-9][^ ]*$/,
+        `kein Versionshinweis: ${zeile.trim()}`,
+      );
+    assert.ok(zeilen.length >= 5);
+  });
+
+  it('der Gitleaks-Scan fährt auf einem Digest, nicht auf einem Tag', () => {
+    assert.match(
+      ci,
+      /ghcr\.io\/gitleaks\/gitleaks@sha256:[0-9a-f]{64}/,
+      'Registry-Tags sind umschreibbar – der Digest ist die feste Adresse.',
+    );
+    assert.ok(
+      !/gitleaks\/gitleaks:v\d/.test(ci),
+      'Tag-Referenz neben dem Digest',
+    );
+  });
+
+  it('der Workflow hat keine Schreibrechte über die Prüfung hinaus', () => {
+    assert.match(
+      ci,
+      /^permissions:\n\s+contents: read\s*$/m,
+      'Breitere CI-Rechte wären ein Hebel auf den Repository-Inhalt.',
+    );
+  });
+});
