@@ -17,6 +17,7 @@ import {
   rmSync,
   symlinkSync,
   unlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -138,6 +139,11 @@ test('sweepStaleExecEnvFiles räumt nur das eigene Muster', async () => {
   const fremd = join(tmpdir(), 'bot-hub-andere-datei');
   writeFileSync(spur, 'DISCORD_BOT_TOKEN=alt\n', { mode: 0o600 });
   writeFileSync(fremd, 'fremd');
+  // Die Räumung gilt nur Dateien, die älter als die Schwelle sein können
+  // (Maßnahme 44: frische Dateien parallel laufender Prozesse bleiben).
+  // Für den Nachweis das Alter einer Stunde vorgaukeln.
+  const alt = new Date(Date.now() - 3600_000);
+  utimesSync(spur, alt, alt);
   try {
     const entfernt = sweepStaleExecEnvFiles();
     assert.ok(entfernt >= 1);
@@ -148,6 +154,22 @@ test('sweepStaleExecEnvFiles räumt nur das eigene Muster', async () => {
   }
 });
 
+test('sweepStaleExecEnvFiles lässt frische Exec-Dateien anderer Läufe in Ruhe', async () => {
+  const { sweepStaleExecEnvFiles } = await import('../server/containers.js');
+  const frisch = join(
+    tmpdir(),
+    'bot-hub-exec-env-00000000-0000-4000-8000-000000000002',
+  );
+  writeFileSync(frisch, 'DISCORD_BOT_TOKEN=laufend\n', { mode: 0o600 });
+  try {
+    sweepStaleExecEnvFiles();
+    // Gerade erst angelegt: gehört möglicherweise einem parallel laufenden
+    // Docker-Spawn eines anderen Hub-Prozesses – darf nicht verschwinden.
+    assert.ok(existsSync(frisch));
+  } finally {
+    unlinkSync(frisch);
+  }
+});
 /* ------------------------------------------------------------------ *
  * Maßnahme 37 / Audit SEC-03: Panel-OAuth-Schlüssel sind Handpflege
  * ------------------------------------------------------------------ */

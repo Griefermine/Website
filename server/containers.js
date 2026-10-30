@@ -5,6 +5,7 @@ import {
   existsSync,
   fchmodSync,
   lstatSync,
+  statSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -595,14 +596,25 @@ export const removeContainer = async (bot) => {
 /* Maßnahme 38 (Audit SEC-07): Die env-Dateien enthalten Bot- und Laufzeit-
  * Tokens und werden normalerweise beim Prozess-Exit gelöscht. Stirbt der Hub
  * hart (OOM, SIGKILL), bleiben sie im /tmp liegen – beim Start wird das
- * Muster deshalb vollständig abgeräumt, bevor irgendetwas spawned. */
+ * Muster deshalb abgeräumt, bevor irgendetwas spawned.
+ * Maßnahme 44 (V27): ohne Altersschwelle räumte der Start auch die Dateien
+ * parallel laufender Geschwister-Prozesse weg (zwei Test-Suiten im selben
+ * /tmp; produkttheoretisch: ein Hub-Restart während ein laufender Install-
+ * Spawn seine Datei noch braucht). Legitime Dateien leben nur Sekunden bis
+ * Minuten – geräumt wird deshalb nur, was älter als diese Schwelle ist.
+ * Token-Reste aus Abstürzen erwischt jeder spätere Start mit. */
+const STALE_EXEC_ENV_MIN_AGE_MS = 10 * 60_000;
+
 export const sweepStaleExecEnvFiles = () => {
   let removed = 0;
   try {
+    const now = Date.now();
     for (const entry of readdirSync(tmpdir())) {
       if (!/^bot-hub-exec-env-[0-9a-f-]{36}$/.test(entry)) continue;
+      const full = join(tmpdir(), entry);
       try {
-        unlinkSync(join(tmpdir(), entry));
+        if (now - statSync(full).mtimeMs < STALE_EXEC_ENV_MIN_AGE_MS) continue;
+        unlinkSync(full);
         removed += 1;
       } catch {
         /* fremde Datei oder schon weg */
