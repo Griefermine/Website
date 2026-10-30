@@ -544,6 +544,10 @@ export const validateLocalBotNetwork = async () => {
     throw new Error(
       'Die lokale Docker-Netzwerkisolation wird derzeit nur für native Linux-Docker-Engine unterstützt. Docker Desktop und Rootless Docker sind noch nicht freigegeben.',
     );
+  if (process.getuid?.() === 0)
+    throw new Error(
+      'Bothub darf für die lokale Docker-Isolation nicht als root laufen. Starte den Hub als normalen Linux-Benutzer; Root-Rechte werden nur vom installierten Firewall-Helfer verwendet.',
+    );
   if (RUNTIME !== 'docker')
     throw new Error(
       'Die lokale Netzwerkisolation unterstützt derzeit ausschließlich Docker Engine (BOT_HUB_CONTAINER_RUNTIME=docker).',
