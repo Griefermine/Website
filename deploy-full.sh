@@ -6,7 +6,7 @@
 # Verwendung: sudo bash deploy-full.sh
 #
 
-set -e
+set -Ee -o pipefail
 
 # Farben für Ausgabe
 RED='\033[0;31m'
@@ -40,7 +40,37 @@ fi
 
 # Projektverzeichnis ermitteln
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 PROJECT_DIR="$SCRIPT_DIR"
+
+# TLS ist beim Standard-Deployment verpflichtend. Domain und Kontaktadresse
+# werden vor Systemänderungen abgefragt bzw. aus der Umgebung übernommen.
+BOT_HUB_DOMAIN="${BOT_HUB_DOMAIN:-}"
+BOT_HUB_LE_EMAIL="${BOT_HUB_LE_EMAIL:-}"
+if [ -z "$BOT_HUB_DOMAIN" ]; then
+    if [ -r /dev/tty ]; then
+        read -r -p "Öffentliche Bot-Hub-Domain (z. B. hub.example.org): " BOT_HUB_DOMAIN </dev/tty
+    else
+        log_error "BOT_HUB_DOMAIN fehlt. Nichtinteraktiv: BOT_HUB_DOMAIN und BOT_HUB_LE_EMAIL setzen."
+        exit 1
+    fi
+fi
+if [ -z "$BOT_HUB_LE_EMAIL" ]; then
+    if [ -r /dev/tty ]; then
+        read -r -p "E-Mail für Let's Encrypt Ablaufmeldungen: " BOT_HUB_LE_EMAIL </dev/tty
+    else
+        log_error "BOT_HUB_LE_EMAIL fehlt. Bitte eine erreichbare E-Mail-Adresse setzen."
+        exit 1
+    fi
+fi
+if ! [[ "$BOT_HUB_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; then
+    log_error "BOT_HUB_DOMAIN ist kein gültiger öffentlicher DNS-Name."
+    exit 1
+fi
+if ! [[ "$BOT_HUB_LE_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+(\.[^[:space:]@]+)+$ ]]; then
+    log_error "BOT_HUB_LE_EMAIL ist keine gültige E-Mail-Adresse."
+    exit 1
+fi
 
 log_info "Bot-Hub Full Deployment Script"
 log_info "Projektverzeichnis: $PROJECT_DIR"
@@ -173,38 +203,97 @@ if [ -n "$BOT_HUB_HOME" ] && [ ! -d "$BOT_HUB_HOME" ]; then
     chown bot-hub:bot-hub "$BOT_HUB_HOME"
 fi
 
-# Projektverzeichnis berechtigen
-chown -R bot-hub:bot-hub "$PROJECT_DIR"
-
-# Der Hub steuert Bot-Container über den Socket und validiert in Produktion
-# die Egress-Netzwerke per `docker network inspect` – ohne Gruppenmitglied-
-# schaft bricht der Produktionsstart mit "Discord-Ausgangsfilter: Docker-Netz
-# fehlt", weil der Dienst den Socket nicht lesen darf.
+# Quellcode und Git-Historie bleiben root-eigen und für den Dienst nur lesbar.
+# npm lifecycle scripts laufen unter einem eigenen Build-Benutzer ohne Docker-
+# oder Secret-Gruppenmitgliedschaft. Der Dienst braucht den Docker-Socket für
+# die Containersteuerung; bei rootful Docker ist diese Berechtigung selbst
+# weiterhin host-root-äquivalent und muss architektonisch separat abgelöst werden.
+if ! getent group bot-hub-code >/dev/null; then
+    groupadd --system bot-hub-code
+fi
+usermod -aG bot-hub-code bot-hub
 usermod -aG docker bot-hub
+
+if ! id bot-hub-build >/dev/null 2>&1; then
+    useradd --system --create-home --home-dir /var/lib/bot-hub-build \
+        --shell /usr/sbin/nologin --gid bot-hub-code bot-hub-build
+else
+    usermod --gid bot-hub-code --groups bot-hub-code --shell /usr/sbin/nologin bot-hub-build
+fi
+install -d -o bot-hub-build -g bot-hub-code -m 0750 /var/lib/bot-hub-build
+install -d -o bot-hub-build -g bot-hub-code -m 0750 /var/lib/bot-hub-build/.npm
+
+# Runtime-Verzeichnisse sind die einzigen Projektbereiche, die der Hub
+# beschreiben darf. Symlinks an diesen Grenzen werden nicht akzeptiert.
+for runtime_dir in "$PROJECT_DIR/data" "$PROJECT_DIR/bots"; do
+    if [ -L "$runtime_dir" ]; then
+        log_error "Runtime-Verzeichnis darf kein Symlink sein: $runtime_dir"
+        exit 1
+    fi
+    mkdir -p "$runtime_dir"
+    chown -R bot-hub:bot-hub -- "$runtime_dir"
+    chmod 0750 "$runtime_dir"
+done
+
+# Alles Übrige einschließlich .git wird root:bot-hub-code und nicht für den
+# Dienst beschreibbar. Secrets und generierte Build-Verzeichnisse bleiben außen vor.
+if [ -L "$PROJECT_DIR/.env" ]; then
+    log_error ".env darf kein Symlink sein."
+    exit 1
+fi
+chown root:bot-hub-code "$PROJECT_DIR"
+chmod 0750 "$PROJECT_DIR"
+for entry in "$PROJECT_DIR"/* "$PROJECT_DIR"/.[!.]*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    case "$entry" in
+        "$PROJECT_DIR/data"|"$PROJECT_DIR/bots"|"$PROJECT_DIR/node_modules"|"$PROJECT_DIR/dist"|"$PROJECT_DIR/.env"|"$PROJECT_DIR"/.env.backup*)
+            continue
+            ;;
+    esac
+    chown -R root:bot-hub-code -- "$entry"
+    find "$entry" -type d -exec chmod 0750 {} +
+    find "$entry" -type f -exec chmod u+rw,g+r,o-rwx {} +
+done
+
+# Die ausgelieferte Beispielbibliothek ist Quellcode, kein Workspace.
+if [ -d "$PROJECT_DIR/bots/shared" ] && [ ! -L "$PROJECT_DIR/bots/shared" ]; then
+    chown -R root:bot-hub-code -- "$PROJECT_DIR/bots/shared"
+    find "$PROJECT_DIR/bots/shared" -type d -exec chmod 0750 {} +
+    find "$PROJECT_DIR/bots/shared" -type f -exec chmod u+rw,g+r,o-rwx {} +
+fi
+
+# npm ci und Vite dürfen ausschließlich node_modules/dist beschreiben.
+for build_dir in "$PROJECT_DIR/node_modules" "$PROJECT_DIR/dist"; do
+    if [ -L "$build_dir" ]; then
+        log_error "Build-Verzeichnis darf kein Symlink sein: $build_dir"
+        exit 1
+    fi
+    install -d -o bot-hub-build -g bot-hub-code -m 2750 "$build_dir"
+    chown -R bot-hub-build:bot-hub-code -- "$build_dir"
+    find "$build_dir" -type d -exec chmod 2750 {} +
+    find "$build_dir" -type f -exec chmod u+rw,g+r,o-rwx {} +
+done
 
 # In Projektverzeichnis wechseln
 cd "$PROJECT_DIR"
 
-# Abhängigkeiten installieren
-log_info "Node.js Abhängigkeiten installieren..."
-# Audit SC-14: `--ignore-scripts` wäre hier falsch – das Frontend-Build
-# braucht esbuilds postinstall-Binary. Der Schutzweg ist die Kette aus
-# verbindlicher Lockdatei (`npm ci`), `npm audit`-Gate in der CI und dem
-# SBOM-Inventar; neue postinstall-Haker müssen als Audit-Fund sichtbar werden.
-sudo -u bot-hub npm ci --include=dev
+# Abhängigkeiten installieren und Frontend bauen – absichtlich NICHT als
+# bot-hub, da dieser Benutzer den Docker-Socket für den Laufzeitbetrieb benötigt.
+log_info "Node.js Abhängigkeiten als isolierter Build-Benutzer installieren..."
+umask 0027
+sudo -u bot-hub-build env HOME=/var/lib/bot-hub-build npm ci --include=dev
 log_success "Abhängigkeiten installiert"
 
-# Frontend bauen
-log_info "Frontend bauen..."
-sudo -u bot-hub npm run build
+log_info "Frontend als isolierter Build-Benutzer bauen..."
+sudo -u bot-hub-build env HOME=/var/lib/bot-hub-build npm run build
 log_success "Frontend gebaut"
 
 # .env.example kopieren falls .env nicht existiert
 if [ ! -f .env ]; then
     if [ -f .env.example ]; then
         cp .env.example .env
-        chown bot-hub:bot-hub .env
-        chmod 600 .env
+        chown root:bot-hub .env
+        chmod 640 .env
         log_warn ".env erstellt aus .env.example - bitte konfigurieren!"
     else
         log_error ".env.example nicht gefunden!"
@@ -213,6 +302,8 @@ if [ ! -f .env ]; then
 else
     log_info ".env existiert bereits"
 fi
+chown root:bot-hub .env
+chmod 640 .env
 
 # Vault-Master-Key für die Verschlüsselung von data/secrets/*.env (AES-256-GCM).
 # Absichtlich AUSSERHALB von data/ und des Projektordners: ein Backup oder Git-
@@ -352,120 +443,58 @@ else
 fi
 
 # ============================================
-# 10. nginx konfigurieren
+# 10. nginx vorbereiten
 # ============================================
-log_info "Step 10: nginx konfigurieren..."
+log_info "Step 10: nginx für das verpflichtende TLS-Setup vorbereiten..."
 
-# Backup der default config
-if [ -f /etc/nginx/sites-available/default ]; then
+# Eine vorhandene Bot-Hub-Konfiguration wird erst vom TLS-Skript auf eine
+# Challenge-only-Konfiguration und danach auf HTTPS umgestellt. Kein neuer
+# unverschlüsselter Reverse-Proxy wird hier veröffentlicht.
+if [ -f /etc/nginx/sites-available/default ] && [ ! -e /etc/nginx/sites-available/default.backup ]; then
     mv /etc/nginx/sites-available/default /etc/nginx/sites-available/default.backup
 fi
-
-# Bot-Hub nginx config erstellen
-cat > /etc/nginx/sites-available/bot-hub <<'EOF'
-server {
-    listen 80;
-    server_name _;
-    
-    # Security Headers
-    add_header X-Frame-Options "SAMEORIGIN" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header X-XSS-Protection "1; mode=block" always;
-
-    # Maßnahme 47 (Audit 5.9): eigene Obergrenze statt nginx-Standard 1m.
-    # Der Hub selbst lehnt Dateikörper über 1 MiB ab (413 mit eigener
-    # Meldung); 2m lässt genau genug Spiel, damit die Antwort vom Hub kommt
-    # und nicht von nginx – und ein Body trotzdem nie unbegrenzt läuft.
-    # Kein limit_req: die Besucher-Adressen kennt der Hub (er zählt pro
-    # Client aus X-Forwarded-For, siehe BOT_HUB_TRUSTED_PROXIES); eine Zählung
-    # auf der Proxy-Adresse würde hier alle Teilnehmer treffen.
-    client_max_body_size 2m;
-    
-    # Temporary redirect to HTTPS (wird später konfiguriert)
-    location / {
-        proxy_pass http://127.0.0.1:8787;
-        proxy_set_header Host $http_host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        
-        # WebSocket support
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-    }
-}
-EOF
-
-ln -sf /etc/nginx/sites-available/bot-hub /etc/nginx/sites-enabled/
 rm -f /etc/nginx/sites-enabled/default
-
-# nginx testen und neustarten
-nginx -t
-if [ $? -eq 0 ]; then
-    systemctl reload nginx
-    log_success "nginx konfiguriert und neu gestartet"
-else
-    log_error "nginx Konfiguration fehlerhaft!"
-    exit 1
-fi
+log_success "nginx vorbereitet"
 
 # ============================================
-# 11. Service starten
+# 11. Certbot-TLS standardmäßig einrichten
 # ============================================
-log_info "Step 11: Bot-Hub Service starten..."
+log_info "Step 11: Let's Encrypt-Zertifikat automatisch beantragen..."
 
 systemctl enable bot-hub
-systemctl start bot-hub
+if ! bash "$PROJECT_DIR/setup-tls.sh" "$BOT_HUB_DOMAIN" "$BOT_HUB_LE_EMAIL"; then
+    log_error "TLS-Einrichtung fehlgeschlagen. Deployment wird nicht als erfolgreich gemeldet."
+    exit 1
+fi
 
-# Warten und Status prüfen
-sleep 3
+# setup-tls.sh startet den Hub nach dem HTTPS-/Cookie-Upsert neu.
 if systemctl is-active --quiet bot-hub; then
-    log_success "Bot-Hub Service läuft"
+    log_success "Bot-Hub läuft hinter HTTPS"
 else
     log_error "Bot-Hub Service konnte nicht gestartet werden"
-    journalctl -u bot-hub -n 20 --no-pager
+    journalctl -u bot-hub -n 30 --no-pager || true
     exit 1
 fi
 
 # ============================================
-# 12. Abschluss und Hinweise
+# 12. Abschluss
 # ============================================
 echo ""
 log_success "========================================="
-log_success "Deployment erfolgreich abgeschlossen!"
+log_success "Deployment mit HTTPS erfolgreich!"
 log_success "========================================="
 echo ""
-log_info "Nächste Schritte:"
+log_info "Bot-Hub: https://$BOT_HUB_DOMAIN"
+log_info "Let's Encrypt: certbot.timer ist für automatische Erneuerungen aktiviert."
 echo ""
-echo "1. .env Datei konfigurieren:"
-echo "   nano $PROJECT_DIR/.env"
+log_info "Noch zu konfigurieren:"
+echo "1. .env: DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET und BOT_HUB_OWNER_IDS eintragen."
+echo "2. In der Discord Developer Console diese Redirect URI registrieren:"
+echo "   https://$BOT_HUB_DOMAIN/api/auth/discord/callback"
+echo "3. Danach: systemctl restart bot-hub"
+echo "4. Logs: journalctl -u bot-hub -f"
 echo ""
-echo "   WICHTIGE Variablen:"
-echo "   - DISCORD_CLIENT_ID=ihre-client-id"
-echo "   - DISCORD_CLIENT_SECRET=ihre-client-secret"
-echo "   - BOT_HUB_OWNER_IDS=ihre-discord-id"
-echo "   - BOT_HUB_URL=https://ihre-domain.de"
-echo "   - DISCORD_REDIRECT_URI=https://ihre-domain.de/api/auth/discord/callback"
-echo "   - BOT_HUB_SECURE_COOKIES=1"
-echo "   - BOT_HUB_CONTAINER_NETWORK=bot-hub-discord"
-echo "   - BOT_HUB_REQUIRE_IMAGE_DIGEST=1"
+log_warn "TLS ist eingerichtet; die Discord-OAuth-Werte müssen vor der produktiven Anmeldung gesetzt werden."
 echo ""
-echo "2. Service neu starten:"
-echo "   systemctl restart bot-hub"
-echo ""
-echo "3. Logs prüfen:"
-echo "   journalctl -u bot-hub -f"
-echo ""
-echo "4. TLS einrichten (Let's Encrypt):"
-echo "   apt install certbot python3-certbot-nginx"
-echo "   certbot --nginx -d ihre-domain.de"
-echo ""
-echo "5. Für HTTPS: nginx config anpassen:"
-echo "   nano /etc/nginx/sites-available/bot-hub"
-echo ""
-log_warn "WICHTIG: Die .env Datei MUSS konfiguriert werden bevor der Hub produktiv genutzt wird!"
-echo ""
-log_info "Service Status:"
 systemctl status bot-hub --no-pager
 echo ""
