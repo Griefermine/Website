@@ -83,6 +83,20 @@ export const collectSecurityFindings = ({
   const errors = [];
   const warnings = [];
   const production = env.NODE_ENV === 'production';
+
+  // Im lokalen Containerbetrieb ist eine nicht verifizierte Bridge oder
+  // fehlende Host-Firewall ein Startfehler, kein bloßer Hinweis.
+  if (
+    !production &&
+    env.NODE_ENV !== 'test' &&
+    facts.containerRuntimeEnabled === true &&
+    facts.localNetworkVerified !== true
+  ) {
+    errors.push(
+      'Lokale Docker-Netzwerkisolation wurde nicht erfolgreich verifiziert. Bot-Container dürfen nicht ohne bot-hub-local und aktive Host-Firewall starten.',
+    );
+  }
+
   /* Schutz-Status wird hier einmal erhoben und sowohl für die Vorprüfung als
    * auch für die Laufzeit-Meldung verwendet; `vaultStatus()` wirft nicht. */
   const schutz =
