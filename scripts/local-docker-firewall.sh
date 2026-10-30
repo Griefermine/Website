@@ -75,6 +75,41 @@ PY
   [ "$ICC" = "false" ] || die "Docker-Bridge-Peer-Kommunikation ist nicht abgeschaltet."
   [ "$MASQ" = "true" ] || die "IP-Masquerading muss für öffentlichen Ausgang aktiviert sein."
   ip -o link show dev "$BRIDGE" >/dev/null 2>&1 || die "Bridge-Interface $BRIDGE fehlt."
+
+  # Docker's automatic address pool does not know every manually configured
+  # VPN/LAN route. Refuse an overlap instead of silently shadowing that route.
+  python3 - "$SUBNET" "$BRIDGE" <<'PY'
+import ipaddress
+import subprocess
+import sys
+
+network = ipaddress.ip_network(sys.argv[1], strict=True)
+bridge = sys.argv[2]
+routes = subprocess.run(
+    ["ip", "-4", "-o", "route", "show", "table", "all"],
+    check=True,
+    capture_output=True,
+    text=True,
+).stdout
+for line in routes.splitlines():
+    fields = line.split()
+    if not fields or fields[0] == "default":
+        continue
+    dev = fields[fields.index("dev") + 1] if "dev" in fields and fields.index("dev") + 1 < len(fields) else ""
+    if dev == bridge:
+        continue
+    try:
+        route = ipaddress.ip_network(fields[0], strict=False)
+    except ValueError:
+        continue
+    if route.version == 4 and route.overlaps(network):
+        print(
+            f"Docker-Subnetz {network} überschneidet sich mit Host-Route {route} ({dev or 'unbekanntes Interface'}).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+PY
+  || die "Docker-Subnetz kollidiert mit einer vorhandenen LAN-/VPN-Route."
 }
 
 require_docker_user_chain() {
