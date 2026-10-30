@@ -42,6 +42,8 @@ sudo bash deploy-full.sh
 - ✅ Docker-Netzwerk (bot-hub-discord)
 - ✅ Host-Firewall
 - ✅ Systemd Service
+- ✅ Certbot/Let's Encrypt, HTTPS-Proxy, HTTP→HTTPS-Weiterleitung und automatische Zertifikatserneuerung
+- ✅ Digest-Pinning für die Produktions-Container-Images
 - ✅ Verzeichnisse und Rechte
 
 ### 3. .env konfigurieren
@@ -60,8 +62,8 @@ HOST=127.0.0.1
 PORT=8787
 NODE_ENV=production
 BOT_HUB_SECURE_COOKIES=1
-BOT_HUB_URL=http://127.0.0.1:8787  # Temporär, wird später von setup-tls.sh geändert
-DISCORD_REDIRECT_URI=http://ihre-domain.de/api/auth/discord/callback  # Temporär
+BOT_HUB_URL=https://ihre-domain.de
+DISCORD_REDIRECT_URI=https://ihre-domain.de/api/auth/discord/callback
 BOT_HUB_CONTAINER_RUNTIME=docker
 BOT_HUB_CONTAINER_NETWORK=bot-hub-discord
 BOT_HUB_REQUIRE_IMAGE_DIGEST=1
@@ -74,19 +76,22 @@ systemctl restart bot-hub
 systemctl status bot-hub
 ```
 
-### 5. TLS/HTTPS einrichten
+### 5. TLS/HTTPS (normalerweise automatisch)
+
+`deploy-full.sh` richtet TLS bereits während des Standard-Deployments ein.
+Die manuelle Ausführung ist nur für bestehende Installationen oder zur
+erneuten Konfiguration nötig:
 
 ```bash
-sudo bash setup-tls.sh ihre-domain.de
+sudo bash setup-tls.sh ihre-domain.de admin@example.org
 ```
 
-**Das Skript:**
+**Voraussetzungen für Let's Encrypt:**
 
-- ✅ Installiert certbot
-- ✅ Beantragt Let's Encrypt Zertifikat
-- ✅ Konfiguriert nginx für HTTPS
-- ✅ Richtet Auto-Renewal ein
-- ✅ Aktualisiert .env mit HTTPS-URLs
+- Der Domainname zeigt per DNS auf diesen Server; vorhandene A- und AAAA-Einträge müssen stimmen.
+- TCP-Port 80 ist von außen erreichbar (HTTP-01-Challenge); TCP-Port 443 ist für HTTPS freigegeben.
+- Das Skript testet die nginx-Konfiguration und aktiviert die automatische Erneuerung einschließlich nginx-Reload nach einer erfolgreichen Erneuerung.
+- Das Deployment legt für die Standard-Container und optional verwaltetes MySQL unveränderliche Registry-Digests fest.
 
 ### 6. Discord OAuth App konfigurieren
 
@@ -417,7 +422,7 @@ Bei Problemen:
 - [ ] deploy-full.sh ausgeführt
 - [ ] .env konfiguriert
 - [ ] Discord OAuth App erstellt
-- [ ] setup-tls.sh ausgeführt
+- [ ] HTTPS ist aktiv und Certbot-Erneuerung wurde geprüft
 - [ ] Service läuft: `systemctl status bot-hub`
 - [ ] HTTPS funktioniert: `https://ihre-domain.de`
 - [ ] Discord Login funktioniert
