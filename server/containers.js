@@ -56,14 +56,26 @@ const MAVEN_SETTINGS_CONTENT =
  * auf dem Pfad wird als Verweis selbst entfernt (sein Ziel bleibt
  * unangetastet), geschrieben wird atomar über Temporärdatei + rename. */
 
-/** `basis/…teile` als echtes Verzeichnis sichern; Verweise werden ersetzt. */
+/** `basis/…teile` als echtes Verzeichnis sichern; Verweise werden ersetzt.
+ *
+ * Maßnahme 51 (Auftrag 5.3): die frühere Fassung warf nach `lstat` ->
+ * `unlink` ->
+ * `mkdir` ein `EEXIST` stillschweigend weg. Genau das ist der Fall, wenn ein
+ * Angreifer mit Writer-Rechten im Workspace den gelöschten Eintrag zwischen
+ * unserer Prüfung und dem Anlegen NEU als Symlink anlegt: der Aufrufer bekam
+ * „alles gut“ zurück, und der .NET-Init-Lauf (der bewusst als root in diesen
+ * Ordner schreibt) folgte dem Verweis. Ein EEXIST nach vorherigem Nichtvor-
+ * handensein ist deshalb ein harter Abbruch, wenn die Stelle kein echtes
+ * Verzeichnis trägt – auf einem zweifelhaften Zustand wird nicht weiter-
+ * gemacht. */
 export const ensureWorkspaceDirNoFollow = (basis, ...teile) => {
   let pfad = basis;
   for (const teil of teile) {
     pfad = join(pfad, teil);
     try {
       const stat = lstatSync(pfad);
-      if (!stat.isDirectory()) unlinkSync(pfad);
+      if (stat.isDirectory()) continue;
+      unlinkSync(pfad);
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
     }
@@ -72,6 +84,22 @@ export const ensureWorkspaceDirNoFollow = (basis, ...teile) => {
       mkdirSync(pfad, { mode: 0o755 });
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
+      /* Jemand anderes hat in der Zwischenzeit hier etwas angelegt. Echtes
+       * Verzeichnis -> in Ordnung (etwa ein zweiter Hub-Lauf). Alles andere,
+       * insbesondere ein frisch gesetzter Symlink -> Abbruch. */
+      let nachtrag;
+      try {
+        nachtrag = lstatSync(pfad);
+      } catch {
+        throw error;
+      }
+      if (!nachtrag.isDirectory())
+        throw Object.assign(
+          new Error(
+            `Workspace-Eintrag "${teil}" wurde während der Prüfung ausgetauscht`,
+          ),
+          { code: 'ESWAPPED' },
+        );
     }
   }
   return pfad;
@@ -794,8 +822,13 @@ export const execArgs = (bot, projectRoot, dir, command, env = {}) => {
  * Lösch-Cleanup blockieren (Maßnahme 32/35). */
 export const ensureDotnetCliHome = async (bot, projectRoot) => {
   const workspace = workspacePath(bot, projectRoot);
-  // Vor dem root-Lauf die Ziele symlinksicher machen (Maßnahme 36): root
-  // würde einem vom Bot gelegten Verweis sonst bis ins Ziel folgen.
+  /* Maßnahme 51: Vorher wurde ein Fehler der Symlink-Prüfung hier
+   * geschluckt und der ROOT-Lauf trotzdem gestartet – dabei ist genau der
+   * Schutzloseste Fall ("Prüfung konnte nicht durchgreifen") der Grund, ihn
+   * bleiben zu lassen. Der root-Einlauf ohne geprüfte Pfade ist genau der
+   * Angriffsvektor, den die Prüfung abschneidet. Jetzt: Prüfung schlägt
+   * fehl -> kein root-Lauf; das nächste dotnet-Kommando meldet den echten
+   * Grund. */
   try {
     ensureWorkspaceDirNoFollow(
       workspace,
@@ -810,8 +843,11 @@ export const ensureDotnetCliHome = async (bot, projectRoot) => {
       'NuGet',
       'Migrations',
     );
-  } catch {
-    /* unbeschreibbarer Workspace: der root-Lauf schlägt fehl, der Build meldet es */
+  } catch (error) {
+    console.warn(
+      `[hub] .NET-Init-Lauf übersprungen – Workspace-Pfade nicht sicher anlegbar (${error.message}).`,
+    );
+    return;
   }
   const args = [
     'run',
@@ -820,13 +856,37 @@ export const ensureDotnetCliHome = async (bot, projectRoot) => {
     `bot-hub-dotnet-init-${randomUUID()}`,
     '--entrypoint',
     'sh',
+    // Maßnahme 51: root ist hier Absicht (Sentinel aus /root des Bildes),
+    // also wird es fest gesetzt statt der Bild-Vorgabe zu vertrauen – ein
+    // Bild mit Nicht-Root-Default konnte die Init bisher still scheitern
+    // lassen. Das Skript selbst prüft JEDEN Pfadteil erneut auf Symlinks
+    // (doppelte Boden: die Host-Prüfung oben ist nur die eine Hälfte) und
+    // chown folgt keinen Verweisen (-h: der Link selbst, nie sein Ziel).
+    '--user',
+    '0:0',
     '--network',
     'none',
     '-v',
     `${workspace}:/workspace`,
     imageOf(bot),
     '-c',
-    'mkdir -p /workspace/.cache/dotnet-cli-home/.dotnet && find /root/.dotnet -maxdepth 1 \\( -name "*.dotnetFirstUseSentinel" -o -name "*.toolpath.sentinel" \\) -exec cp -n {} /workspace/.cache/dotnet-cli-home/.dotnet/ \\; && mkdir -p /workspace/.cache/xdg-data/NuGet/Migrations && touch /workspace/.cache/xdg-data/NuGet/Migrations/1 && chown -R "$(stat -c %u /workspace)":$(stat -c %g /workspace) /workspace/.cache/dotnet-cli-home /workspace/.cache/xdg-data',
+    [
+      'set -e',
+      'for d in /workspace/.cache /workspace/.cache/dotnet-cli-home ' +
+        '/workspace/.cache/dotnet-cli-home/.dotnet /workspace/.cache/xdg-data ' +
+        '/workspace/.cache/xdg-data/NuGet ' +
+        '/workspace/.cache/xdg-data/NuGet/Migrations; do',
+      '  [ ! -L "$d" ] || exit 1',
+      '  mkdir -p "$d"',
+      '  [ ! -L "$d" ] || exit 1',
+      'done',
+      'm=/workspace/.cache/xdg-data/NuGet/Migrations/1',
+      '[ ! -L "$m" ] || exit 1',
+      'find /root/.dotnet -maxdepth 1 \\( -name "*.dotnetFirstUseSentinel" -o -name "*.toolpath.sentinel" \\) -exec cp -n {} /workspace/.cache/dotnet-cli-home/.dotnet/ \\;',
+      'touch "$m"',
+      'chown -Rh "$(stat -c %u /workspace)":$(stat -c %g /workspace) ' +
+        '/workspace/.cache/dotnet-cli-home /workspace/.cache/xdg-data',
+    ].join('\n'),
   ];
   try {
     await run(args);
