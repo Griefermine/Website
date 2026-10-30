@@ -72,7 +72,8 @@ const registryParts = (input) => {
   const slash = reference.indexOf('/');
   const first = slash >= 0 ? reference.slice(0, slash) : '';
   const hasRegistry =
-    slash >= 0 && (first.includes('.') || first.includes(':') || first === 'localhost');
+    slash >= 0 &&
+    (first.includes('.') || first.includes(':') || first === 'localhost');
   const registry =
     hasRegistry && first !== 'docker.io'
       ? first
@@ -119,14 +120,18 @@ const requestManifestHeaders = (url, token = '') =>
 
 const tokenFromChallenge = (challenge, repository) => {
   if (!/^Bearer\s+/i.test(challenge))
-    throw new Error('Registry verwendet eine nicht unterstützte Authentisierung');
+    throw new Error(
+      'Registry verwendet eine nicht unterstützte Authentisierung',
+    );
   const field = (name) =>
     new RegExp(name + '="([^"]+)"', 'i').exec(challenge)?.[1] ?? '';
   const realm = field('realm');
   const service = field('service');
   const scope = field('scope') || 'repository:' + repository + ':pull';
   if (!realm || !/^https:\/\//i.test(realm) || !service)
-    throw new Error('Registry lieferte eine ungültige Authentisierungs-Challenge');
+    throw new Error(
+      'Registry lieferte eine ungültige Authentisierungs-Challenge',
+    );
   const url = new URL(realm);
   url.searchParams.set('service', service);
   url.searchParams.set('scope', scope);
@@ -159,14 +164,18 @@ export const resolveImageDigest = (input) => {
     );
   const digest = headerValue(headers, 'docker-content-digest');
   if (!/^sha256:[a-f0-9]{64}$/.test(digest))
-    throw new Error('Registry lieferte keinen gültigen SHA-256-Digest für ' + parsed.reference);
+    throw new Error(
+      'Registry lieferte keinen gültigen SHA-256-Digest für ' + parsed.reference,
+    );
   return parsed.reference + '@' + digest;
 };
 
 const upsertEnvironment = (path, original, changes) => {
   const stat = lstatSync(path);
   if (!stat.isFile() || stat.isSymbolicLink())
-    throw new Error('.env muss eine reguläre Datei und darf kein Symlink sein.');
+    throw new Error(
+      '.env muss eine reguläre Datei und darf kein Symlink sein.',
+    );
   const keys = new Set(Object.keys(changes));
   const kept = String(original)
     .split(/\r?\n/)
@@ -212,7 +221,11 @@ const main = () => {
     } catch {
       throw new Error('BOT_HUB_CONTAINER_IMAGES ist kein gültiges JSON.');
     }
-    if (!configured || Array.isArray(configured) || typeof configured !== 'object')
+    if (
+      !configured ||
+      Array.isArray(configured) ||
+      typeof configured !== 'object'
+    )
       throw new Error('BOT_HUB_CONTAINER_IMAGES muss ein JSON-Objekt sein.');
   }
 
@@ -220,14 +233,17 @@ const main = () => {
   for (const [key, value] of Object.entries(configured)) {
     if (!(key in DEFAULT_CONTAINER_IMAGES)) continue;
     if (typeof value !== 'string' || !IMAGE_PATTERN.test(value.trim()))
-      throw new Error('BOT_HUB_CONTAINER_IMAGES.' + key + ' ist keine gültige Image-Referenz.');
+      throw new Error(
+        'BOT_HUB_CONTAINER_IMAGES.' + key + ' ist keine gültige Image-Referenz.',
+      );
     selected[key] = value.trim();
   }
 
   const cache = new Map();
   const pinned = {};
   for (const [key, reference] of Object.entries(selected)) {
-    if (!cache.has(reference)) cache.set(reference, resolveImageDigest(reference));
+    if (!cache.has(reference))
+      cache.set(reference, resolveImageDigest(reference));
     pinned[key] = cache.get(reference);
   }
 
