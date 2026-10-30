@@ -295,7 +295,7 @@ describe('Lokale Firewall-Einrichtung', () => {
     assert.doesNotMatch(helper, /iptables[^\n]*-F DOCKER-USER/);
     assert.match(setup, /com\.docker\.network\.bridge\.enable_icc=false/);
     assert.match(setup, /com\.docker\.network\.bridge\.enable_ip_masquerade=true/);
-    assert.match(setup, /ExecStartPost=-\/usr\/local\/sbin\/bot-hub-local-firewall apply/);
+    assert.match(setup, /ExecStartPost=\/usr\/local\/sbin\/bot-hub-local-firewall apply/);
     assert.match(setup, /NOPASSWD: %s apply, %s check/);
   });
 });
