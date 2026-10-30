@@ -27,9 +27,13 @@ import { lookup } from 'node:dns/promises';
 import { BlockList, isIP } from 'node:net';
 import {
   chmodSync,
+  constants,
+  closeSync,
   createReadStream,
   existsSync,
+  fstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
   statSync,
@@ -2455,16 +2459,53 @@ const panelAssetOrigin = (req) => {
  * gelesen (OOM = Totalausfall aller Bots). Dazu Streaming statt readFileSync. */
 const MAX_PANEL_FILE_BYTES = 8 * 1024 * 1024;
 
-const sendFile = (res, path, assetOrigin = '') => {
-  let stat;
+/* Maßnahme 50 (V27-E, Auftrag 5.2): Prüf-und-Öffnen in einem Schritt.
+ *
+ * Vorher waren es zwei getrennte Pfad-Auflösungen: erst `statSync(path)`
+ * (Größe, isFile) und danach `createReadStream(path)`. Dazwischen – und
+ * zwischen dem vorausgehenden `realpathSync` in `servePanelFile` – lag ein
+ * Zeitfenster, in dem der Bot (er schreibt seinen Workspace selbst) die
+ * Datei durch einen Symlink auf beliebige vom Hub-Benutzer lesbare Dateien
+ * tauschen konnte: geprüft wurde die eine Datei, gelesen die andere. Das
+ * Fenster ist mikrosekundengroß und praktisch schwer trafbar – die Abwehr
+ * kostet aber nichts: EINmal öffnen mit `O_NOFOLLOW` (Symlink beim Öffnen =
+ * Abbruch), danach zählt ausschließlich der Deskriptor. `fstat` gibt Größe
+ * und Typ DES GEÖFFNETEN Objekts, und der Stream liest den Deskriptor –
+ * ein späterer Tausch am Pfad geht ihn nichts mehr an.
+ *
+ * `O_NOFOLLOW` ist POSIX; unter Windows (nur Entwicklerbetrieb) fehlt die
+ * Konstante, dann entfällt dieser Teilerschutz ersatzlos – `servePanelFile`
+ * prüft weiterhin Realpfad-Eingrenzung und Namenslisten. */
+const openPanelFile = (path) => {
+  let fd;
   try {
-    stat = statSync(path);
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   } catch {
+    // Nicht gefunden, Berechtigung, oder ein Symlink (ELOOP) – nach außen
+    // immer dasselbe 404, aus dem Response darf nichts über den Grund
+    //ablesbar sein.
     throw httpError(404, 'Datei nicht gefunden');
   }
-  if (!stat.isFile()) throw httpError(404, 'Datei nicht gefunden');
-  if (stat.size > MAX_PANEL_FILE_BYTES)
+  let stat;
+  try {
+    stat = fstatSync(fd);
+  } catch {
+    closeSync(fd);
+    throw httpError(404, 'Datei nicht gefunden');
+  }
+  if (!stat.isFile()) {
+    closeSync(fd);
+    throw httpError(404, 'Datei nicht gefunden');
+  }
+  if (stat.size > MAX_PANEL_FILE_BYTES) {
+    closeSync(fd);
     throw httpError(413, 'Panel-Datei größer als 8 MiB');
+  }
+  return { fd, stat };
+};
+
+const sendFile = (res, path, assetOrigin = '') => {
+  const { fd, stat } = openPanelFile(path);
   const ext = path.slice(path.lastIndexOf('.')).toLowerCase();
   res.writeHead(200, {
     'content-type': MIME[ext] ?? 'application/octet-stream',
@@ -2485,7 +2526,9 @@ const sendFile = (res, path, assetOrigin = '') => {
       "frame-ancestors 'self'",
     ].join('; '),
   });
-  createReadStream(path)
+  // Stream am Deskriptor, nicht am Pfad: autoClose gibt den Deskriptor frei,
+  // auch im Fehlerfall (destroy schließt ihn).
+  createReadStream(null, { fd })
     .on('error', () => res.destroy())
     .pipe(res);
 };
@@ -3169,3 +3212,9 @@ const handleStoreRoutes = async (req, res, url, bot, identity) => {
 
   throw httpError(404, 'Unbekannter Bot-Speicher-Endpunkt');
 };
+
+/* Maßnahme 50 (Auftrag 5.2): Test-Zugang auf die Datei-Auslieferung. Die
+ * Funktion entscheidet, ob ein getauschter Pfad (Symlink nach der Prüfung)
+ * noch an den Deskriptor des geprüften Objekts gebunden bleibt – das lässt
+ * sich mit einem gefälschten `res` direkt beweisen, ohne den ganzen Hub. */
+export const __testing = { openPanelFile, sendFile };
