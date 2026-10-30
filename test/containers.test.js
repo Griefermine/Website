@@ -17,6 +17,7 @@ let root;
 let bot;
 let containers;
 let createArgs;
+let createInternalBotApiHandler;
 
 const label = (args) =>
   args[args.findIndex((item) => item.startsWith('bot-hub.config='))] ?? '';
@@ -35,6 +36,7 @@ before(async () => {
     workspaceRoot: 'bots/bot1/workspace',
   };
   containers = await import('../server/containers.js');
+  ({ createInternalBotApiHandler } = await import('../server/internalBotApi.js'));
   createArgs = containers.containerCreateArgs(bot, root);
   if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
   else process.env.NODE_ENV = previousNodeEnv;
@@ -210,6 +212,90 @@ describe('Container-Isolation', () => {
       root,
     );
     assert.notEqual(label(other), label(createArgs));
+  });
+});
+
+describe('Interner Bot-API-Listener', () => {
+  const request = (url) => {
+    let status = null;
+    let body = '';
+    let calls = 0;
+    const wrapped = createInternalBotApiHandler((_req, res) => {
+      calls += 1;
+      res.writeHead(200);
+      res.end('delegiert');
+    });
+    wrapped(
+      { url },
+      {
+        writeHead(code) {
+          status = code;
+        },
+        end(value = '') {
+          body = value;
+        },
+      },
+    );
+    return { status, body, calls };
+  };
+
+  it('leitet nur /api/hub und seine Unterpfade an den Haupt-Router weiter', () => {
+    for (const path of ['/api/hub', '/api/hub/', '/api/hub/db/items?x=1']) {
+      assert.deepEqual(request(path), {
+        status: 200,
+        body: 'delegiert',
+        calls: 1,
+      });
+    }
+  });
+
+  it('blockiert Dashboard-, Auth- und Admin-APIs auf dem Container-Listener', () => {
+    for (const path of [
+      '/api/auth',
+      '/api/bots',
+      '/api/access',
+      '/api/hub%2Fdb',
+      '/api/hub/../bots',
+      '/',
+    ]) {
+      const result = request(path);
+      assert.equal(result.status, 404, path);
+      assert.equal(result.calls, 0, path);
+    }
+  });
+
+  it('behandelt ungültige Request-URLs ohne Aufruf des Routers', () => {
+    const result = request('http://[::1');
+    assert.equal(result.status, 400);
+    assert.equal(result.calls, 0);
+  });
+});
+
+describe('Lokale Firewall-Einrichtung', () => {
+  it('nutzt eigene Ketten, blockiert private Ziele und erhält Docker-Ketten', () => {
+    const helper = readFileSync(
+      join(ROOT, 'scripts/local-docker-firewall.sh'),
+      'utf8',
+    );
+    const setup = readFileSync(
+      join(ROOT, 'scripts/setup-local-docker-isolation.sh'),
+      'utf8',
+    );
+    assert.match(helper, /BOTHUB_LOCAL_EGRESS/);
+    assert.match(helper, /BOTHUB_LOCAL_INPUT/);
+    assert.match(helper, /DOCKER-USER/);
+    assert.match(helper, /10\.0\.0\.0\/8/);
+    assert.match(helper, /172\.16\.0\.0\/12/);
+    assert.match(helper, /192\.168\.0\.0\/16/);
+    assert.match(helper, /169\.254\.0\.0\/16/);
+    assert.match(helper, /bot-hub-local-api-egress/);
+    assert.match(helper, /replace_jump_first DOCKER-USER/);
+    assert.match(helper, /replace_jump_first INPUT/);
+    assert.doesNotMatch(helper, /iptables[^\n]*-F DOCKER-USER/);
+    assert.match(setup, /com\.docker\.network\.bridge\.enable_icc=false/);
+    assert.match(setup, /com\.docker\.network\.bridge\.enable_ip_masquerade=true/);
+    assert.match(setup, /ExecStartPost=-\/usr\/local\/sbin\/bot-hub-local-firewall apply/);
+    assert.match(setup, /NOPASSWD: %s apply, %s check/);
   });
 });
 
