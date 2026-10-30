@@ -19,6 +19,7 @@ import {
 } from './database.js';
 import { managedMySqlActive, provisionManagedMySql } from './mysql.js';
 import { configureProductionEgress } from './egress.js';
+import { createInternalBotApiHandler } from './internalBotApi.js';
 
 // BOT_HUB_TEST_MODE schaltet Anmeldung, Rate-Limits und Pfadprüfung ab.
 // Das darf in einer veröffentlichten Instanz niemals passieren – sonst
@@ -218,20 +219,7 @@ const botApiPort =
 // Dieser Listener ist ausschließlich für die Runtime-API gedacht. Selbst wenn
 // ein anderer API-Endpunkt später versehentlich ohne Authentifizierung bleibt,
 // ist er über das Docker-Gateway nicht erreichbar.
-const botApiHandler = (req, res) => {
-  let pathname = '';
-  try {
-    pathname = new URL(req.url || '/', 'http://localhost').pathname;
-  } catch {
-    res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
-    return res.end(JSON.stringify({ error: 'Ungültiger Request-Pfad' }));
-  }
-  if (pathname !== '/api/hub' && !pathname.startsWith('/api/hub/')) {
-    res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' });
-    return res.end(JSON.stringify({ error: 'Nicht verfügbar' }));
-  }
-  return handler(req, res);
-};
+const botApiHandler = createInternalBotApiHandler(handler);
 const botApiServer = botApiGateway
   ? createServerFactory(botApiHandler)
   : null;
