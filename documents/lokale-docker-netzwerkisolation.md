@@ -41,7 +41,7 @@ Erwartete Docker-Eigenschaften:
 
 Die Subnetz- und Gateway-Adresse werden von Docker dynamisch vergeben und danach aus `docker network inspect` gelesen. Dadurch wird kein festes privates Subnetz angenommen. `Internal=true` wird bewusst nicht verwendet, weil dieses Docker-Netz dann keinen normalen externen Ausgang hätte.
 
-Die Bot-Container veröffentlichen keine Ports und erhalten keinen `host.docker.internal`-Eintrag. IPv6 wird zusätzlich im Netzwerk-Namespace jedes Bot-Containers über Sysctl deaktiviert.
+Die Bot-Container veröffentlichen keine Ports und erhalten keinen `host.docker.internal`-Eintrag. IPv6 wird zusätzlich im Netzwerk-Namespace jedes Bot-Containers über Sysctl deaktiviert. Der einzige private IPv4-Ausnahmepfad ist die tatsächliche Docker-Gateway-Adresse auf TCP-Port `8788`; sowohl im Egress-Filter als auch in der Host-INPUT-Kette ist ausschließlich dieses Ziel für die interne Bot-API erlaubt.
 
 ## Einrichtung
 
@@ -52,7 +52,7 @@ Die Bot-Container veröffentlichen keine Ports und erhalten keinen `host.docker.
    sudo BOT_HUB_USER="$USER" bash scripts/setup-local-docker-isolation.sh
    ```
 
-   Das Skript erstellt das Netzwerk, installiert den kleinen Firewall-Helfer root-eigen nach `/usr/local/sbin/bot-hub-local-firewall`, richtet eng begrenzte sudoers-Rechte für `apply` und `check` ein und installiert einen systemd-Drop-in, der die Firewall nach einem Docker-Daemon-Start erneut anwendet.
+   Das Skript erstellt das Netzwerk, installiert den kleinen Firewall-Helfer root-eigen nach `/usr/local/sbin/bot-hub-local-firewall`, richtet eng begrenzte sudoers-Rechte für `apply` und `check` ein und installiert einen systemd-Drop-in, der die Firewall nach einem Docker-Daemon-Start erneut anwendet. Kann die Firewall dort nicht angewendet werden, gilt der Docker-Dienststart als fehlgeschlagen.
 
 3. Anschließend Bothub wie gewohnt als normaler Hub-Benutzer starten.
 
@@ -118,4 +118,4 @@ Vor produktiver Verwendung müssen reale Tests auf dem Zielrechner durchgeführt
 
 ## Grenzen
 
-Die Isolation hängt weiterhin vom Host-Kernel, Docker-Daemon, Firewall-Backend und den Rechten des Hub-Benutzers ab. Wer den Docker-Daemon kontrolliert, kann Container und Netzwerke verändern. Die Maßnahme ersetzt weder ein Rootless-/MicroVM-Sandboxing noch ein separates Testsystem. Sie ist außerdem kein Ersatz für die weiterhin nötigen Bot-Code-, API-, OAuth- und Dateisystem-Sicherheitsprüfungen.
+Bothub muss für dieses lokale Profil als normaler, nicht privilegierter Linux-Benutzer laufen; nur das installierte Firewall-Hilfsprogramm wird gezielt mit Root-Rechten ausgeführt. Die Isolation hängt weiterhin vom Host-Kernel, Docker-Daemon, Firewall-Backend und den Rechten des Hub-Benutzers ab. Wer den Docker-Daemon kontrolliert, kann Container und Netzwerke verändern. Die Maßnahme ersetzt weder ein Rootless-/MicroVM-Sandboxing noch ein separates Testsystem. Sie ist außerdem kein Ersatz für die weiterhin nötigen Bot-Code-, API-, OAuth- und Dateisystem-Sicherheitsprüfungen.
