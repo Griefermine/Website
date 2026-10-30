@@ -71,7 +71,7 @@ read_network() {
   [[ "$MASQUERADE" == "true" ]] || fail "IP-Masquerading muss für ausgehenden Internetzugriff aktiviert sein."
   [[ "$LABEL" == "$PROFILE_VERSION" ]] || fail "Netzwerk trägt nicht das erwartete Bothub-Sicherheitslabel."
   [[ "$NETWORK_ID" =~ ^[a-f0-9]{64}$ ]] || fail "Docker-Netzwerk-ID ist ungültig."
-  [[ "$SUBNET" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-0])$ ]] || fail "IPv4-Subnetz fehlt oder ist ungültig."
+  [[ "$SUBNET" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([1-9]|[12][0-9]|30)$ ]] || fail "IPv4-Subnetz fehlt oder ist ungültig."
   [[ "$GATEWAY" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail "IPv4-Gateway fehlt oder ist ungültig."
 
   if [[ -z "$BRIDGE" || "$BRIDGE" == "<no value>" ]]; then
@@ -279,6 +279,8 @@ main() {
       setup_unit_and_checker
       systemctl restart bot-hub-local-network-firewall.service ||
         systemctl start bot-hub-local-network-firewall.service
+      systemctl is-active --quiet bot-hub-local-network-firewall.service ||
+        fail "Systemd-Firewall-Service ist nicht aktiv."
       check_firewall
       note "Lokales Docker-Netz und Firewall sind eingerichtet."
       note "Netz: $NETWORK | Bridge: $BRIDGE | Subnetz: $SUBNET | Gateway: $GATEWAY"
