@@ -298,12 +298,13 @@ Zwei weitere Prüfungen können den Start verhindern:
   die Container `root`, und die Trennung zwischen fremdem Bot-Code und dem Host
   träfe nicht mehr.
 - **Images ohne Digest.** Ein Tag wie `python:3.12-bookworm` ist eine Liste von
-  Namen, die jemand anderes jederzeit umschreiben kann. Mit
-  `BOT_HUB_REQUIRE_IMAGE_DIGEST=1` startet der Hub nicht, solange nicht alle
-  Images über `BOT_HUB_CONTAINER_IMAGES` auf einen Digest festgelegt sind. Ohne
-  diesen Schalter gibt es in Produktion eine deutliche Warnung – die
-  Grundeinstellung bleibt veränderlich, damit ein Betrieb nicht an einem fehlenden
-  Digest-Pin stehen bleibt. Ein ausgedachter Digest wäre schlimmer als keiner:
+  Namen, die jemand anderes jederzeit umschreiben kann. In Produktion bricht
+  der Preflight immer ab, solange nicht alle verwendeten Images über
+  `BOT_HUB_CONTAINER_IMAGES` auf einen Digest festgelegt sind; der optionale
+  Schalter `BOT_HUB_REQUIRE_IMAGE_DIGEST=1` erzwingt denselben Check auch in
+  Entwicklung. `deploy-full.sh` löst die Registry-Digests vor dem Hub-Start
+  über den eingeschränkten Loopback-Proxy auf und schreibt die festen
+  Referenzen in `.env`. Ein ausgedachter Digest wäre schlimmer als keiner:
   er lässt jeden Pull scheitern, ohne erkennbar zu sein, warum.
 - **`data/secrets/` mit fremden Rechten.** Secret-Dateien werden mit `0600`
   angelegt; das nützt nichts, wenn das Verzeichnis sie offen hält. In Produktion
