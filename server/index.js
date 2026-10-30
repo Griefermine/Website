@@ -3,9 +3,13 @@ import {
   containerRuntimeEnabled,
   containerSecurityFacts,
   PRODUCTION_BOT_GATEWAY,
-  PRODUCTION_BOT_HUB_PORT,
   validateProductionBotNetwork,
 } from './containers.js';
+import { createInternalBotApiHandler } from './internalApi.js';
+import {
+  LOCAL_BOT_HUB_PORT,
+  validateLocalBotNetwork,
+} from './localNetwork.js';
 import { createServer, stopAllBots, flushPersist } from './manager.js';
 import { collectSecurityFindings, resolveBindHost } from './preflight.js';
 import {
@@ -79,6 +83,20 @@ if (process.env.NODE_ENV === 'production') {
     await validateProductionBotNetwork();
   } catch (error) {
     console.error(`[hub] ABBRUCH: Discord-Ausgangsfilter: ${error.message}`);
+    process.exit(1);
+  }
+}
+
+// Das lokale Profil wird vor Datenbank- und Bot-Initialisierung verifiziert.
+// Ohne Custom-Bridge und Host-Firewall dürfen keine Bot-Container starten.
+let localBotNetwork = null;
+if (process.env.NODE_ENV !== 'production') {
+  try {
+    localBotNetwork = await validateLocalBotNetwork();
+  } catch (error) {
+    console.error(
+      `[hub] ABBRUCH: lokale Docker-Netzwerkisolation: ${error.message}`,
+    );
     process.exit(1);
   }
 }
@@ -179,20 +197,6 @@ warnAboutUrl();
  * `BOT_HUB_CONTAINER_URL` würde den Hub-Start sogar abbrechen lassen
  * (siehe `validateProductionBotNetwork`).
  */
-if (
-  containerRuntimeEnabled() &&
-  process.env.NODE_ENV !== 'production' &&
-  !String(process.env.BOT_HUB_CONTAINER_URL ?? '').trim()
-)
-  console.warn(
-    '[hub] HINWEIS: BOT_HUB_CONTAINER_URL ist nicht gesetzt. Bot-Prozesse\n' +
-      `         erreichen den Hub über ${String(process.env.BOT_HUB_URL || 'http://127.0.0.1:8787').replace(/\/+$/, '')} nicht, weil 127.0.0.1 im Container der Container selbst ist.\n` +
-      '         Sie brauchen den Hub nur, wenn sie Zustand oder Meldungen melden.\n' +
-      '         Dann BOT_HUB_CONTAINER_URL=http://host.docker.internal:8787 setzen\n' +
-      '         (schaltet den Host für die Container frei) oder in BOT_HUB_URL eine\n' +
-      '         Adresse eintragen, die auch aus dem Container erreichbar ist.',
-  );
-
 /**
  * Startup-Selbstprüfung – Regeln Leben in `preflight.js`, damit sie ohne den
  * lauschenden Prozess tested werden können. `errors` verhindern den Start.
@@ -214,8 +218,13 @@ securitySelfCheck();
 
 const handler = createServer();
 const server = createServerFactory(handler);
-const botApiServer =
-  process.env.NODE_ENV === 'production' ? createServerFactory(handler) : null;
+const botApiBindAddress =
+  process.env.NODE_ENV === 'production'
+    ? PRODUCTION_BOT_GATEWAY
+    : localBotNetwork?.gateway;
+const botApiServer = botApiBindAddress
+  ? createServerFactory(createInternalBotApiHandler(handler))
+  : null;
 
 // Ein belegter Port ist ein Bedienfehler, kein Absturz. Ohne diese Auswertung
 // steht hier ein halber Seitenfehler-Stack, der mehr irritiert als erklärt –
@@ -251,9 +260,9 @@ if (botApiServer) {
     stopAllBots();
     process.exit(1);
   });
-  botApiServer.listen(PRODUCTION_BOT_HUB_PORT, PRODUCTION_BOT_GATEWAY, () => {
+  botApiServer.listen(LOCAL_BOT_HUB_PORT, botApiBindAddress, () => {
     console.log(
-      `[hub] Interne Bot-API nur im isolierten Docker-Netz: ${PRODUCTION_BOT_GATEWAY}:${PRODUCTION_BOT_HUB_PORT}`,
+      `[hub] Interne Bot-API nur im isolierten Docker-Netz: ${botApiBindAddress}:${LOCAL_BOT_HUB_PORT}`,
     );
   });
 }
