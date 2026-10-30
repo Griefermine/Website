@@ -151,6 +151,16 @@ describe('Container-Isolation', () => {
       { Options: { ...network.Options, 'com.docker.network.bridge.enable_ip_masquerade': 'false' } },
       { IPAM: { Config: [{ Subnet: '172.25.40.0/24', Gateway: '192.168.1.1' }] } },
       { IPAM: { Config: [{ Subnet: '172.25.40.0/33', Gateway: '172.25.40.1' }] } },
+      {
+        IPAM: {
+          Config: [{ Subnet: '192.168.7.0/24', Gateway: '192.168.7.0' }],
+        },
+      },
+      {
+        IPAM: {
+          Config: [{ Subnet: '192.168.7.0/24', Gateway: '192.168.7.255' }],
+        },
+      },
     ]) {
       assert.throws(
         () =>
