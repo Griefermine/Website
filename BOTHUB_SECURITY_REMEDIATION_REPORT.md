@@ -19,19 +19,19 @@ Push fand nicht statt.
 
 ## B. Klassifikation der elf Bereiche
 
-| Bereich | Urteil | Kernbeweis |
-|---|---|---|
-| 5.1 Sessions/Vault/Exec-Sweep | **bestätigt → behoben (44/45/46)** | Sitzungsklartext in `data/sessions.json` (behoben: SHA-256-Speicher, Migration beim Laden auth.js:114/460); Produktions-Rückfall auf Klartext-Secrets war warnungsfrei (behoben: Preflight-Error preflight.js:230/268, Schreibverbot secrets.js:170); Sweep konnte frische Exec-Dateien löschen (behoben: 10-min-Schwelle containers.js:634) |
-| 5.2 TOCTOU Panel | **theoretisch bestätigt → behoben (50/53)** | `statSync(path)` → `createReadStream(path)` und `existsSync/statSync` → `readFileSync(path)` im Manifest-Leser; Fenster mikrosekundengroß, praktisch schwer trafbar, Abwehr folgenlos billig (panel.js `openPanelFile`, fd-Lesen) |
-| 5.3 .NET-Init im Workspace | **teilweise bestätigt → behoben (51)** | Bestehende Schutzmaßnahmen (UID-Abbildung, cap-drop, read-only) wirken; aber: Vorprüfungsfehler wurde geschluckt und der root-Lauf lief trotzdem; `EEXIST` nach `unlink` still akzeptiert; `set -e && for …` im gelieferten Skript war ungültige Shell (durch `sh -n` reproduziert) |
-| 5.4 Workspace-Quota | **teilweise bestätigt → gemessen (49)** | `quotaAllows` deckt nur Hub-Schreibvorgänge ab; harte Grenze je Workspace bleibt bewusste Betriebsentscheidung (`documents/sicherheit.md`). Was fehlte: jegliche Messung des freien Platzes — jetzt `statfs`-Guard mit 422 vor Anlage und Installation |
-| 5.5 Proxy/Raten | **bestätigt → behoben (47)** | `::ffff:127.0.0.1` vs. `127.0.0.1` wurde zeichengetreu verglichen: `X-Forwarded-For` verwarf man selbst bei konfiguriertem Vertrauen → alle Besucher teilten einen Eimer; jetzt kanonisch (manager.js:143–176), live bewiesen (30/429-Grenze pro Besucheradresse) |
-| 5.6 Auth-Kette ungeprüft | **bestätigt → behoben (48)** | Die ganze Suite lief mit `BOT_HUB_TEST_MODE=1`, der genau diese Kette abschaltet; jetzt 15 Fälle echter HTTP-Kette gegen Mock-Discord ohne Testmodus; Nebenfund: unbekannter `error`-Parameter ließ die Anmeldung bisher erfolgreich durchlaufen |
-| 5.7 viewer-Rechtewiderspruch | **Produktentscheidung → vereinheitlicht (45)** | botbezogene Rechte sind für „Eingeschränkt“ gedacht (Maßnahme 37/WEB-01); Server und UI folgen jetzt derselben Grenze, Label korrigiert. Ein Widerspruch im Code blieb unter keiner Lesart |
-| 5.8 (Vault/Doku) | **bestätigt → dokumentiert/geprüft (46)** | `vaultStatus()` meldet „kein Schlüssel“ vs. „unbrauchbarer Schlüssel“ ohne Werte auszugeben; Preflight-Check 1 + Tests |
-| 5.9 nginx-Härtung | **praktisch reproduziert → behoben (47)** | setup-tls.sh-Heredoc-Bug mit echtem `nginx -t` reproduziert (`[emerg] invalid number of arguments in "proxy_set_header"`, Beleg `/tmp/opencode/tlsproof/`); Host-Durchreichung jetzt `$http_host`, `client_max_body_size 2m` in allen Vorlagen, alle drei bestehen `nginx -t`. Kein `limit_req` im Hub-Stack (die Besucheradresse kennt erst der Hub — Maßnahme 47 schließt dort) |
-| 5.10 Token in URL/panelToken | **nicht reproduziert (bewusst so)** | Panel-Token liegt nie dauerhaft in der URL: nur ein einmaliges 60-Sekunden-Bootstrap-Token (`?bootstrap=`), danach `HttpOnly`-Cookie; `publicPanel` enthält kein `panelToken` (panel.js:2943ff.); Bot-Löschung widerruft sofort (live: 200 → 404). Abweichung zur Behauptung dokumentiert |
-| 5.11 CI/Release | **bestätigt (nur CI-Referenzen) → behoben (52)** | Release-INHALTE waren bereits durch den Artefakt-Scanner abgedeckt (22 Tests); offen waren die verschiebbaren `@v4`-Tags und der Gitleaks-Registry-Tag — jetzt volle SHAs bzw. `@sha256`-Digest, gelöst per `git ls-remote`/`docker image inspect` (nichts geraten) |
+| Bereich                       | Urteil                                           | Kernbeweis                                                                                                                                                                                                                                                                                                                                                                        |
+| ----------------------------- | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 5.1 Sessions/Vault/Exec-Sweep | **bestätigt → behoben (44/45/46)**               | Sitzungsklartext in `data/sessions.json` (behoben: SHA-256-Speicher, Migration beim Laden auth.js:114/460); Produktions-Rückfall auf Klartext-Secrets war warnungsfrei (behoben: Preflight-Error preflight.js:230/268, Schreibverbot secrets.js:170); Sweep konnte frische Exec-Dateien löschen (behoben: 10-min-Schwelle containers.js:634)                                      |
+| 5.2 TOCTOU Panel              | **theoretisch bestätigt → behoben (50/53)**      | `statSync(path)` → `createReadStream(path)` und `existsSync/statSync` → `readFileSync(path)` im Manifest-Leser; Fenster mikrosekundengroß, praktisch schwer trafbar, Abwehr folgenlos billig (panel.js `openPanelFile`, fd-Lesen)                                                                                                                                                 |
+| 5.3 .NET-Init im Workspace    | **teilweise bestätigt → behoben (51)**           | Bestehende Schutzmaßnahmen (UID-Abbildung, cap-drop, read-only) wirken; aber: Vorprüfungsfehler wurde geschluckt und der root-Lauf lief trotzdem; `EEXIST` nach `unlink` still akzeptiert; `set -e && for …` im gelieferten Skript war ungültige Shell (durch `sh -n` reproduziert)                                                                                               |
+| 5.4 Workspace-Quota           | **teilweise bestätigt → gemessen (49)**          | `quotaAllows` deckt nur Hub-Schreibvorgänge ab; harte Grenze je Workspace bleibt bewusste Betriebsentscheidung (`documents/sicherheit.md`). Was fehlte: jegliche Messung des freien Platzes — jetzt `statfs`-Guard mit 422 vor Anlage und Installation                                                                                                                            |
+| 5.5 Proxy/Raten               | **bestätigt → behoben (47)**                     | `::ffff:127.0.0.1` vs. `127.0.0.1` wurde zeichengetreu verglichen: `X-Forwarded-For` verwarf man selbst bei konfiguriertem Vertrauen → alle Besucher teilten einen Eimer; jetzt kanonisch (manager.js:143–176), live bewiesen (30/429-Grenze pro Besucheradresse)                                                                                                                 |
+| 5.6 Auth-Kette ungeprüft      | **bestätigt → behoben (48)**                     | Die ganze Suite lief mit `BOT_HUB_TEST_MODE=1`, der genau diese Kette abschaltet; jetzt 15 Fälle echter HTTP-Kette gegen Mock-Discord ohne Testmodus; Nebenfund: unbekannter `error`-Parameter ließ die Anmeldung bisher erfolgreich durchlaufen                                                                                                                                  |
+| 5.7 viewer-Rechtewiderspruch  | **Produktentscheidung → vereinheitlicht (45)**   | botbezogene Rechte sind für „Eingeschränkt“ gedacht (Maßnahme 37/WEB-01); Server und UI folgen jetzt derselben Grenze, Label korrigiert. Ein Widerspruch im Code blieb unter keiner Lesart                                                                                                                                                                                        |
+| 5.8 (Vault/Doku)              | **bestätigt → dokumentiert/geprüft (46)**        | `vaultStatus()` meldet „kein Schlüssel“ vs. „unbrauchbarer Schlüssel“ ohne Werte auszugeben; Preflight-Check 1 + Tests                                                                                                                                                                                                                                                            |
+| 5.9 nginx-Härtung             | **praktisch reproduziert → behoben (47)**        | setup-tls.sh-Heredoc-Bug mit echtem `nginx -t` reproduziert (`[emerg] invalid number of arguments in "proxy_set_header"`, Beleg `/tmp/opencode/tlsproof/`); Host-Durchreichung jetzt `$http_host`, `client_max_body_size 2m` in allen Vorlagen, alle drei bestehen `nginx -t`. Kein `limit_req` im Hub-Stack (die Besucheradresse kennt erst der Hub — Maßnahme 47 schließt dort) |
+| 5.10 Token in URL/panelToken  | **nicht reproduziert (bewusst so)**              | Panel-Token liegt nie dauerhaft in der URL: nur ein einmaliges 60-Sekunden-Bootstrap-Token (`?bootstrap=`), danach `HttpOnly`-Cookie; `publicPanel` enthält kein `panelToken` (panel.js:2943ff.); Bot-Löschung widerruft sofort (live: 200 → 404). Abweichung zur Behauptung dokumentiert                                                                                         |
+| 5.11 CI/Release               | **bestätigt (nur CI-Referenzen) → behoben (52)** | Release-INHALTE waren bereits durch den Artefakt-Scanner abgedeckt (22 Tests); offen waren die verschiebbaren `@v4`-Tags und der Gitleaks-Registry-Tag — jetzt volle SHAs bzw. `@sha256`-Digest, gelöst per `git ls-remote`/`docker image inspect` (nichts geraten)                                                                                                               |
 
 ## C. Prozessbefunde (Befunde über den Code hinaus)
 
@@ -70,12 +70,33 @@ OHNE `BOT_HUB_TEST_MODE` — echte Autorisierung), SQLite, Bot-Image lokal
   10 Eimer; 35 Anfragen einer Adresse → 30×302 dann 429; erfundener Header
   direkt am Hub wird ignoriert (Eimer bleibt der Socket-Adresse).
 - Platz-Guard: 422 mit messbarer Meldung, kein Bot, kein Pfad-Leck.
-- Panel: Bootstrap einmalig + `HttpOnly`-Cookie, Symlink als Panel-Datei 400,
+- Panel: Bootstrap einmalig + `HttpOnly`-Cookie, Symlink als Panel-Datei 404
+  (Einheits-404 absichtslos — der Response darf den Grund nicht verraten),
   Traversierung 401/404, Zuschauer 403, Token-Widerruf nach Delete.
-- **Nicht live geprüft:** MySQL-Umschaltung (kein lokales Bild, VM aus) —
-  bleibt von `npm run test:mysql` abgedeckt; MySQL-Standardbild `mysql:8.4`
-  ist ein Floating Tag (überschreibbar per `BOT_HUB_MYSQL_IMAGE`) — im
-  Bericht erwähnt, bewusst nicht geändert.
+- Manifest-Falle (Maßnahme 53): Symlink statt `bot-hub.json` →
+  `panel.available:false`, kein Pfad/Inhalt der Fremddatei im Response;
+  echtes Manifest wieder `available:true`.
+- Browser-UI: Dashboard lädt mit 0 Konsole-Fehlern; Login-Link führt hart auf
+  `discord.com/oauth2/authorize` (PKCE) — auch während der Token-Tausch gegen
+  die Mock läuft (Autorisierungs-URL wird bewusst nie umgebogen).
+- Produktions-Abbruch: `NODE_ENV=production` ohne Egress-Netz → Exit 1, Port
+  bindet nie; Vault-Fehler-Zweig am Preflight bewiesen (meldet nur die ANZAHL
+  offener Secrets, nie einen Wert).
+- **MySQL live (Nachtrag nach dem ersten Bericht):** zweiter Hub mit
+  `BOT_HUB_DB=mysql-container` auf 127.0.0.1:18788 — Provisionierer legt
+  `bot-hub-mysql` (mysql:8.4) selbst an und verbindet; Bot-Container gestartet,
+  mit dessen echtem Runtime-Token `PUT /api/hub/db/matrix/gruss` → 200, Zeile
+  direkt in `bot_hub.bot_store` nachgewiesen; Hub-Neustart → Wert bleibt.
+  Der HTTP-Ruf von INNERHALB des Bot-Containers zum Host war auf diesem
+  Rechner nicht möglich (Firewall droppt Container→Host, per nc bewiesen);
+  getestet wurde derselbe Token, den der Bot-Prozess erhält. Das
+  MySQL-Standardbild `mysql:8.4` bleibt ein Floating Tag (überschreibbar per
+  `BOT_HUB_MYSQL_IMAGE`) — bewusst nicht geändert.
+
+Die gesamte Liste wurde in einem **zweiten frischen Durchlauf** (neue
+Datenwurzeln, neue Container, neue nginx-Rate-Zähler) wiederholt: identische
+Ergebnisse, dazu `npm test` erneut 612/612 sowie `test:mysql-container` 28/28
+und `test/database-mysql.test.js` 7/7 gegen echten mysql:8.4-Container.
 
 ## E. Unabhängige Gegenprüfung und Maßnahme 53
 
@@ -106,18 +127,18 @@ alle Maßnahmen M44–M52 mit Datei:Zeile und meldete drei neue Punkte:
 
 ## F. Maßnahmen-Register
 
-| Nr | Commit | Testregister |
-|---|---|---|
-| 44 Exec-Env-Sweep | `4f95baf` | security-audit.test.js (alter Fall + Race-Fall) |
-| 45 Sessions/Delegation | `0db84b3` | security-v27-sessions.test.js (10) |
-| 46 Vault | `011ef93` | preflight/vault-Fälle (+9) |
-| 47 Proxy/TLS-Vorlagen | `eb673f4` | security-v27-proxy.test.js (8), deploy-templates.test.js (7) |
-| 48 Auth-Kette | `bf23467` | auth-flow.test.js (15) |
-| 49 Datenträgerplatz | `4e3761f` | security-v27-disk.test.js (12), preflight (+3) |
-| 50 Panel fd | `7569b3c` | security-v27-toctou.test.js (7) |
-| 51 .NET-Init | `8a99466` | security-v27-dotnet-init.test.js (6, inkl. `sh -n` und Symlink-Falle) |
-| 52 CI-Pinning | `9fc15b0` | release-scan.test.js (+4 Regel-Tests) |
-| 53 Manifest fd | (dieser Zweig) | security-v27-toctou.test.js (+4) |
+| Nr                     | Commit         | Testregister                                                          |
+| ---------------------- | -------------- | --------------------------------------------------------------------- |
+| 44 Exec-Env-Sweep      | `4f95baf`      | security-audit.test.js (alter Fall + Race-Fall)                       |
+| 45 Sessions/Delegation | `0db84b3`      | security-v27-sessions.test.js (10)                                    |
+| 46 Vault               | `011ef93`      | preflight/vault-Fälle (+9)                                            |
+| 47 Proxy/TLS-Vorlagen  | `eb673f4`      | security-v27-proxy.test.js (8), deploy-templates.test.js (7)          |
+| 48 Auth-Kette          | `bf23467`      | auth-flow.test.js (15)                                                |
+| 49 Datenträgerplatz    | `4e3761f`      | security-v27-disk.test.js (12), preflight (+3)                        |
+| 50 Panel fd            | `7569b3c`      | security-v27-toctou.test.js (7)                                       |
+| 51 .NET-Init           | `8a99466`      | security-v27-dotnet-init.test.js (6, inkl. `sh -n` und Symlink-Falle) |
+| 52 CI-Pinning          | `9fc15b0`      | release-scan.test.js (+4 Regel-Tests)                                 |
+| 53 Manifest fd         | (dieser Zweig) | security-v27-toctou.test.js (+4)                                      |
 
 Baseline 526 Tests (1 Fehler im Altkörper) → Endstand **612 Tests, 0 Fehler**;
 `npx prettier --check .` grün; alle Commits ausschließlich lokal auf
@@ -127,8 +148,12 @@ Baseline 526 Tests (1 Fehler im Altkörper) → Endstand **612 Tests, 0 Fehler**
 
 1. Harte Kontingentgrenze je Workspace — weiterhin Betriebsentscheidung
    (Dateisystem-Quota für `bots/`), jetzt immerhin mit Messung und 422.
-2. MySQL-Umschaltung und `mysql:8.4`-Floating-Tag — in der Isolation nicht
-   live gefahren; nur Integrations-Suite.
+2. MySQL: Die Umschaltung ist inzwischen live geprüft (Provisionierung,
+   Bot-KV direkt in `bot_hub.bot_store`, Neustart-Persistenz — siehe D).
+   Offens bleiben: der `mysql:8.4`-Floating-Tag (bewusst) und der
+   Bot-Hub-HTTP-Ruf aus dem Container zum Hub, der auf diesem Rechner an der
+   Firewall (Container→Host wird gedroppt) scheitert; auf dem Produktivnetz
+   läuft er über das interne Hub-Netz und ist nur durch die Suite gedeckt.
 3. NF-4/NF-5 (mtime-Schwelle, Zwischenverzeichnis-Fenster) — bewusst
    hingenommen, im Code-Kommentar begründet.
 4. Hub als Ein-Prozess-Mischbetrieb (UI + Auth + Container-Steuerung) —

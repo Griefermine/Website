@@ -686,18 +686,18 @@ Unten lief **auf dem Laptop**, nie in der VM (die blieb während V27 ausge‐
 schaltet). Tests: `npm test` (zuletzt 608 + 4 Fälle für Maßnahme 53), jeweils
 Loopback-gebunden.
 
-| Maßnahme | Commit | Bereich | was sie tut |
-|---|---|---|---|
-| 44 Exec-Env-Sweep | `4f95baf` | 5.1 | räumt nur Env-Dateien älter als 10 min weg — Race mit laufenden Starts zu |
-| 45 Session-Härtung | `0db84b3` | 5.1/5.7 | Sitzungen nur als SHA-256 in `sessions.json` (Altbestand wird beim Laden umgeschlüsselt), Idle-Frist `BOT_HUB_SESSION_IDLE_HOURS` (72 h) + TTL (168 h), Widerruf aller Sessions bei `removeAccess`, 256-Bit-IDs; botbezogene Rechte folgen der Capability-Delegation (Server + UI), Rollenlabel „Eingeschränkt (nur pro Bot)“ |
-| 46 Vault-Pflicht | `011ef93` | 5.1 | `vaultStatus()` unterscheidet „kein Schlüssel“ von „unbrauchbar“; in Produktion wird Klartext-Rückfall zum Start-Abbruch (Preflight-Fehler), Schreiben von Secrets in Klartext ist in Produktion verboten |
-| 47 Proxy-Kanonik | `eb673f4` | 5.5/5.9 | `::ffff:`-Normalisierung vor jedem Adressvergleich; `X-Forwarded-For` zählt nur bei vertrauter Direktadresse (`BOT_HUB_TRUSTED_PROXIES`); nginx-Vorlagen: Host-Durchreicheung `$http_host`, `client_max_body_size 2m`; setup-tls.sh-Heredoc-Bug bewiesen (echtes `nginx -t`: `[emerg] invalid number of arguments in "proxy_set_header"`) und in allen drei Vorlagen behoben |
-| 48 Auth-Kette | `bf23467` | 5.6 | `discordApiBasis()` als Test-Öse (nur `NODE_ENV=test` UND Schleifenadresse); Suite `test/auth-flow.test.js` (15 Fälle) fährt den Hub OHNE `BOT_HUB_TEST_MODE` gegen eine Mock-Discord; dabei gehärtet: ein UNBEKANNTER `error`-Parameter im Callback bricht die Anmeldung jetzt ab (vorher lief sie „erfolgreich“ durch) |
-| 49 Datenträgerplatz | `4e3761f` | 5.4 | `server/disk.js` misst `bavail` + `ffree` vor Bot-Anlage (HTTP 422 mit lesbarem Grund) und vor jeder Installation; `BOT_HUB_MIN_FREE_MB` (256) / `BOT_HUB_MIN_FREE_INODES` (10000); Messausfall lässt zu (kein Aussperrrisiko); Preflight-Warnung in Produktion. Die harte Kontingentgrenze je Workspace bleibt dokumentierte Betriebsentscheidung |
-| 50 Panel fd-Basis | `7569b3c` | 5.2 | `openPanelFile()`: EINmal öffnen mit `O_NOFOLLOW`, Größe/Typ vom `fstat` des Deskriptors, 404/413 vor `writeHead`, Stream am Deskriptor — ein Tausch des Pfads nach der Prüfung ist folgenlos (im Test bewiesen, ohne Wettlauf) |
-| 51 .NET-Init | `8a99466` | 5.3 | Guard-Fehler überspringt den bewussten root-Lauf jetzt (vorher: schlucken + trotzdem laufen); `EEXIST` nach gelöschtem Eintrag = harter Abbruch, wenn die Stelle kein echtes Verzeichnis ist; Container-Skript mit `[ ! -L ]`-Doppelschutz, `chown -Rh`, festem `--user 0:0` und korrekter Zeilenfügung (vorher: `set -e && for …` — ungültige Syntax, durch `sh -n` bewiesen) |
-| 52 CI-Pinning | `9fc15b0` | 5.11 | alle `uses:` auf volle Commit-SHAs (checkout v4.4.0, setup-node v4.4.0, upload-artifact v4.6.2 — via `git ls-remote` gelöst), Gitleaks auf `@sha256:75bdb2b2…` (v8.18.4); Regressionstests prüfen die REGEL, nicht Momentwerte |
-| 53 Manifest fd-Basis | (dieser Zweig) | 5.2 | Gegenprüfungs-Befund NF-1: `readManifest` prüfte `existsSync`/`statSync` und las dann nach PFAD — jetzt wie Maßnahme 50: `O_NOFOLLOW` + Inhalt/Größe ausschließlich am Deskriptor, übergroß = Fehler statt Inhalt; 4 weitere Fälle in `test/security-v27-toctou.test.js` |
+| Maßnahme             | Commit         | Bereich | was sie tut                                                                                                                                                                                                                                                                                                                                                                    |
+| -------------------- | -------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 44 Exec-Env-Sweep    | `4f95baf`      | 5.1     | räumt nur Env-Dateien älter als 10 min weg — Race mit laufenden Starts zu                                                                                                                                                                                                                                                                                                      |
+| 45 Session-Härtung   | `0db84b3`      | 5.1/5.7 | Sitzungen nur als SHA-256 in `sessions.json` (Altbestand wird beim Laden umgeschlüsselt), Idle-Frist `BOT_HUB_SESSION_IDLE_HOURS` (72 h) + TTL (168 h), Widerruf aller Sessions bei `removeAccess`, 256-Bit-IDs; botbezogene Rechte folgen der Capability-Delegation (Server + UI), Rollenlabel „Eingeschränkt (nur pro Bot)“                                                  |
+| 46 Vault-Pflicht     | `011ef93`      | 5.1     | `vaultStatus()` unterscheidet „kein Schlüssel“ von „unbrauchbar“; in Produktion wird Klartext-Rückfall zum Start-Abbruch (Preflight-Fehler), Schreiben von Secrets in Klartext ist in Produktion verboten                                                                                                                                                                      |
+| 47 Proxy-Kanonik     | `eb673f4`      | 5.5/5.9 | `::ffff:`-Normalisierung vor jedem Adressvergleich; `X-Forwarded-For` zählt nur bei vertrauter Direktadresse (`BOT_HUB_TRUSTED_PROXIES`); nginx-Vorlagen: Host-Durchreicheung `$http_host`, `client_max_body_size 2m`; setup-tls.sh-Heredoc-Bug bewiesen (echtes `nginx -t`: `[emerg] invalid number of arguments in "proxy_set_header"`) und in allen drei Vorlagen behoben   |
+| 48 Auth-Kette        | `bf23467`      | 5.6     | `discordApiBasis()` als Test-Öse (nur `NODE_ENV=test` UND Schleifenadresse); Suite `test/auth-flow.test.js` (15 Fälle) fährt den Hub OHNE `BOT_HUB_TEST_MODE` gegen eine Mock-Discord; dabei gehärtet: ein UNBEKANNTER `error`-Parameter im Callback bricht die Anmeldung jetzt ab (vorher lief sie „erfolgreich“ durch)                                                       |
+| 49 Datenträgerplatz  | `4e3761f`      | 5.4     | `server/disk.js` misst `bavail` + `ffree` vor Bot-Anlage (HTTP 422 mit lesbarem Grund) und vor jeder Installation; `BOT_HUB_MIN_FREE_MB` (256) / `BOT_HUB_MIN_FREE_INODES` (10000); Messausfall lässt zu (kein Aussperrrisiko); Preflight-Warnung in Produktion. Die harte Kontingentgrenze je Workspace bleibt dokumentierte Betriebsentscheidung                             |
+| 50 Panel fd-Basis    | `7569b3c`      | 5.2     | `openPanelFile()`: EINmal öffnen mit `O_NOFOLLOW`, Größe/Typ vom `fstat` des Deskriptors, 404/413 vor `writeHead`, Stream am Deskriptor — ein Tausch des Pfads nach der Prüfung ist folgenlos (im Test bewiesen, ohne Wettlauf)                                                                                                                                                |
+| 51 .NET-Init         | `8a99466`      | 5.3     | Guard-Fehler überspringt den bewussten root-Lauf jetzt (vorher: schlucken + trotzdem laufen); `EEXIST` nach gelöschtem Eintrag = harter Abbruch, wenn die Stelle kein echtes Verzeichnis ist; Container-Skript mit `[ ! -L ]`-Doppelschutz, `chown -Rh`, festem `--user 0:0` und korrekter Zeilenfügung (vorher: `set -e && for …` — ungültige Syntax, durch `sh -n` bewiesen) |
+| 52 CI-Pinning        | `9fc15b0`      | 5.11    | alle `uses:` auf volle Commit-SHAs (checkout v4.4.0, setup-node v4.4.0, upload-artifact v4.6.2 — via `git ls-remote` gelöst), Gitleaks auf `@sha256:75bdb2b2…` (v8.18.4); Regressionstests prüfen die REGEL, nicht Momentwerte                                                                                                                                                 |
+| 53 Manifest fd-Basis | (dieser Zweig) | 5.2     | Gegenprüfungs-Befund NF-1: `readManifest` prüfte `existsSync`/`statSync` und las dann nach PFAD — jetzt wie Maßnahme 50: `O_NOFOLLOW` + Inhalt/Größe ausschließlich am Deskriptor, übergroß = Fehler statt Inhalt; 4 weitere Fälle in `test/security-v27-toctou.test.js`                                                                                                       |
 
 ### Live-Nachweis (§6) in isolierter Loopback-Umgebung
 
@@ -736,10 +736,41 @@ Bot-Images auf das lokale `alpine:3.20` umgelenkt, nginx:1.27-alpine als Proxy a
 - **Panel live:** `/panel/open` → 302 mit einmaligem 60-s-Bootstrap-Token in der
   URL und `HttpOnly`-Panel-Cookie; Datei-Auslieferung 200 mit Sandbox-CSP;
   ohne Token/Cookie 401/404; Zuschauer 403; Traversierung (`../`) abgewiesen;
-  Bot-Löschung widerruft den ausgegebenen Panel-Token (vorher 200 → nachher 404).
-- MySQL-Umschaltung wurde live NICHT geprüft (kein lokales MySQL-Bild, VM aus);
-  die MySQL-Pfade bleiben durch die Integrationssuite (`npm run test:mysql`)
-  abgedeckt — als „nicht live geprüft“ klassifiziert.
+  Symlink als Panel-Datei 404 (absichtslos: `openPanelFile` antwortet auf
+  ELOOP/Nichtdatei bewusst mit demselben 404, damit der Grund nicht aus dem
+  Response lesbar ist); Bot-Löschung widerruft den ausgegebenen Panel-Token
+  (vorher 200 → nachher 404).
+- **Manifest-Falle live (Maßnahme 53):** `bot-hub.json` im Workspace durch einen
+  Symlink auf eine fremde Datei mit Secret-artigem Inhalt ersetzt → API meldet
+  `panel.available:false` mit „Manifest nicht gefunden – hat es den Pfad
+  verlassen?“, der fremde Pfad und Inhalt tauchen im Response nirgends auf;
+  echtes Manifest zurückgelegt → `available:true`.
+- **Browser-UI live:** Dashboard lädt im echten Browser mit 0
+  Konsole-Fehlern; der Login-Link führt hart auf `discord.com/oauth2/authorize`
+  (client_id + PKCE) — auch während `BOT_HUB_DISCORD_API` auf die Mock zeigt:
+  Die Autorisierungs-URL wird bewusst nie umgebogen, nur der Token-Tausch geht
+  in Tests gegen die Loopback-Mock.
+- **Produktions-Start-Abbruch live:** `NODE_ENV=production` ohne das isolierte
+  Egress-Netz → Exit 1 mit „ABBRUCH: Discord-Ausgangsfilter: Docker-Netz
+  bot-hub-discord fehlt …“, der Port bindet nie. Der Vault-Fehler-Zweig
+  (unverschlüsselte Secrets ohne Key) wurde direkt am Preflight bewiesen:
+  Meldung nennt nur die ANZAHL der offenen Werte, nie einen Wert selbst.
+- **MySQL-Umschaltung live (Nachtrag, zweiter Durchlauf):** zweiter Hub auf
+  127.0.0.1:18788 mit `BOT_HUB_DB=mysql-container` — der Provisionierer legt
+  Bild, Netz, Volume und Container `bot-hub-mysql` (mysql:8.4) selbst an, der
+  Hub verbindet und protokollert `Bot-Speicher: mysql …:3306/bot_hub als
+bot_hub`. Mit dem echten Runtime-Token eines laufenden Bot-Containers
+  (aus der Exec-env-Datei, die der Hub dem Bot selbst mitgibt) schreibt
+  `PUT /api/hub/db/matrix/gruss` → 200 `{created:true}`; die Zeile liegt
+  direkt in `bot_hub.bot_store` (per mysql-Client IM Container abgelesen,
+  Root-Passwort aus der Container-Prozessumgebung). Hub-Neustart → Wert
+  unverändert in MySQL, Hub verbindet erneut (das alte Bot-Token ist nach dem
+  Neustart bewusst ungültig — Runtime-Token rotieren bei jedem Spawn).
+  Hinweis: Ein HTTP-Ruf VON INNEHALB des Bot-Containers zum Host-Loopback ist
+  auf diesem Laptop nicht möglich (Firewall droppt Container→Host auf jedem
+  Port, per nc bewiesen) — der getestete Weg nutzt denselben Token, den der
+  Bot-Prozess ebenfalls erhält; der Container-zu-Hub-Pfad im Produktivnetz
+  bleibt wie bisher nur durch die Suite abgedeckt.
 
 Belege: `/tmp/opencode/live/` (Skripte, `hub*.log`), `/tmp/opencode/tlsproof/`
 (nginx `-t` Beweise für Maßnahme 47), `/tmp/opencode/v27-after-*.log`
