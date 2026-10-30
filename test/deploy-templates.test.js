@@ -64,6 +64,8 @@ const gerendert = (blok) => {
       'set -e',
       // Der einzige Platzhalter, den die Skripte bewusst einsetzen.
       'DOMAIN=bot.example',
+      'WEBROOT=/var/lib/letsencrypt',
+      'CERT_DIR=/etc/letsencrypt/live/bot.example',
       `cat > '${ziel}' <<MARKER`,
       blok.inhalt,
       'MARKER',
