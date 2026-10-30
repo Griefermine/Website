@@ -75,9 +75,7 @@ const registryParts = (input) => {
     slash >= 0 &&
     (first.includes('.') || first.includes(':') || first === 'localhost');
   const registry =
-    hasRegistry && first !== 'docker.io'
-      ? first
-      : 'registry-1.docker.io';
+    hasRegistry && first !== 'docker.io' ? first : 'registry-1.docker.io';
   let remote = hasRegistry ? reference.slice(slash + 1) : reference;
   if (!hasRegistry && !remote.includes('/')) remote = 'library/' + remote;
 
@@ -92,9 +90,7 @@ const registryParts = (input) => {
 };
 
 const statusOf = (headers) => {
-  const statuses = [
-    ...String(headers).matchAll(/^HTTP\/\S+\s+(\d{3})/gim),
-  ];
+  const statuses = [...String(headers).matchAll(/^HTTP\/\S+\s+(\d{3})/gim)];
   return statuses.length ? Number(statuses.at(-1)[1]) : 0;
 };
 
@@ -147,7 +143,11 @@ export const resolveImageDigest = (input) => {
   const parsed = registryParts(input);
   if (parsed.pinned) return parsed.reference;
   const url =
-    'https://' + parsed.registry + '/v2/' + parsed.repository + '/manifests/' +
+    'https://' +
+    parsed.registry +
+    '/v2/' +
+    parsed.repository +
+    '/manifests/' +
     encodeURIComponent(parsed.tag);
   let headers = requestManifestHeaders(url);
   let status = statusOf(headers);
@@ -159,8 +159,10 @@ export const resolveImageDigest = (input) => {
   }
   if (status !== 200)
     throw new Error(
-      'Registry-Prüfung für ' + parsed.reference + ' endete mit HTTP ' +
-      (status || 'unbekannt'),
+      'Registry-Prüfung für ' +
+        parsed.reference +
+        ' endete mit HTTP ' +
+        (status || 'unbekannt'),
     );
   const digest = headerValue(headers, 'docker-content-digest');
   if (!/^sha256:[a-f0-9]{64}$/.test(digest))
@@ -253,12 +255,16 @@ const main = () => {
   const changes = {
     BOT_HUB_CONTAINER_IMAGES: JSON.stringify(pinned),
   };
-  const database = String(env.BOT_HUB_DB ?? 'sqlite').trim().toLowerCase();
+  const database = String(env.BOT_HUB_DB ?? 'sqlite')
+    .trim()
+    .toLowerCase();
   if (database === 'mysql-container') {
     const mysql = String(env.BOT_HUB_MYSQL_IMAGE ?? '').trim() || 'mysql:8.4';
     changes.BOT_HUB_MYSQL_IMAGE = resolveImageDigest(mysql);
     const phpmyadmin = ['1', 'true', 'ja', 'yes'].includes(
-      String(env.BOT_HUB_PHPMYADMIN ?? '').trim().toLowerCase(),
+      String(env.BOT_HUB_PHPMYADMIN ?? '')
+        .trim()
+        .toLowerCase(),
     );
     if (phpmyadmin) {
       const image =
@@ -270,7 +276,8 @@ const main = () => {
 
   upsertEnvironment(envPath, original, changes);
   console.log(
-    '[bot-hub] Image-Digests fixiert: ' + Object.keys(pinned).join(', ') +
+    '[bot-hub] Image-Digests fixiert: ' +
+      Object.keys(pinned).join(', ') +
       (changes.BOT_HUB_MYSQL_IMAGE ? ', mysql' : '') +
       (changes.BOT_HUB_PHPMYADMIN_IMAGE ? ', phpMyAdmin' : ''),
   );
