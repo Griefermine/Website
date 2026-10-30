@@ -18,6 +18,7 @@ let bot;
 let containers;
 let createArgs;
 let createInternalBotApiHandler;
+let originalNodeEnv;
 
 const label = (args) =>
   args[args.findIndex((item) => item.startsWith('bot-hub.config='))] ?? '';
@@ -28,7 +29,7 @@ before(async () => {
   root = mkdtempSync(join(tmpdir(), 'bot-hub-container-'));
   mkdirSync(join(root, 'bots', 'shared'), { recursive: true });
   mkdirSync(join(root, 'bots', 'bot1', 'workspace'), { recursive: true });
-  const previousNodeEnv = process.env.NODE_ENV;
+  originalNodeEnv = process.env.NODE_ENV;
   process.env.NODE_ENV = 'development';
   bot = {
     id: 'bot1',
@@ -38,11 +39,11 @@ before(async () => {
   containers = await import('../server/containers.js');
   ({ createInternalBotApiHandler } = await import('../server/internalBotApi.js'));
   createArgs = containers.containerCreateArgs(bot, root);
-  if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
-  else process.env.NODE_ENV = previousNodeEnv;
 });
 
 after(() => {
+  if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+  else process.env.NODE_ENV = originalNodeEnv;
   rmSync(root, { recursive: true, force: true });
 });
 
