@@ -148,6 +148,16 @@ apply_firewall() {
   iptables -nL DOCKER-USER >/dev/null 2>&1 ||
     fail "Docker-Chain DOCKER-USER fehlt. Dieses Profil benötigt Docker mit iptables-/DOCKER-USER-Backend."
 
+  # Während einer erneuten Anwendung (z. B. nach Docker-Neustart) wird der
+  # Bot-Verkehr vorübergehend vollständig gesperrt. Schlägt ein Schritt fehl,
+  # bleibt diese Guard-Regel bestehen: lieber keine Verbindung als ein
+  # kurzzeitig offenes Host- oder LAN-Netz.
+  local guard_comment="bothub-local-setup-guard"
+  iptables -I INPUT 1 -i "$BRIDGE" -s "$SUBNET" \
+    -m comment --comment "$guard_comment" -j DROP
+  iptables -I DOCKER-USER 1 -i "$BRIDGE" -s "$SUBNET" \
+    -m comment --comment "$guard_comment" -j DROP
+
   ensure_chain "$INPUT_CHAIN"
   ensure_chain "$FORWARD_CHAIN"
 
@@ -169,6 +179,21 @@ apply_firewall() {
 
   install_jump_first INPUT "$INPUT_CHAIN"
   install_jump_first DOCKER-USER "$FORWARD_CHAIN"
+
+  # Erst nachdem beide Schutz-Chains aktiv sind, die temporären Sperren
+  # entfernen. Bei einem Abbruch davor bleibt die Bridge vollständig dicht.
+  while iptables -C INPUT -i "$BRIDGE" -s "$SUBNET" \
+    -m comment --comment "$guard_comment" -j DROP >/dev/null 2>&1; do
+    iptables -D INPUT -i "$BRIDGE" -s "$SUBNET" \
+      -m comment --comment "$guard_comment" -j DROP ||
+      fail "Temporäre INPUT-Guard-Regel konnte nicht entfernt werden."
+  done
+  while iptables -C DOCKER-USER -i "$BRIDGE" -s "$SUBNET" \
+    -m comment --comment "$guard_comment" -j DROP >/dev/null 2>&1; do
+    iptables -D DOCKER-USER -i "$BRIDGE" -s "$SUBNET" \
+      -m comment --comment "$guard_comment" -j DROP ||
+      fail "Temporäre DOCKER-USER-Guard-Regel konnte nicht entfernt werden."
+  done
 }
 
 check_firewall() {
