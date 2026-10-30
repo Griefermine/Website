@@ -198,8 +198,9 @@ test(
         blok.gerendert,
         /\bclient_max_body_size\s+2m\s*;/,
         `${blok.pfad} → ${blok.ziel} setzt keine Körpergrenze. Der ` +
-          'nginx-Standard (1m) kollidiert mit der hub-eigenen Grenze von 1 MiB ' +
-          'und liefert eine nginx-Fehlerseite statt der Hub-Meldung.',
+          'nginx-Standard (1m) kollidiert mit der hub-eigenen ' +
+          'Grenze von 1 MiB und liefert eine nginx-Fehlerseite ' +
+          'statt der Hub-Meldung.',
       );
     }
   },
@@ -229,7 +230,7 @@ test('Deployment schreibt Proxy-Vertrauen und Vault-Key in die .env', () => {
 });
 
 test(
-  'TLS-Setup expandiert Shell-Variablen korrekt und unterstützt ältere nginx-Versionen',
+  'TLS-Setup expandiert Variablen und unterstützt ältere nginx-Versionen',
   () => {
     const tls = readFileSync(join(WURZEL, 'setup-tls.sh'), 'utf8');
     assert.match(tls, /^DOMAIN="\$\{1:-\$\{BOT_HUB_DOMAIN:-\}\}"/m);
