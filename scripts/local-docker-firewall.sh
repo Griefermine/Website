@@ -228,18 +228,44 @@ CIDRS
   "$IPT" -w -C "$INPUT_CHAIN" -j DROP || die "Host-Input-DROP fehlt."
 
   # Rule presence alone is insufficient: an early RETURN would neutralize
-  # the deny list. Verify the complete effective order and exact rule count.
-  local egress_rules input_rules egress_first input_first input_second
+  # the deny list. Compare the entire effective order, not only rule counts.
+  local egress_rules input_rules expected_egress input_first input_second
   egress_rules="$("$IPT" -w -S "$EGRESS_CHAIN" | grep -c "^-A $EGRESS_CHAIN" || true)"
   input_rules="$("$IPT" -w -S "$INPUT_CHAIN" | grep -c "^-A $INPUT_CHAIN" || true)"
   [ "$egress_rules" -eq $((count + 2)) ] || die "Die Egress-Kette enthält unerwartete Regeln."
   [ "$input_rules" -eq 2 ] || die "Die Input-Kette enthält unerwartete Regeln."
 
-  egress_first="$("$IPT" -w -S "$EGRESS_CHAIN" | awk -v chain="$EGRESS_CHAIN" '$1 == "-A" && $2 == chain { print; exit }')"
+  expected_egress="-A $EGRESS_CHAIN -d $GATEWAY/32 -p tcp -m tcp --dport $API_PORT -m conntrack --ctstate NEW,ESTABLISHED -m comment --comment bot-hub-local-api-egress -j RETURN"
+  while IFS= read -r CIDR; do
+    [ -n "$CIDR" ] || continue
+    expected_egress="$expected_egress
+-A $EGRESS_CHAIN -d $CIDR -m comment --comment bot-hub-local-private-egress -j DROP"
+  done <<'CIDRS'
+0.0.0.0/8
+10.0.0.0/8
+100.64.0.0/10
+127.0.0.0/8
+169.254.0.0/16
+172.16.0.0/12
+192.0.0.0/24
+192.0.2.0/24
+192.88.99.0/24
+192.168.0.0/16
+198.18.0.0/15
+198.51.100.0/24
+203.0.113.0/24
+224.0.0.0/4
+240.0.0.0/4
+255.255.255.255/32
+CIDRS
+  expected_egress="$expected_egress
+-A $EGRESS_CHAIN -j RETURN"
+  actual_egress="$("$IPT" -w -S "$EGRESS_CHAIN" | awk -v chain="$EGRESS_CHAIN" '$1 == "-A" && $2 == chain')"
+  [ "$actual_egress" = "$expected_egress" ] ||
+    die "Die Egress-Regeln sind nicht vollständig und in sicherer Reihenfolge angeordnet."
+
   input_first="$("$IPT" -w -S "$INPUT_CHAIN" | awk -v chain="$INPUT_CHAIN" '$1 == "-A" && $2 == chain { print; exit }')"
   input_second="$("$IPT" -w -S "$INPUT_CHAIN" | awk -v chain="$INPUT_CHAIN" '$1 == "-A" && $2 == chain { count++; if (count == 2) print }')"
-  [ "$egress_first" = "-A $EGRESS_CHAIN -d $GATEWAY/32 -p tcp -m tcp --dport $API_PORT -m conntrack --ctstate NEW,ESTABLISHED -m comment --comment bot-hub-local-api-egress -j RETURN" ] ||
-    die "Die API-Ausnahme steht nicht vor allen privaten Ziel-Sperren."
   [ "$input_first" = "-A $INPUT_CHAIN -d $GATEWAY/32 -p tcp -m tcp --dport $API_PORT -m conntrack --ctstate NEW,ESTABLISHED -m comment --comment bot-hub-local-api -j ACCEPT" ] ||
     die "Die interne API-Freigabe steht nicht an erster Stelle."
   [ "$input_second" = "-A $INPUT_CHAIN -j DROP" ] ||
