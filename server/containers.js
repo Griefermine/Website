@@ -17,6 +17,11 @@ import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative } from 'node:path';
 
 import { managedConfig, managedMySqlActive } from './mysql.js';
+import {
+  getLocalBotApiUrl,
+  getVerifiedLocalBotNetwork,
+  LOCAL_BOT_NETWORK,
+} from './localNetwork.js';
 
 const RUNTIME = process.env.BOT_HUB_CONTAINER_RUNTIME || 'docker';
 const PREFIX = process.env.BOT_HUB_CONTAINER_PREFIX || 'bot-hub';
@@ -136,14 +141,19 @@ const containerNetwork = () => {
     throw new Error(
       `In Produktion ist nur das isolierte Netzwerk ${PRODUCTION_BOT_NETWORK} erlaubt.`,
     );
+  if (!production && configured && configured !== LOCAL_BOT_NETWORK)
+    throw new Error(
+      `Im lokalen Profil ist ausschließlich das geprüfte Netzwerk ${LOCAL_BOT_NETWORK} erlaubt.`,
+    );
   const network =
-    configured || (production ? PRODUCTION_BOT_NETWORK : 'bridge');
+    configured || (production ? PRODUCTION_BOT_NETWORK : LOCAL_BOT_NETWORK);
   if (
     !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$/.test(network) ||
-    network.toLowerCase() === 'host'
+    network.toLowerCase() === 'host' ||
+    (!production && network === 'bridge')
   )
     throw new Error(
-      'BOT_HUB_CONTAINER_NETWORK muss ein gültiger, vom Host-Netz verschiedener Docker-Netzwerkname sein.',
+      'BOT_HUB_CONTAINER_NETWORK muss ein gültiger, vom Host-Netz verschiedener und für das lokale Profil freigegebener Docker-Netzwerkname sein.',
     );
   return network;
 };
@@ -317,17 +327,16 @@ const sharedVolume = (projectRoot) => {
 };
 
 /**
- * `host.docker.internal` erlaubt einem Bot jeden Dienst auf dem Host – auch
- * SSH und andere lokal laufende Programme. In Produktion ist es deshalb
- * gesperrt; dort gibt es einen getrennten internen Hub-Listener.
+ * Kein Bot-Container erhält eine allgemeine Host-Gateway-Zuordnung. Die
+ * begrenzte Hub-Kommunikation läuft über den separaten Listener am Gateway
+ * des geprüften Docker-Netzes.
  */
 const hostMapping = () => {
-  if (!String(process.env.BOT_HUB_CONTAINER_URL ?? '').trim()) return [];
-  if (process.env.NODE_ENV === 'production')
+  if (String(process.env.BOT_HUB_CONTAINER_URL ?? '').trim())
     throw new Error(
-      'BOT_HUB_CONTAINER_URL ist in Produktion gesperrt, damit Bots keine Host-Dienste erreichen.',
+      'BOT_HUB_CONTAINER_URL ist nicht mehr zulässig. Der direkte Host-Gateway-Zugriff wurde durch die isolierte interne Bot-API ersetzt.',
     );
-  return ['--add-host', 'host.docker.internal:host-gateway'];
+  return [];
 };
 
 /**
@@ -1042,14 +1051,16 @@ export const dependencyRunArgs = (bot, projectRoot, dir, command, env = {}) => {
 };
 
 export const containerRuntimeName = () => RUNTIME;
-export const containerHubUrl = () =>
-  process.env.NODE_ENV === 'production'
-    ? `http://${PRODUCTION_BOT_GATEWAY}:${PRODUCTION_BOT_HUB_PORT}`
-    : String(
-        process.env.BOT_HUB_CONTAINER_URL ||
-          process.env.BOT_HUB_URL ||
-          `http://127.0.0.1:${process.env.PORT || 8787}`,
-      ).replace(/\/+$/, '');
+export const containerHubUrl = () => {
+  if (process.env.NODE_ENV === 'production')
+    return `http://${PRODUCTION_BOT_GATEWAY}:${PRODUCTION_BOT_HUB_PORT}`;
+  const localUrl = getLocalBotApiUrl();
+  if (!localUrl)
+    throw new Error(
+      'Die lokale Bot-API-Adresse ist erst nach erfolgreicher Prüfung der Docker-Netzwerkisolation verfügbar.',
+    );
+  return localUrl;
+};
 export const containerRuntimeEnabled = () =>
   process.env.BOT_HUB_TEST_MODE !== '1' &&
   process.env.BOT_HUB_CONTAINER_MODE !== 'disabled';
@@ -1062,4 +1073,10 @@ export const containerSecurityFacts = () => ({
   discordProxyUrl: DISCORD_EGRESS_PROXY,
   unpinnedImages: unpinnedImages(),
   digestRequired: digestRequired(),
+  containerRuntimeEnabled: containerRuntimeEnabled(),
+  localNetworkVerified:
+    process.env.NODE_ENV === 'production' ||
+    process.env.NODE_ENV === 'test' ||
+    !containerRuntimeEnabled() ||
+    getVerifiedLocalBotNetwork() !== null,
 });
