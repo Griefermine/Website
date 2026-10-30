@@ -81,13 +81,22 @@ const alleBloecke = SKRIPTE.flatMap((name) =>
 
 const mitProxy = (blok) => blok.gerendert.includes('proxy_pass');
 
-test('die Deployment-Skripte schreiben nginx-Konfigurationen mit Proxy', () => {
+test('die TLS-Vorlage schreibt den HTTPS-Reverse-Proxy', () => {
+  const proxyBloecke = alleBloecke.filter(mitProxy);
+  assert.ok(proxyBloecke.length >= 1, 'Erwartet mindestens eine Proxy-Vorlage.');
   assert.ok(
-    alleBloecke.filter(mitProxy).length >= 2,
-    `erwartet mindestens zwei Proxy-Vorlagen, gefunden: ${alleBloecke
-      .map((blok) => `${blok.pfad} → ${blok.ziel}`)
-      .join(', ')}`,
+    proxyBloecke.some((blok) => /listen 443 ssl/.test(blok.gerendert)),
+    'Der produktive Reverse-Proxy muss TLS verwenden.',
   );
+});
+
+test('Standard-Deployment fordert TLS an und veröffentlicht keine HTTP-App', () => {
+  const deploy = readFileSync(join(WURZEL, 'deploy-full.sh'), 'utf8');
+  assert.match(deploy, /setup-tls\.sh.*BOT_HUB_DOMAIN/);
+  assert.match(deploy, /BOT_HUB_LE_EMAIL/);
+  assert.doesNotMatch(deploy, /chown -R bot-hub:bot-hub "\$PROJECT_DIR"/);
+  assert.match(deploy, /sudo -u bot-hub-build .*npm ci/);
+  assert.match(deploy, /sudo -u bot-hub-build .*npm run build/);
 });
 
 test('keine Vorlage hinterlässt eine Direktive ohne Wert', () => {
