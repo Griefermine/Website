@@ -22,7 +22,11 @@ const roleLabels = {
   owner: 'Eigentümer',
   admin: 'Administrator',
   operator: 'Operator',
-  viewer: 'Nur lesen',
+  /* Maßnahme 45 (Auftrag 5.7): „Nur lesen“ war falsch – die Rolle hat gar
+   * keine globalen Rechte (`ACCESS_ROLES.viewer = []`), Rechte lassen sich
+   * nur pro Bot vergeben. Die Beschriftung muss sagen, was die Berechnung
+   * tut, nicht was man erwarten könnte. */
+  viewer: 'Eingeschränkt (nur pro Bot)',
 };
 
 const roleLevel = { viewer: 1, operator: 2, admin: 3, owner: 4 };
@@ -88,6 +92,21 @@ export const openAccess = async () => {
       const editable =
         roleLevel[accessData.role] > (roleLevel[user.role] ?? 0) &&
         user.role !== 'owner';
+
+      /* Maßnahme 45 (Auftrag 5.7): botbezogene Rechte hängen nicht an der
+       * Zielrolle, sondern daran, was der handelnde Benutzer auf genau
+       * diesem Bot selbst darf – das ist auch die Regel des Servers
+       * (`updateAccess`). Vorher filterte die Oberfläche Bot-Rechte auf die
+       * Rollenmenge der Zielrolle, für „Eingeschränkt“ (= keine) also auf
+       * nichts:
+       * der einzige Weg, jemanden auf genau einen Bot zu beschränken, war
+       * eine global weitergehende Rolle. */
+      const ownGlobalPermissions = new Set(accessData.permissions ?? []);
+      const grantableFor = (botId) =>
+        new Set([
+          ...ownGlobalPermissions,
+          ...(accessData.bots?.[botId]?.permissions ?? []),
+        ]);
 
       const roleSelect = el(
         'select',
@@ -187,11 +206,11 @@ export const openAccess = async () => {
           );
           return;
         }
-        const allowedRole = new Set(roles[roleSelect.value] ?? []);
         for (const [botId, cfg] of entries) {
           const bot = botMap.get(botId);
           const botLabel = bot?.name ? `${bot.name} (${botId})` : botId;
           const perms = Array.isArray(cfg?.permissions) ? cfg.permissions : [];
+          const grantable = grantableFor(botId);
           const block = el('div', { class: 'access-bot-block' });
           const head = el(
             'div',
@@ -222,7 +241,7 @@ export const openAccess = async () => {
               value: key,
               'data-bot-id': botId,
               checked: perms.includes(key),
-              disabled: !editable || !allowedRole.has(key),
+              disabled: !editable || !grantable.has(key),
             });
             grid.append(
               el(
@@ -246,12 +265,9 @@ export const openAccess = async () => {
           input.disabled = !editable || !allowed.has(input.value);
           if (!allowed.has(input.value)) input.checked = false;
         }
-        botPermsWrap
-          .querySelectorAll('input[type="checkbox"]')
-          .forEach((input) => {
-            input.disabled = !editable || !allowed.has(input.value);
-            if (!allowed.has(input.value)) input.checked = false;
-          });
+        /* Bot-Rechte werden hier nicht mehr angefasst: ihre Grenze ist die
+         * Rolle des Handelnden auf diesem Bot (`grantableFor`), nicht die
+         * gewählte Zielrolle. */
       };
 
       roleSelect.addEventListener('change', applyRoleDefaults);
@@ -285,8 +301,10 @@ export const openAccess = async () => {
                 const bid = first?.dataset.botId;
                 if (!bid) return;
                 const list = [];
+                const grantable = grantableFor(bid);
                 for (const cb of inputs) {
-                  if (cb.checked && allowed.has(cb.value)) list.push(cb.value);
+                  if (cb.checked && grantable.has(cb.value))
+                    list.push(cb.value);
                 }
                 botsPatch[bid] = { permissions: [...new Set(list)] };
               });
