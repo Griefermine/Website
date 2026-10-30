@@ -508,3 +508,46 @@ test('außerhalb der Produktion warnt die Platzprüfung nicht', () => {
     JSON.stringify(entwicklung.warnings),
   );
 });
+
+test('lokale Docker-Isolation verhindert den Start ohne bestätigte Firewall', () => {
+  const ergebnis = collectSecurityFindings({
+    env: { NODE_ENV: 'development' },
+    projectRoot: '/nicht/vorhanden',
+    facts: {
+      ...grundfakten,
+      containerRuntimeEnabled: true,
+      localNetworkVerified: false,
+    },
+    exists: () => false,
+    stat: () => ({ mode: 0o700 }),
+    secretSchutz: {
+      aktiv: true,
+      konfiguriert: true,
+      pfad: '',
+      grund: '',
+    },
+  });
+  assert.equal(ergebnis.errors.length, 1, JSON.stringify(ergebnis));
+  assert.match(ergebnis.errors[0], /Lokale Docker-Netzwerkisolation/);
+});
+
+test('lokales Docker-Profil bleibt bei verifizierter Firewall startfähig', () => {
+  const ergebnis = collectSecurityFindings({
+    env: { NODE_ENV: 'development' },
+    projectRoot: '/nicht/vorhanden',
+    facts: {
+      ...grundfakten,
+      containerRuntimeEnabled: true,
+      localNetworkVerified: true,
+    },
+    exists: () => false,
+    stat: () => ({ mode: 0o700 }),
+    secretSchutz: {
+      aktiv: true,
+      konfiguriert: true,
+      pfad: '',
+      grund: '',
+    },
+  });
+  assert.deepEqual(ergebnis.errors, []);
+});
