@@ -165,7 +165,8 @@ export const resolveImageDigest = (input) => {
   const digest = headerValue(headers, 'docker-content-digest');
   if (!/^sha256:[a-f0-9]{64}$/.test(digest))
     throw new Error(
-      'Registry lieferte keinen gültigen SHA-256-Digest für ' + parsed.reference,
+      'Registry lieferte keinen gültigen SHA-256-Digest für ' +
+        parsed.reference,
     );
   return parsed.reference + '@' + digest;
 };
@@ -234,7 +235,9 @@ const main = () => {
     if (!(key in DEFAULT_CONTAINER_IMAGES)) continue;
     if (typeof value !== 'string' || !IMAGE_PATTERN.test(value.trim()))
       throw new Error(
-        'BOT_HUB_CONTAINER_IMAGES.' + key + ' ist keine gültige Image-Referenz.',
+        'BOT_HUB_CONTAINER_IMAGES.' +
+          key +
+          ' ist keine gültige Image-Referenz.',
       );
     selected[key] = value.trim();
   }
