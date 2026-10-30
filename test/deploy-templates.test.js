@@ -39,10 +39,9 @@ const nginxBloecke = (pfad) => {
   const zeilen = readFileSync(pfad, 'utf8').split('\n');
   const blöcke = [];
   for (let index = 0; index < zeilen.length; index += 1) {
-    const treffer =
-      /^cat\s+>\s*(.+?)\s+<<(-?)([\'"]?)([A-Za-z_]+)\3$/.exec(
-        zeilen[index],
-      );
+    const treffer = /^cat\s+>\s*(.+?)\s+<<(-?)([\'"]?)([A-Za-z_]+)\3$/.exec(
+      zeilen[index],
+    );
     if (!treffer) continue;
     const [, ziel, , zitierung, marker] = treffer;
     const ende = zeilen.findIndex((zeile, j) => j > index && zeile === marker);
@@ -85,7 +84,10 @@ const mitProxy = (blok) => blok.gerendert.includes('proxy_pass');
 
 test('die TLS-Vorlage schreibt den HTTPS-Reverse-Proxy', () => {
   const proxyBloecke = alleBloecke.filter(mitProxy);
-  assert.ok(proxyBloecke.length >= 1, 'Erwartet mindestens eine Proxy-Vorlage.');
+  assert.ok(
+    proxyBloecke.length >= 1,
+    'Erwartet mindestens eine Proxy-Vorlage.',
+  );
   assert.ok(
     proxyBloecke.some((blok) => /listen 443 ssl/.test(blok.gerendert)),
     'Der produktive Reverse-Proxy muss TLS verwenden.',
@@ -135,7 +137,8 @@ test('der HTTP→HTTPS-Verweis behält Ziel und Anfrage', () => {
       blok.gerendert,
       /return\s+301\s+https:\/\/\S*\$request_uri\s*;/,
       `${blok.pfad} → ${blok.ziel}: Der Verweis verliert Ziel oder ` +
-        'Anfragepfad – `return 301 https://;` ist zwar gültige Syntax, leitet ' +
+        'Anfragepfad – `return 301 https://;` ist zwar gültige Syntax, ' +
+        'leitet ' +
         'aber ins Leere.',
     );
   }
@@ -153,10 +156,7 @@ test('Proxy-Kopfzeilen bleiben als nginx-Variablen erhalten', () => {
       'X-Forwarded-For',
       /\bproxy_set_header\s+X-Forwarded-For\s+\$proxy_add_x_forwarded_for\s*;/,
     ],
-    [
-      'X-Forwarded-Proto',
-      /\bproxy_set_header\s+X-Forwarded-Proto\s+\$scheme\s*;/,
-    ],
+    ['X-Forwarded-Proto', /\bproxy_set_header\s+X-Forwarded-Proto\s+https\s*;/],
   ];
   for (const blok of alleBloecke.filter(mitProxy)) {
     for (const [name, muster] of erwartet) {
@@ -165,7 +165,8 @@ test('Proxy-Kopfzeilen bleiben als nginx-Variablen erhalten', () => {
         muster,
         `${blok.pfad} → ${blok.ziel} verliert die Kopfzeile ${name}. Ohne ` +
           'sie kennt der Hub weder echte Besucher-Adresse noch HTTPS – und ' +
-          'ohne X-Forwarded-For landen alle Besucher in einem Rate-Limit-Eimer.',
+          'ohne X-Forwarded-For landen alle Besucher in einem Rate-Limit-' +
+          'Eimer.',
       );
     }
   }
@@ -188,8 +189,9 @@ test('Uploads haben eine bewusste Körpergrenze, nicht die nginx-Standardgrenze'
       blok.gerendert,
       /\bclient_max_body_size\s+2m\s*;/,
       `${blok.pfad} → ${blok.ziel} setzt keine Körpergrenze. Der ` +
-        'nginx-Standard (1m) kollidiert mit der hub-eigenen Grenze von 1 MiB ' +
-        'und liefert eine nginx-Fehlerseite statt der Hub-Meldung.',
+        'nginx-Standard (1m) kollidiert mit der hub-eigenen ' +
+        'Grenze von 1 MiB und liefert eine nginx-Fehlerseite ' +
+        'statt der Hub-Meldung.',
     );
   }
 });
@@ -215,4 +217,25 @@ test('Deployment schreibt Proxy-Vertrauen und Vault-Key in die .env', () => {
     'Ohne Vault-Key-Eintrag würde die Produktion ohne Verschlüsselung ' +
       'starten (Maßnahme 46).',
   );
+});
+
+test('TLS-Setup expandiert Variablen und unterstützt ältere nginx-Versionen', () => {
+  const tls = readFileSync(join(WURZEL, 'setup-tls.sh'), 'utf8');
+  assert.match(tls, /^DOMAIN="\$\{1:-\$\{BOT_HUB_DOMAIN:-\}\}"/m);
+  assert.match(tls, /^EMAIL="\$\{2:-\$\{BOT_HUB_LE_EMAIL:-\}\}"/m);
+  assert.match(tls, /dirname "\$\{BASH_SOURCE\[0\]\}"/);
+  assert.match(tls, /listen 443 ssl http2;/);
+  assert.doesNotMatch(tls, /^http2 on;$/m);
+  assert.match(tls, /renewal-hooks\/deploy\/10-bot-hub-reload-nginx/);
+  assert.match(tls, /certbot renew --dry-run/);
+});
+
+test('Deployment pinnt alle Standard-Images vor dem Hub-Start', () => {
+  const deploy = readFileSync(join(WURZEL, 'deploy-full.sh'), 'utf8');
+  const pinning = readFileSync(join(WURZEL, 'scripts/pin-images.mjs'), 'utf8');
+  assert.match(deploy, /scripts\/pin-images\.mjs/);
+  assert.match(pinning, /DEFAULT_CONTAINER_IMAGES/);
+  assert.match(pinning, /docker-content-digest/i);
+  assert.match(pinning, /BOT_HUB_CONTAINER_IMAGES/);
+  assert.match(pinning, /127\.0\.0\.1:3130/);
 });
