@@ -48,7 +48,11 @@ const spawnHub = (env) => {
  * Prozess danach beenden. Schneller als auf das (nicht eintretende) Ende.
  */
 const startAndRead = async (env) => {
-  const { child, out } = spawnHub(env);
+  const { child, out } = spawnHub({
+    NODE_ENV: 'test',
+    BOT_HUB_TEST_MODE: '1',
+    ...env,
+  });
   try {
     await Promise.race([
       once(child.stdout, 'data'),
@@ -107,21 +111,12 @@ describe('Startschutz für unsichere Konfiguration', () => {
     assert.ok(!out.includes('ABBRUCH'));
   });
 
-  it('warnt, wenn Bot-Prozesse den Hub nicht erreichen können', async () => {
-    const ohneUrl = await startAndRead({
+  it('empfiehlt keinen uneingeschränkten Host-Zugriff für Bot-Container', async () => {
+    const out = await startAndRead({
       BOT_HUB_URL: 'http://127.0.0.1:8787',
     });
-    assert.match(ohneUrl, /BOT_HUB_CONTAINER_URL ist nicht gesetzt/);
-    assert.match(ohneUrl, /127\.0\.0\.1 im Container/);
-
-    const mitUrl = await startAndRead({
-      BOT_HUB_URL: 'http://127.0.0.1:8787',
-      BOT_HUB_CONTAINER_URL: 'http://host.docker.internal:8787',
-    });
-    assert.ok(
-      !mitUrl.includes('BOT_HUB_CONTAINER_URL ist nicht gesetzt'),
-      'Hinweis erscheint trotz gesetzter Container-URL',
-    );
+    assert.doesNotMatch(out, /host\.docker\.internal/);
+    assert.doesNotMatch(out, /BOT_HUB_CONTAINER_URL ist nicht gesetzt/);
   });
 });
 
