@@ -433,3 +433,78 @@ test('ohne Produktionsschalter nur eine Warnung', () => {
   assert.deepEqual(entwicklung.errors, []);
   assert.deepEqual(entwicklung.warnings, []);
 });
+
+/* ----- Maßnahme 49 (Auftrag 5.4): Vorwarnung bei knappem Datenträger ----- */
+
+const knapp = () => ({
+  bsize: 4096,
+  bavail: Math.ceil((8 * 1024 * 1024) / 4096),
+  ffree: 500_000,
+});
+
+test('knapper Datenträger ist in Produktion eine Warnung, kein Abbruch', () => {
+  const ergebnis = collectSecurityFindings({
+    env: { NODE_ENV: 'production' },
+    projectRoot: '/sonst/nichts',
+    facts: grundfakten,
+    exists: () => false,
+    stat: () => ({ mode: 0o700 }),
+    secretSchutz: { aktiv: true, konfiguriert: true, pfad: '', grund: '' },
+    statfs: knapp,
+  });
+  assert.deepEqual(ergebnis.errors, [], JSON.stringify(ergebnis));
+  assert.ok(
+    ergebnis.warnings.some((text) => text.includes('MiB frei')),
+    JSON.stringify(ergebnis.warnings),
+  );
+});
+
+test('reichlich Platz erzeugt keine Meldung, ein Messausfall auch nicht', () => {
+  const grund = {
+    env: { NODE_ENV: 'production' },
+    projectRoot: '/sonst/nichts',
+    facts: grundfakten,
+    exists: () => false,
+    stat: () => ({ mode: 0o700 }),
+    secretSchutz: { aktiv: true, konfiguriert: true, pfad: '', grund: '' },
+  };
+  const mitPlatz = collectSecurityFindings({
+    ...grund,
+    statfs: () => ({
+      bsize: 4096,
+      bavail: Math.ceil((50 * 1024 * 1024 * 1024) / 4096),
+      ffree: 5_000_000,
+    }),
+  });
+  assert.ok(
+    !mitPlatz.warnings.some((text) => text.includes('MiB frei')),
+    JSON.stringify(mitPlatz.warnings),
+  );
+  // Nicht messbar (exotisches Dateisystem, fehlende Berechtigung): still.
+  const unmessbar = collectSecurityFindings({
+    ...grund,
+    statfs: () => {
+      throw new Error('EPERM');
+    },
+  });
+  assert.ok(
+    !unmessbar.warnings.some((text) => text.includes('MiB frei')),
+    JSON.stringify(unmessbar.warnings),
+  );
+});
+
+test('außerhalb der Produktion warnt die Platzprüfung nicht', () => {
+  const entwicklung = collectSecurityFindings({
+    env: { NODE_ENV: 'development' },
+    projectRoot: '/sonst/nichts',
+    facts: grundfakten,
+    exists: () => false,
+    stat: () => ({ mode: 0o700 }),
+    secretSchutz: { aktiv: true, konfiguriert: true, pfad: '', grund: '' },
+    statfs: knapp,
+  });
+  assert.ok(
+    !entwicklung.warnings.some((text) => text.includes('MiB frei')),
+    JSON.stringify(entwicklung.warnings),
+  );
+});

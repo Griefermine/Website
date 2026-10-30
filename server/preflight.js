@@ -11,9 +11,11 @@ import {
   readdirSync,
   readFileSync,
   statSync,
+  statfsSync,
 } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseDotenv } from './util.js';
+import { capacityGuard } from './disk.js';
 import { isVaultValue, vaultStatus } from './vault.js';
 
 export const LOOPBACK_HOSTS = new Set([
@@ -72,6 +74,7 @@ export const collectSecurityFindings = ({
   stat = statSync,
   lstat = lstatSync,
   list = readdirSync,
+  statfs = statfsSync,
   secretSchutz = undefined,
   aktuelleBenutzerkennung = typeof process.getuid === 'function'
     ? process.getuid()
@@ -307,6 +310,18 @@ export const collectSecurityFindings = ({
           'BOT_HUB_TRUSTED_PROXIES=127.0.0.1).',
       );
     }
+  }
+
+  // 8) Maßnahme 49 (Auftrag 5.4): freier Platz auf dem Datenträger. Der Hub
+  //    kann ohne Dateisystem-Quota keine harte Grenze je Workspace setzen
+  //    (bewusste Entscheidung, documents/sicherheit.md) – aber er kann beim
+  //    Start sehen, ob der Datenträger, auf dem `bots/` und die Datenbank
+  //    liegen, überhaupt noch Raum hat. Warnung, kein Abbruch: ein knapper
+  //    Datenträger ist eine Meldung wert, aber kein Grund, die bestehende
+  //    Installation auszusperren. Nicht messbare Datenträger bleiben still.
+  if (production) {
+    const platz = capacityGuard(projectRoot, { env, statfs });
+    if (!platz.ok) warnings.push(platz.grund);
   }
 
   return { errors, warnings };

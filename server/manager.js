@@ -92,6 +92,7 @@ import {
   sweepStaleExecEnvFiles,
 } from './containers.js';
 import { database } from './database.js';
+import { capacityGuard } from './disk.js';
 import { ensurePanelScaffold, migrateScaffold } from './panelScaffold.js';
 
 const PROJECT_ROOT = resolve(process.env.BOT_DASHBOARD_ROOT || process.cwd());
@@ -1782,6 +1783,16 @@ const installDependencies = async (bot, dir, { state, force = false } = {}) => {
     setStatus(bot, 'stopped', { depsStatus: 'missing' });
     return { ...info, installed: false, ok: false };
   }
+  /* Maßnahme 49 (Auftrag 5.4): Installationen sind der größte Schreiber
+   * (pip/npm laden Hunderte MB in den Workspace). Lieber vorher abbrechen,
+   * als die Installation bei halb heruntergeladenen Abhängigkeiten vom vollen
+   * Datenträger stoppen zu lassen – und dabei alle anderen Bots mitzureißen. */
+  const platz = capacityGuard(PROJECT_ROOT);
+  if (!platz.ok) {
+    pushLine(bot.id, 'system', `✗ ${platz.grund}`);
+    setStatus(bot, 'stopped', { depsStatus: 'failed' });
+    return { ...info, installed: false, ok: false };
+  }
 
   setStatus(bot, 'installing', {
     depsStatus: 'installing',
@@ -2932,6 +2943,17 @@ const handleApi = async (req, res, url) => {
         // nicht während des gesamten Body-Uploads reservieren.
         const body = await readBody(req);
         const config = normaliseConfig(body, null);
+        /* Maßnahme 49 (Auftrag 5.4): vor jeder Anlage, die einen Workspace
+         * und später eine Installation nach sich zieht, muss der Datenträger
+         * messbar Platz haben. Eine volle Platte trifft nicht nur diesen Bot:
+         * Datenbank, Sitzungsdatei und jeder andere Workspace brechen dann
+         * ebenfalls weg. Synchron (statfs), reiht sich also vor das
+         * Slot-Reservieren, ohne die Atomarität der Zeile darunter zu stören.
+         * Status 422 (nicht 507): dieser Handler versteckt 5xx-Meldungen
+         * bewusst hinter „Interner Serverfehler“ – der Betreiber soll den
+         * Grund hier aber lesen können, so wie bei 413 und 429 auch. */
+        const platz = capacityGuard(PROJECT_ROOT);
+        if (!platz.ok) throw httpError(422, platz.grund);
         // P1-H: Prüfen und Reserven in einem Synchronzug – zwischen `if` und
         // `+=` darf kein await liegen, sonst sehen parallele Requests erneut
         // dieselbe freie Kapazität.
