@@ -35,10 +35,17 @@ import { Writable } from 'node:stream';
 import { test } from 'node:test';
 
 const { __testing } = await import('../server/panel.js');
-const { openPanelFile, sendFile } = __testing;
+const { openPanelFile, sendFile, readManifest } = __testing;
 
 const root = mkdtempSync(join(tmpdir(), 'v27-toctou-'));
 test.after(() => rmSync(root, { recursive: true, force: true }));
+
+/* Manifest-Grundlage für die Maße-53-Fälle: `leseManifest` sucht im
+ * Workspace-Root (hier das Temp-Verzeichnis selbst). */
+writeFileSync(
+  join(root, 'bot-hub.json'),
+  JSON.stringify({ title: 'Testseite', entry: 'index.html' }),
+);
 
 /** Datei mit gewünschter Größe anlegen (für die 8-MiB-Grenze). */
 const dateiMitGroesse = (pfad, bytes) =>
@@ -197,3 +204,89 @@ function fremdVorhanden() {
     return false;
   }
 }
+
+/* ---------------- Maßnahme 53 (Gegenprüfung NF-1): das Manifest ----------- *
+ * readManifest prüfte früher existsSync/statSync und las dann readFileSync
+ * NACH PFAD – dasselbe Prüfe-dann-öffne-Muster, das Maßnahme 50 für die
+ * Datei-Auslieferung geschlossen hat. Ein Bot, der im Fenster den Pfad gegen
+ * einen Symlink tauscht, ließ den Hub eine beliebige vom Hub-Benutzer lesbare
+ * Datei parsen (Fehlerfragmente landen als `error` im Panel-Zustand).
+ *
+ * workspaceDir liefert ohne Testmodus den bots/<id>/workspace-Pfad (kompliziert
+ * aufzubauen); mit BOT_HUB_TEST_MODE=1 ist es der Projekt-Root. Als bot.cwd
+ * wird ein ABSOLUTER Temp-Pfad übergeben — join() lässt ihn gewinnen, die
+ * Bot-Ordner liegen also exakt im Temp-Verzeichnis dieses Tests. */
+
+const { readdirSync: readdirSyncFd } = await import('node:fs');
+
+const manifestBot = (id) => ({ id, workspaceRoot: '', cwd: root });
+
+const leseManifest = (id, ordner = root) => {
+  const vorher = {
+    mode: process.env.BOT_HUB_TEST_MODE,
+    root: process.env.BOT_DASHBOARD_ROOT,
+  };
+  process.env.BOT_HUB_TEST_MODE = '1';
+  // projectRoot() wird bei jedem Aufruf gelesen – der Temp-Root dieses Tests
+  // wird so zum Workspace-Root, ohne dass etwas ins Repo schreibt.
+  process.env.BOT_DASHBOARD_ROOT = root;
+  try {
+    return readManifest({ id, workspaceRoot: '', cwd: ordner });
+  } finally {
+    if (vorher.mode === undefined) delete process.env.BOT_HUB_TEST_MODE;
+    else process.env.BOT_HUB_TEST_MODE = vorher.mode;
+    if (vorher.root === undefined) delete process.env.BOT_DASHBOARD_ROOT;
+    else process.env.BOT_DASHBOARD_ROOT = vorher.root;
+  }
+};
+
+test('ein echtes Manifest wird gelesen', () => {
+  const ergebnis = leseManifest('m-echt');
+  assert.ok(ergebnis, 'Manifest nicht gefunden');
+  assert.equal(ergebnis.error, '');
+  assert.equal(ergebnis.manifest.title, 'Testseite');
+  assert.match(ergebnis.manifest.entry, /index\.html/);
+});
+
+test('ein Symlink als Manifest wird ignoriert, die fremde Datei nicht gelesen', () => {
+  const beute = join(root, 'beute-manifest.json');
+  writeFileSync(beute, '{"geheimnis":"NICHT-LESEN"}');
+  const botOrdner = join(root, 'symlinkbot');
+  mkdirSync(botOrdner, { recursive: true });
+  symlinkSync(beute, join(botOrdner, 'bot-hub.json'));
+  const ergebnis = leseManifest('m-link', botOrdner);
+  assert.equal(ergebnis, null, 'Symlink-Manifest wurde gelesen');
+  // Kein Fragment der Beute wäre im Ergebnis sichtbar – gar kein Ergebnis.
+});
+
+test('ein übergroßes Manifest wird am Deskriptor abgelehnt', () => {
+  const botOrdner = join(root, 'riesig-bot');
+  mkdirSync(botOrdner, { recursive: true });
+  // Fülle den Wert so, dass normalisePanel den Inhalt noch sehen würde.
+  writeFileSync(
+    join(botOrdner, 'bot-hub.json'),
+    JSON.stringify({ title: 'x'.repeat(200_000), entry: 'a.html' }),
+  );
+  const ergebnis = leseManifest('m-gross', botOrdner);
+  assert.ok(ergebnis, 'übergroßes Manifest lieferte null statt Fehler');
+  assert.equal(ergebnis.manifest, null);
+  assert.match(ergebnis.error, /zu groß \(max\. 128 KB\)/);
+});
+
+test('Manifest-Leser leakt keinen Dateideskriptor', async () => {
+  let anzahl = 0;
+  try {
+    anzahl = readdirSyncFd('/proc/self/fd').length;
+  } catch {
+    return; // ohne /proc nichts zu prüfen
+  }
+  leseManifest('m-fd-1');
+  leseManifest('m-fd-2'); // Cache-Treffer
+  const gross = join(root, 'riesig-bot');
+  leseManifest('m-fd-3', gross); // 413-Pfad
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(
+    readdirSyncFd('/proc/self/fd').length <= anzahl,
+    'Deskriptoren laufen davon',
+  );
+});

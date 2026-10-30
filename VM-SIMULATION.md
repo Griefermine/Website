@@ -677,3 +677,70 @@ Serenity-Bau wäre in der VM (2 CPU) ein 20-Minuten-Monster; die Schiene
 
 **Bug 29** (siehe Bug-Liste) war Voraussetzung: ohne ihn startet kein
 Rust-Preset-Bot.
+
+## V27: Nachrüstung und Live-Prüfung auf dem Laptop (Maßnahmen 44–53)
+
+Auftrag V27 prüfte alle elf Problembereiche des Auditberichts (5.1–5.11) am
+tatsächlichen Code und ließ nur nach, was dort wirklich nachweisbar war. Alles
+Unten lief **auf dem Laptop**, nie in der VM (die blieb während V27 ausge‐
+schaltet). Tests: `npm test` (zuletzt 608 + 4 Fälle für Maßnahme 53), jeweils
+Loopback-gebunden.
+
+| Maßnahme | Commit | Bereich | was sie tut |
+|---|---|---|---|
+| 44 Exec-Env-Sweep | `4f95baf` | 5.1 | räumt nur Env-Dateien älter als 10 min weg — Race mit laufenden Starts zu |
+| 45 Session-Härtung | `0db84b3` | 5.1/5.7 | Sitzungen nur als SHA-256 in `sessions.json` (Altbestand wird beim Laden umgeschlüsselt), Idle-Frist `BOT_HUB_SESSION_IDLE_HOURS` (72 h) + TTL (168 h), Widerruf aller Sessions bei `removeAccess`, 256-Bit-IDs; botbezogene Rechte folgen der Capability-Delegation (Server + UI), Rollenlabel „Eingeschränkt (nur pro Bot)“ |
+| 46 Vault-Pflicht | `011ef93` | 5.1 | `vaultStatus()` unterscheidet „kein Schlüssel“ von „unbrauchbar“; in Produktion wird Klartext-Rückfall zum Start-Abbruch (Preflight-Fehler), Schreiben von Secrets in Klartext ist in Produktion verboten |
+| 47 Proxy-Kanonik | `eb673f4` | 5.5/5.9 | `::ffff:`-Normalisierung vor jedem Adressvergleich; `X-Forwarded-For` zählt nur bei vertrauter Direktadresse (`BOT_HUB_TRUSTED_PROXIES`); nginx-Vorlagen: Host-Durchreicheung `$http_host`, `client_max_body_size 2m`; setup-tls.sh-Heredoc-Bug bewiesen (echtes `nginx -t`: `[emerg] invalid number of arguments in "proxy_set_header"`) und in allen drei Vorlagen behoben |
+| 48 Auth-Kette | `bf23467` | 5.6 | `discordApiBasis()` als Test-Öse (nur `NODE_ENV=test` UND Schleifenadresse); Suite `test/auth-flow.test.js` (15 Fälle) fährt den Hub OHNE `BOT_HUB_TEST_MODE` gegen eine Mock-Discord; dabei gehärtet: ein UNBEKANNTER `error`-Parameter im Callback bricht die Anmeldung jetzt ab (vorher lief sie „erfolgreich“ durch) |
+| 49 Datenträgerplatz | `4e3761f` | 5.4 | `server/disk.js` misst `bavail` + `ffree` vor Bot-Anlage (HTTP 422 mit lesbarem Grund) und vor jeder Installation; `BOT_HUB_MIN_FREE_MB` (256) / `BOT_HUB_MIN_FREE_INODES` (10000); Messausfall lässt zu (kein Aussperrrisiko); Preflight-Warnung in Produktion. Die harte Kontingentgrenze je Workspace bleibt dokumentierte Betriebsentscheidung |
+| 50 Panel fd-Basis | `7569b3c` | 5.2 | `openPanelFile()`: EINmal öffnen mit `O_NOFOLLOW`, Größe/Typ vom `fstat` des Deskriptors, 404/413 vor `writeHead`, Stream am Deskriptor — ein Tausch des Pfads nach der Prüfung ist folgenlos (im Test bewiesen, ohne Wettlauf) |
+| 51 .NET-Init | `8a99466` | 5.3 | Guard-Fehler überspringt den bewussten root-Lauf jetzt (vorher: schlucken + trotzdem laufen); `EEXIST` nach gelöschtem Eintrag = harter Abbruch, wenn die Stelle kein echtes Verzeichnis ist; Container-Skript mit `[ ! -L ]`-Doppelschutz, `chown -Rh`, festem `--user 0:0` und korrekter Zeilenfügung (vorher: `set -e && for …` — ungültige Syntax, durch `sh -n` bewiesen) |
+| 52 CI-Pinning | `9fc15b0` | 5.11 | alle `uses:` auf volle Commit-SHAs (checkout v4.4.0, setup-node v4.4.0, upload-artifact v4.6.2 — via `git ls-remote` gelöst), Gitleaks auf `@sha256:75bdb2b2…` (v8.18.4); Regressionstests prüfen die REGEL, nicht Momentwerte |
+| 53 Manifest fd-Basis | (dieser Zweig) | 5.2 | Gegenprüfungs-Befund NF-1: `readManifest` prüfte `existsSync`/`statSync` und las dann nach PFAD — jetzt wie Maßnahme 50: `O_NOFOLLOW` + Inhalt/Größe ausschließlich am Deskriptor, übergroß = Fehler statt Inhalt; 4 weitere Fälle in `test/security-v27-toctou.test.js` |
+
+### Live-Nachweis (§6) in isolierter Loopback-Umgebung
+
+Aufbau unter `/tmp/opencode/live/`: Mock-Discord (127.0.0.1:18799, Einmal-Codes,
+echte PKCE-Prüfung, drei erfundene Benutzer), Hub (127.0.0.1:18787, `NODE_ENV=test`
+aber OHNE `BOT_HUB_TEST_MODE` — die Autorisierungskette ist die echte), SQLite,
+Bot-Images auf das lokale `alpine:3.20` umgelenkt, nginx:1.27-alpine als Proxy auf
+127.0.0.1:80. Prüfer und Skripte haben keine echten Discord-Daten berührt.
+
+- **Anmeldung über die echte Kette:** Handshake (State + PKCE + Vorab-Cookie),
+  Code bei der Mock, Rückkehr, Sitzungs-Cookie. Eigentümer und Zuschauer anonym
+  mit curl + Skript (`login.mjs`) — 302, Cookie, Rollen sofort wirksam.
+- **Rollen live:** Zuschauer bekommt auf POST /api/bots, PUT files, POST start
+  jeweils **403**; der Eigentümer darf.
+- **Container live:** custom-Bot auf `alpine:3.20` gestartet (`docker ps`:
+  `bot-hub-<id> Up … alpine:3.20`), Protokoll lieferte „bot lebt“ über die
+  Log-Schiene, Stop → `Exited (143)`, Delete → Container und Workspace weg,
+  Audit-Zeile `BOT_DELETE … COMPLETED` mit `actor=live-eigentuemer`.
+- **Lösch-Teilfehler:** root-eigener Ordner im Workspace (per root-Container
+  gesetzt) → DELETE antwortet 500 mit `status:"cleanup_failed"`, `deleted:false`,
+  `cleanupErrors:[{step:"files"}]`; Audit schreibt `FAILED step=files: EACCES`;
+  Bot bleibt gelistet und gesperrt. Nach Bereinigung erledigt der Recovery-Lauf
+  des nächsten Starts die Anlage restlos.
+- **Session-Hashing live:** in `data/sessions.json` stehen nur `sha256:…`-Schlüssel,
+  der echte Cookie-Wert kommt im Dateinhalt nirgends vor; Hub-Neustart → alter
+  Cookie bleibt gültig.
+- **Proxy/Rates live (Maßnahme 47):** nginx vor dem Hub, `BOT_HUB_TRUSTED_PROXIES=127.0.0.1`.
+  10 Besucher mit je eigener `X-Forwarded-For` → 10× 302 (eigene Eimer);
+  35 Anfragen einer Adresse → exakt 30× 302, dann 429 (Limit 30/min);
+  35 Anfragen DIREKT am Hub mit erfundenem Header → Teilung des 127.0.0.1-Eimers,
+  Header ignoriert. Ohne Maßnahme 47 (Vergleich gegen `::ffff:127.0.0.1`) wären
+  alle/nginx-Besucher in einem Eimer gelandet.
+- **Platz-Guard live:** Hub mit `BOT_HUB_MIN_FREE_MB=100000000` gestartet → POST
+  /api/bots antwortet **422** mit „nur noch 28193 MiB frei; erforderlich sind
+  …“; kein Bot angelegt, kein Pfad in der Meldung.
+- **Panel live:** `/panel/open` → 302 mit einmaligem 60-s-Bootstrap-Token in der
+  URL und `HttpOnly`-Panel-Cookie; Datei-Auslieferung 200 mit Sandbox-CSP;
+  ohne Token/Cookie 401/404; Zuschauer 403; Traversierung (`../`) abgewiesen;
+  Bot-Löschung widerruft den ausgegebenen Panel-Token (vorher 200 → nachher 404).
+- MySQL-Umschaltung wurde live NICHT geprüft (kein lokales MySQL-Bild, VM aus);
+  die MySQL-Pfade bleiben durch die Integrationssuite (`npm run test:mysql`)
+  abgedeckt — als „nicht live geprüft“ klassifiziert.
+
+Belege: `/tmp/opencode/live/` (Skripte, `hub*.log`), `/tmp/opencode/tlsproof/`
+(nginx `-t` Beweise für Maßnahme 47), `/tmp/opencode/v27-after-*.log`
+(Suite-Verläufe 526→612).
