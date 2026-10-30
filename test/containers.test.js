@@ -46,7 +46,12 @@ describe('Container-Isolation', () => {
     assert.ok(!createArgs.includes('--privileged'));
     assert.ok(!joined.includes('docker.sock'));
     assert.ok(createArgs.includes('--network'));
-    assert.equal(createArgs[createArgs.indexOf('--network') + 1], 'bridge');
+    assert.equal(
+      createArgs[createArgs.indexOf('--network') + 1],
+      'bot-hub-local',
+    );
+    assert.ok(!createArgs.includes('--publish'));
+    assert.ok(!createArgs.includes('-p'));
     assert.ok(!joined.includes('--pid=host'));
     assert.ok(createArgs.includes('ALL'), 'cap-drop ALL fehlt');
     assert.ok(joined.includes('no-new-privileges:true'));
@@ -403,19 +408,20 @@ describe('Produktionsnetzwerke isolieren gleichzeitige Container', () => {
   });
 });
 
-describe('Container-URL aktiviert den Weg zum Host', () => {
-  let withHost;
-  before(async () => {
+describe('Host-Gateway bleibt gesperrt', () => {
+  it('lehnt die frühere BOT_HUB_CONTAINER_URL-Freigabe ab', async () => {
     process.env.BOT_HUB_CONTAINER_URL = 'http://host.docker.internal:8787';
-    // Frisches Modul, weil die Konfiguration einmalig gelesen wird.
-    const module = await import(`../server/containers.js?v=${Date.now()}`);
-    withHost = module.containerCreateArgs(bot, root);
-    delete process.env.BOT_HUB_CONTAINER_URL;
-  });
-
-  it('mappt host.docker.internal nur auf Wunsch', () => {
-    assert.ok(withHost.includes('--add-host'));
-    assert.ok(withHost.includes('host.docker.internal:host-gateway'));
+    try {
+      const module = await import(
+        `../server/containers.js?v=${Date.now()}`
+      );
+      assert.throws(
+        () => module.containerCreateArgs(bot, root),
+        /BOT_HUB_CONTAINER_URL ist nicht mehr zulässig/,
+      );
+    } finally {
+      delete process.env.BOT_HUB_CONTAINER_URL;
+    }
   });
 });
 
