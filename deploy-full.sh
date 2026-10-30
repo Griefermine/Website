@@ -360,8 +360,21 @@ if [ -d "deploy/discord-egress" ]; then
     log_info "Docker Compose für Discord-Egress starten..."
     docker compose up -d
     log_success "Docker-Netzwerk gestartet"
-    
+
     cd "$PROJECT_DIR"
+
+    # Der Produktions-Preflight verlangt unveränderliche Image-Digests.
+    # Vor dem Hub-Start werden die Registry-Manifeste über den gerade
+    # eingerichteten, loopback-gebundenen Docker-Egress-Proxy aufgelöst und
+    # atomar in .env geschrieben. Es werden dabei keine Image-Layer geladen.
+    if [ -f "$PROJECT_DIR/scripts/pin-images.mjs" ]; then
+        log_info "Container-Images auf Registry-Digests festlegen..."
+        node "$PROJECT_DIR/scripts/pin-images.mjs" "$PROJECT_DIR/.env"
+        log_success "Container-Image-Digests festgelegt"
+    else
+        log_error "scripts/pin-images.mjs fehlt; Produktionsstart wäre nicht verifiziert."
+        exit 1
+    fi
 else
     log_error "deploy/discord-egress Verzeichnis nicht gefunden!"
     exit 1
