@@ -40,7 +40,7 @@ const nginxBloecke = (pfad) => {
   const blöcke = [];
   for (let index = 0; index < zeilen.length; index += 1) {
     const treffer =
-      /^cat > (\/etc\/nginx\/[^\s]+) <<(-?)(['"]?)([A-Za-z_]+)\3$/.exec(
+      /^cat\s+>\s*(.+?)\s+<<(-?)([\'"]?)([A-Za-z_]+)\3$/.exec(
         zeilen[index],
       );
     if (!treffer) continue;
