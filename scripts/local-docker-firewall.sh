@@ -137,6 +137,12 @@ apply_rules() {
   "$IPT" -w -F "$EGRESS_CHAIN"
   "$IPT" -w -F "$INPUT_CHAIN"
 
+  # The Docker gateway itself is RFC1918. Permit only the internal Bot API
+  # tuple before the general private-address deny rules.
+  "$IPT" -w -A "$EGRESS_CHAIN" -d "$GATEWAY/32" -p tcp --dport "$API_PORT" \
+    -m conntrack --ctstate NEW,ESTABLISHED \
+    -m comment --comment bot-hub-local-api-egress -j RETURN
+
   while IFS= read -r CIDR; do
     [ -n "$CIDR" ] || continue
     "$IPT" -w -A "$EGRESS_CHAIN" -d "$CIDR" -m comment --comment bot-hub-local-private-egress -j DROP
@@ -210,6 +216,10 @@ check_rules() {
 240.0.0.0/4
 255.255.255.255/32
 CIDRS
+  "$IPT" -w -C "$EGRESS_CHAIN" -d "$GATEWAY/32" -p tcp --dport "$API_PORT" \
+    -m conntrack --ctstate NEW,ESTABLISHED \
+    -m comment --comment bot-hub-local-api-egress -j RETURN ||
+    die "Ausnahme für die interne Bot-API im Egress-Filter fehlt."
   "$IPT" -w -C "$EGRESS_CHAIN" -j RETURN || die "Egress-RETURN fehlt."
   "$IPT" -w -C "$INPUT_CHAIN" -d "$GATEWAY/32" -p tcp --dport "$API_PORT" \
     -m conntrack --ctstate NEW,ESTABLISHED \
@@ -217,11 +227,23 @@ CIDRS
     die "Freigabe für die interne Bot-API fehlt."
   "$IPT" -w -C "$INPUT_CHAIN" -j DROP || die "Host-Input-DROP fehlt."
 
-  local egress_rules input_rules
+  # Rule presence alone is insufficient: an early RETURN would neutralize
+  # the deny list. Verify the complete effective order and exact rule count.
+  local egress_rules input_rules egress_first input_first input_second
   egress_rules="$("$IPT" -w -S "$EGRESS_CHAIN" | grep -c "^-A $EGRESS_CHAIN" || true)"
   input_rules="$("$IPT" -w -S "$INPUT_CHAIN" | grep -c "^-A $INPUT_CHAIN" || true)"
-  [ "$egress_rules" -eq $((count + 1)) ] || die "Die Egress-Kette enthält unerwartete Regeln."
+  [ "$egress_rules" -eq $((count + 2)) ] || die "Die Egress-Kette enthält unerwartete Regeln."
   [ "$input_rules" -eq 2 ] || die "Die Input-Kette enthält unerwartete Regeln."
+
+  egress_first="$("$IPT" -w -S "$EGRESS_CHAIN" | awk -v chain="$EGRESS_CHAIN" '$1 == "-A" && $2 == chain { print; exit }')"
+  input_first="$("$IPT" -w -S "$INPUT_CHAIN" | awk -v chain="$INPUT_CHAIN" '$1 == "-A" && $2 == chain { print; exit }')"
+  input_second="$("$IPT" -w -S "$INPUT_CHAIN" | awk -v chain="$INPUT_CHAIN" '$1 == "-A" && $2 == chain { count++; if (count == 2) print }')"
+  [ "$egress_first" = "-A $EGRESS_CHAIN -d $GATEWAY/32 -p tcp -m tcp --dport $API_PORT -m conntrack --ctstate NEW,ESTABLISHED -m comment --comment bot-hub-local-api-egress -j RETURN" ] ||
+    die "Die API-Ausnahme steht nicht vor allen privaten Ziel-Sperren."
+  [ "$input_first" = "-A $INPUT_CHAIN -d $GATEWAY/32 -p tcp -m tcp --dport $API_PORT -m conntrack --ctstate NEW,ESTABLISHED -m comment --comment bot-hub-local-api -j ACCEPT" ] ||
+    die "Die interne API-Freigabe steht nicht an erster Stelle."
+  [ "$input_second" = "-A $INPUT_CHAIN -j DROP" ] ||
+    die "Die Host-Sperre folgt nicht direkt auf die API-Freigabe."
 }
 
 remove_rules() {
