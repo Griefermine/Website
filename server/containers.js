@@ -472,7 +472,7 @@ const ipv4Number = (value) => {
     pieces.length !== 4 ||
     pieces.some(
       (piece, index) =>
-        !/^\\d{1,3}$/.test(piece) ||
+        !/^\d{1,3}$/.test(piece) ||
         !Number.isInteger(octets[index]) ||
         octets[index] < 0 ||
         octets[index] > 255,
@@ -503,7 +503,7 @@ export const validateLocalNetworkInspection = (network) => {
     );
 
   const [addressing] = config;
-  const subnetMatch = /^(\\d{1,3}(?:\\.\\d{1,3}){3})\\/(\\d{1,2})$/.exec(
+  const subnetMatch = /^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/.exec(
     String(addressing?.Subnet ?? ''),
   );
   const gateway = String(addressing?.Gateway ?? '');
@@ -1230,7 +1230,7 @@ export const containerHubUrl = () =>
       : String(
           process.env.BOT_HUB_URL ||
             'http://127.0.0.1:' + (process.env.PORT || 8787),
-        ).replace(/\\/+$/, '');
+        ).replace(/\/+$/, '');
 
 export const containerRuntimeEnabled = () =>
   process.env.BOT_HUB_TEST_MODE !== '1' &&
