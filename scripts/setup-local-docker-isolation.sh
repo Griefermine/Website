@@ -87,7 +87,7 @@ cat > "$SYSTEMD_DROPIN" <<'EOF'
 # Docker recreates its firewall chains at daemon start. Re-apply the
 # Bot-Hub-owned policy after Docker initializes them; failure is also checked
 # by Bot-Hub itself before any bot container can start.
-ExecStartPost=-/usr/local/sbin/bot-hub-local-firewall apply
+ExecStartPost=/usr/local/sbin/bot-hub-local-firewall apply
 EOF
 chmod 0644 "$SYSTEMD_DROPIN"
 
