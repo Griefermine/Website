@@ -78,7 +78,7 @@ PY
 
   # Docker's automatic address pool does not know every manually configured
   # VPN/LAN route. Refuse an overlap instead of silently shadowing that route.
-  python3 - "$SUBNET" "$BRIDGE" <<'PY'
+  python3 - "$SUBNET" "$BRIDGE" <<'PY' || die "Docker-Subnetz kollidiert mit einer vorhandenen LAN-/VPN-Route."
 import ipaddress
 import subprocess
 import sys
@@ -109,7 +109,6 @@ for line in routes.splitlines():
         )
         sys.exit(1)
 PY
-  || die "Docker-Subnetz kollidiert mit einer vorhandenen LAN-/VPN-Route."
 }
 
 require_docker_user_chain() {
