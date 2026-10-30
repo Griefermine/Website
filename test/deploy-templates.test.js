@@ -85,14 +85,19 @@ const mitProxy = (blok) => blok.gerendert.includes('proxy_pass');
 
 test('die TLS-Vorlage schreibt den HTTPS-Reverse-Proxy', () => {
   const proxyBloecke = alleBloecke.filter(mitProxy);
-  assert.ok(proxyBloecke.length >= 1, 'Erwartet mindestens eine Proxy-Vorlage.');
+  assert.ok(
+    proxyBloecke.length >= 1,
+    'Erwartet mindestens eine Proxy-Vorlage.',
+  );
   assert.ok(
     proxyBloecke.some((blok) => /listen 443 ssl/.test(blok.gerendert)),
     'Der produktive Reverse-Proxy muss TLS verwenden.',
   );
 });
 
-test('Standard-Deployment fordert TLS an und veröffentlicht keine HTTP-App', () => {
+test(
+  'Standard-Deployment fordert TLS an und veröffentlicht keine HTTP-App',
+  () => {
   const deploy = readFileSync(join(WURZEL, 'deploy-full.sh'), 'utf8');
   assert.match(deploy, /setup-tls\.sh.*BOT_HUB_DOMAIN/);
   assert.match(deploy, /BOT_HUB_LE_EMAIL/);
@@ -135,7 +140,8 @@ test('der HTTP→HTTPS-Verweis behält Ziel und Anfrage', () => {
       blok.gerendert,
       /return\s+301\s+https:\/\/\S*\$request_uri\s*;/,
       `${blok.pfad} → ${blok.ziel}: Der Verweis verliert Ziel oder ` +
-        'Anfragepfad – `return 301 https://;` ist zwar gültige Syntax, leitet ' +
+        'Anfragepfad – `return 301 https://;` ist zwar gültige Syntax, ' +
+        'leitet ' +
         'aber ins Leere.',
     );
   }
@@ -165,7 +171,8 @@ test('Proxy-Kopfzeilen bleiben als nginx-Variablen erhalten', () => {
         muster,
         `${blok.pfad} → ${blok.ziel} verliert die Kopfzeile ${name}. Ohne ` +
           'sie kennt der Hub weder echte Besucher-Adresse noch HTTPS – und ' +
-          'ohne X-Forwarded-For landen alle Besucher in einem Rate-Limit-Eimer.',
+          'ohne X-Forwarded-For landen alle Besucher in einem Rate-Limit-' +
+          'Eimer.',
       );
     }
   }
@@ -182,7 +189,9 @@ test('der WebSocket-Hochstieg überlebt die Vorlage', () => {
   }
 });
 
-test('Uploads haben eine bewusste Körpergrenze, nicht die nginx-Standardgrenze', () => {
+test(
+  'Uploads haben eine bewusste Körpergrenze, nicht die nginx-Standardgrenze',
+  () => {
   for (const blok of alleBloecke.filter(mitProxy)) {
     assert.match(
       blok.gerendert,
@@ -215,4 +224,15 @@ test('Deployment schreibt Proxy-Vertrauen und Vault-Key in die .env', () => {
     'Ohne Vault-Key-Eintrag würde die Produktion ohne Verschlüsselung ' +
       'starten (Maßnahme 46).',
   );
+});
+
+test('TLS-Setup expandiert Shell-Variablen korrekt und unterstützt ältere nginx-Versionen', () => {
+  const tls = readFileSync(join(WURZEL, 'setup-tls.sh'), 'utf8');
+  assert.match(tls, /^DOMAIN="\$\{1:-\$\{BOT_HUB_DOMAIN:-\}\}"/m);
+  assert.match(tls, /^EMAIL="\$\{2:-\$\{BOT_HUB_LE_EMAIL:-\}\}"/m);
+  assert.match(tls, /dirname "\$\{BASH_SOURCE\[0\]\}"/);
+  assert.match(tls, /listen 443 ssl http2;/);
+  assert.doesNotMatch(tls, /^http2 on;$/m);
+  assert.match(tls, /renewal-hooks\/deploy\/10-bot-hub-reload-nginx/);
+  assert.match(tls, /certbot renew --dry-run/);
 });
