@@ -27,6 +27,8 @@ before(async () => {
   root = mkdtempSync(join(tmpdir(), 'bot-hub-container-'));
   mkdirSync(join(root, 'bots', 'shared'), { recursive: true });
   mkdirSync(join(root, 'bots', 'bot1', 'workspace'), { recursive: true });
+  const previousNodeEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'development';
   bot = {
     id: 'bot1',
     language: 'python',
@@ -34,6 +36,8 @@ before(async () => {
   };
   containers = await import('../server/containers.js');
   createArgs = containers.containerCreateArgs(bot, root);
+  if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+  else process.env.NODE_ENV = previousNodeEnv;
 });
 
 after(() => {
@@ -46,7 +50,21 @@ describe('Container-Isolation', () => {
     assert.ok(!createArgs.includes('--privileged'));
     assert.ok(!joined.includes('docker.sock'));
     assert.ok(createArgs.includes('--network'));
-    assert.equal(createArgs[createArgs.indexOf('--network') + 1], 'bridge');
+    assert.equal(
+      createArgs[createArgs.indexOf('--network') + 1],
+      'bot-hub-local',
+    );
+    assert.ok(createArgs.includes('--sysctl'));
+    assert.ok(
+      createArgs.includes('net.ipv6.conf.all.disable_ipv6=1'),
+      'IPv6 muss im Container-Namespace deaktiviert sein',
+    );
+    assert.ok(
+      createArgs.includes('net.ipv6.conf.default.disable_ipv6=1'),
+      'IPv6-Default muss im Container-Namespace deaktiviert sein',
+    );
+    assert.ok(!createArgs.includes('--publish'));
+    assert.ok(!createArgs.includes('-p'));
     assert.ok(!joined.includes('--pid=host'));
     assert.ok(createArgs.includes('ALL'), 'cap-drop ALL fehlt');
     assert.ok(joined.includes('no-new-privileges:true'));
@@ -72,6 +90,74 @@ describe('Container-Isolation', () => {
 
   it('gibt dem Bot keinen Weg zum Host, solange keiner konfiguriert ist', () => {
     assert.ok(!createArgs.includes('--add-host'));
+  });
+
+  it('verweigert das alte Standardnetz und den frei konfigurierbaren Host-Zugriff', () => {
+    const vorherNode = process.env.NODE_ENV;
+    const vorherNetz = process.env.BOT_HUB_CONTAINER_NETWORK;
+    const vorherUrl = process.env.BOT_HUB_CONTAINER_URL;
+    try {
+      process.env.NODE_ENV = 'development';
+      process.env.BOT_HUB_CONTAINER_NETWORK = 'bridge';
+      assert.throws(
+        () => containers.containerCreateArgs(bot, root),
+        /ausschließlich das isolierte Netzwerk bot-hub-local/,
+      );
+      delete process.env.BOT_HUB_CONTAINER_NETWORK;
+      process.env.BOT_HUB_CONTAINER_URL = 'http://host.docker.internal:8787';
+      assert.throws(
+        () => containers.containerCreateArgs(bot, root),
+        /BOT_HUB_CONTAINER_URL ist nicht mehr zulässig/,
+      );
+    } finally {
+      if (vorherNode === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = vorherNode;
+      if (vorherNetz === undefined)
+        delete process.env.BOT_HUB_CONTAINER_NETWORK;
+      else process.env.BOT_HUB_CONTAINER_NETWORK = vorherNetz;
+      if (vorherUrl === undefined) delete process.env.BOT_HUB_CONTAINER_URL;
+      else process.env.BOT_HUB_CONTAINER_URL = vorherUrl;
+    }
+  });
+
+  it('prüft die exakten Eigenschaften des lokalen Docker-Netzes', () => {
+    const network = {
+      Name: 'bot-hub-local',
+      Driver: 'bridge',
+      Scope: 'local',
+      Internal: false,
+      EnableIPv6: false,
+      Options: {
+        'com.docker.network.bridge.name': 'br-bothublocal',
+        'com.docker.network.bridge.enable_icc': 'false',
+        'com.docker.network.bridge.enable_ip_masquerade': 'true',
+      },
+      IPAM: {
+        Config: [{ Subnet: '172.25.40.0/24', Gateway: '172.25.40.1' }],
+      },
+    };
+    assert.deepEqual(
+      containers.validateLocalNetworkInspection(network),
+      { subnet: '172.25.40.0/24', gateway: '172.25.40.1' },
+    );
+    for (const mutation of [
+      { Internal: true },
+      { EnableIPv6: true },
+      { Driver: 'overlay' },
+      { Options: { ...network.Options, 'com.docker.network.bridge.enable_icc': 'true' } },
+      { Options: { ...network.Options, 'com.docker.network.bridge.enable_ip_masquerade': 'false' } },
+      { IPAM: { Config: [{ Subnet: '172.25.40.0/24', Gateway: '192.168.1.1' }] } },
+      { IPAM: { Config: [{ Subnet: '172.25.40.0/33', Gateway: '172.25.40.1' }] } },
+    ]) {
+      assert.throws(
+        () =>
+          containers.validateLocalNetworkInspection({
+            ...network,
+            ...mutation,
+          }),
+        /Docker-Netz|Gateway/,
+      );
+    }
   });
 
   it('verwendet in Produktion nur das gefilterte Discord-Netz', () => {
