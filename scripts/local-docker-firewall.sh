@@ -93,13 +93,20 @@ routes = subprocess.run(
 ).stdout
 for line in routes.splitlines():
     fields = line.split()
-    if not fields or fields[0] == "default":
+    if not fields:
+        continue
+    route_types = {
+        "unicast", "local", "broadcast", "multicast",
+        "throw", "unreachable", "prohibit", "blackhole",
+    }
+    destination = fields[1] if fields[0] in route_types and len(fields) > 1 else fields[0]
+    if destination == "default":
         continue
     dev = fields[fields.index("dev") + 1] if "dev" in fields and fields.index("dev") + 1 < len(fields) else ""
     if dev == bridge:
         continue
     try:
-        route = ipaddress.ip_network(fields[0], strict=False)
+        route = ipaddress.ip_network(destination, strict=False)
     except ValueError:
         continue
     if route.version == 4 and route.overlaps(network):
