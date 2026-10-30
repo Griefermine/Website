@@ -199,11 +199,7 @@ const upsertEnvironment = (path, original, changes) => {
     fd = undefined;
     const currentUid = process.getuid?.();
     const currentGid = process.getgid?.();
-    if (
-      currentUid === 0 ||
-      stat.uid !== currentUid ||
-      stat.gid !== currentGid
-    )
+    if (currentUid === 0 || stat.uid !== currentUid || stat.gid !== currentGid)
       chownSync(temporary, stat.uid, stat.gid);
     chmodSync(temporary, stat.mode & 0o777);
     renameSync(temporary, path);
@@ -219,14 +215,13 @@ const upsertEnvironment = (path, original, changes) => {
 };
 
 const main = () => {
-  if (
-    typeof process.getuid === 'function' &&
-    process.getuid() !== 0
-  ) {
+  if (typeof process.getuid === 'function' && process.getuid() !== 0) {
     const path = resolve(process.argv[2] ?? '.env');
     const stat = lstatSync(path);
     if (stat.uid !== process.getuid())
-      throw new Error('Die .env muss root-eigen sein oder dem aufrufenden Benutzer gehören.');
+      throw new Error(
+        'Die .env muss root-eigen sein oder dem aufrufenden Benutzer gehören.',
+      );
   }
   const envPath = resolve(process.argv[2] ?? '.env');
   const original = readFileSync(envPath, 'utf8');
