@@ -156,10 +156,7 @@ test('Proxy-Kopfzeilen bleiben als nginx-Variablen erhalten', () => {
       'X-Forwarded-For',
       /\bproxy_set_header\s+X-Forwarded-For\s+\$proxy_add_x_forwarded_for\s*;/,
     ],
-    [
-      'X-Forwarded-Proto',
-      /\bproxy_set_header\s+X-Forwarded-Proto\s+https\s*;/,
-    ],
+    ['X-Forwarded-Proto', /\bproxy_set_header\s+X-Forwarded-Proto\s+https\s*;/],
   ];
   for (const blok of alleBloecke.filter(mitProxy)) {
     for (const [name, muster] of erwartet) {
