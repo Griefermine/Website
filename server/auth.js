@@ -14,7 +14,30 @@ import {
 import { dirname, join } from 'node:path';
 import { decryptValue, encryptValue, vaultEnabled } from './vault.js';
 
-const DISCORD_API = 'https://discord.com/api/v10';
+/**
+ * Maßnahme 48 (Auftrag 5.6): dieselbe, bereits in server/panel.js geprüfte
+ * Test-Öse für die Hub-Anmeldung. Ohne sie konnte die Anmeldekette – State,
+ * PKCE-Verifizierer, Ticket-Vergleich, Rollenvergabe – nie gegen eine echte
+ * HTTP-Gegenstelle getestet werden, weil `https://discord.com` fest einkompiliert
+ * war und die Suite deshalb vollständig an der Authentifizierung vorbeilief.
+ *
+ * Bewusst kein neuer Produktions-Schalter:
+ *  - nur mit NODE_ENV=test,
+ *  - nur auf eine Schleifenadresse (http/https, 127.0.0.1/localhost/::1),
+ *  - sonst hart `https://discord.com/api/v10` – jede andere Angabe, auch eine
+ *    mitgesetzte, wird ignoriert.
+ * Ein beliebig konfigurierbarer OAuth-Endpunkt wäre ein eigener
+ * Angriffsvektor; das ist er hier nicht.
+ */
+const DISCORD_API_LOOPBACK =
+  /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/;
+const discordApiBasis = () =>
+  process.env.NODE_ENV === 'test' &&
+  DISCORD_API_LOOPBACK.test(
+    String(process.env.BOT_HUB_DISCORD_API ?? '').trim(),
+  )
+    ? String(process.env.BOT_HUB_DISCORD_API).trim().replace(/\/+$/, '')
+    : 'https://discord.com/api/v10';
 // Nur bekannte Discord-Codes zurückgeben, niemals den Parameterwert spiegeln.
 const KNOWN_DISCORD_ERRORS = new Set([
   'access_denied',
@@ -230,7 +253,7 @@ const configured = () => {
 };
 
 const discordRequest = async (path, accessToken) => {
-  const response = await fetch(`${DISCORD_API}${path}`, {
+  const response = await fetch(`${discordApiBasis()}${path}`, {
     headers: { authorization: `Bearer ${accessToken}` },
   });
   if (!response.ok)
@@ -814,9 +837,17 @@ export const handleAuthRoutes = async (req, res, url, sendJson, httpError) => {
     // verschiedenen Gründe bekommen eigene Meldungen, sonst ist ein
     // fehlgeschlagener Login nicht nachvollziehbar.
     let reason;
-    if (discordError && KNOWN_DISCORD_ERRORS.has(discordError))
-      reason = ['abgebrochen', `von Discord abgelehnt (${discordError})`];
-    else if (!state || state.used)
+    if (discordError) {
+      /* Ein Fehlerparameter bedeutet: von Discord kommt kein Code. Auch ein
+       * unbekannter Wert bricht ab – würde er nur in der bekannten Liste
+       * abgreifen, machte ein frei erfundener Parameter (z. B. `<script>…`)
+       * aus einer abgelehnten Anmeldung eine ganz normale Rückkehr, und die
+       * Kette lief weiter, als wäre nichts gewesen. Unbekannte Werte werden
+       * außerdem nicht zurückgegeben, sonst spiegelte die Antwort Eingaben. */
+      reason = KNOWN_DISCORD_ERRORS.has(discordError)
+        ? ['abgebrochen', `von Discord abgelehnt (${discordError})`]
+        : ['abgebrochen', 'von Discord abgelehnt (Grund unbekannt)'];
+    } else if (!state || state.used)
       reason = [
         'abgelaufen',
         'der Hub wurde zwischen Anmeldung und Rückkehr neu gestartet oder der Link ist zu alt – bitte erneut anmelden',
@@ -842,7 +873,7 @@ export const handleAuthRoutes = async (req, res, url, sendJson, httpError) => {
     }
     state.used = true;
 
-    const tokenResponse = await fetch(`${DISCORD_API}/oauth2/token`, {
+    const tokenResponse = await fetch(`${discordApiBasis()}/oauth2/token`, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
@@ -924,3 +955,10 @@ export const requiresAuthentication = (req, url) => {
 };
 
 export { SESSION_COOKIE, secureCookies };
+
+/**
+ * Test-Zugang (Maßnahme 48): die Endpunkt-Wahl selbst ist sicherheitsrelevant –
+ * sie darf nur im Testbetrieb und nur auf die Schleife zeigen. Gepürt wird
+ * das Verhalten, nicht eine nachgebildete Kopie der Regel.
+ */
+export const __testing = { discordApiBasis };
