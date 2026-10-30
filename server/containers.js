@@ -148,7 +148,7 @@ const containerNetwork = () => {
   return network;
 };
 
-const BASE_IMAGES = {
+export const DEFAULT_CONTAINER_IMAGES = Object.freeze({
   python: 'python:3.12-bookworm',
   javascript: 'node:22-bookworm',
   typescript: 'node:22-bookworm',
@@ -158,7 +158,9 @@ const BASE_IMAGES = {
   csharp: 'mcr.microsoft.com/dotnet/sdk:8.0',
   rust: 'rust:1-bookworm',
   custom: 'ubuntu:24.04',
-};
+});
+
+const BASE_IMAGES = DEFAULT_CONTAINER_IMAGES;
 
 /**
  * Production-Defaults: Images auf Digest pinnen für Reproduzierbarkeit.
