@@ -12,7 +12,7 @@ readonly FORWARD_CHAIN="BOTHUB_LOCAL_FORWARD"
 readonly INSTALL_PATH="/usr/local/sbin/bot-hub-local-network-firewall"
 readonly UNIT_PATH="/etc/systemd/system/bot-hub-local-network-firewall.service"
 
-ACTION="${1:-setup}"
+ACTION="${1:-install}"
 NETWORK_ID=""
 DRIVER=""
 INTERNAL=""
@@ -270,17 +270,27 @@ main() {
   need iptables
 
   case "$ACTION" in
+    install)
+      create_network
+      read_network
+      collect_blocked_cidrs
+      apply_firewall
+      check_firewall
+      setup_unit_and_checker
+      systemctl restart bot-hub-local-network-firewall.service ||
+        systemctl start bot-hub-local-network-firewall.service
+      check_firewall
+      note "Lokales Docker-Netz und Firewall sind eingerichtet."
+      note "Netz: $NETWORK | Bridge: $BRIDGE | Subnetz: $SUBNET | Gateway: $GATEWAY"
+      note "Öffentlicher Internetzugriff bleibt erlaubt; lokale/private Zielnetze sind gesperrt."
+      ;;
     setup)
       create_network
       read_network
       collect_blocked_cidrs
       apply_firewall
-      setup_unit_and_checker
       check_firewall
-      systemctl restart bot-hub-local-network-firewall.service >/dev/null 2>&1 || true
-      note "Lokales Docker-Netz und Firewall sind eingerichtet."
-      note "Netz: $NETWORK | Bridge: $BRIDGE | Subnetz: $SUBNET | Gateway: $GATEWAY"
-      note "Öffentlicher Internetzugriff bleibt erlaubt; lokale/private Zielnetze sind gesperrt."
+      note "Firewall-Regeln wurden erneut angewendet."
       ;;
     check)
       read_network
