@@ -22,7 +22,7 @@ install -d -o root -g www-data -m 0750 "$WEBROOT"
 install -d -o root -g www-data -m 0750 "$WEBROOT/.well-known" "$WEBROOT/.well-known/acme-challenge"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y certbot nginx
+apt-get install -y certbot nginx python3-certbot-nginx
 
 # Certbot aktualisiert Zertifikatsdateien auf der Platte. nginx lädt sie erst
 # nach einem Reload neu; diesen lösen wir nach jeder erfolgreichen Erneuerung
