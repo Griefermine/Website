@@ -241,3 +241,13 @@ test(
     assert.match(tls, /certbot renew --dry-run/);
   },
 );
+
+test('Deployment pinnt alle Standard-Images vor dem Hub-Start', () => {
+  const deploy = readFileSync(join(WURZEL, 'deploy-full.sh'), 'utf8');
+  const pinning = readFileSync(join(WURZEL, 'scripts/pin-images.mjs'), 'utf8');
+  assert.match(deploy, /scripts\/pin-images\.mjs/);
+  assert.match(pinning, /DEFAULT_CONTAINER_IMAGES/);
+  assert.match(pinning, /docker-content-digest/i);
+  assert.match(pinning, /BOT_HUB_CONTAINER_IMAGES/);
+  assert.match(pinning, /127\.0\.0\.1:3130/);
+});
