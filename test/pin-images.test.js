@@ -69,7 +69,7 @@ test(
       assert.equal(Object.keys(pinned).length, 9);
       for (const reference of Object.values(pinned))
         assert.match(reference, /@sha256:[a-f0-9]{64}$/);
-      assert.match(updated, /BOT_HUB_URL=https:\\/\\/hub\\.example/);
+      assert.ok(updated.includes('BOT_HUB_URL=https://hub.example'));
       assert.match(updated, /OTHER_VALUE=keep/);
       assert.equal(
         (updated.match(/^BOT_HUB_CONTAINER_IMAGES=/gm) ?? []).length,
