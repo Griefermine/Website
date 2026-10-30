@@ -98,13 +98,14 @@ test('die TLS-Vorlage schreibt den HTTPS-Reverse-Proxy', () => {
 test(
   'Standard-Deployment fordert TLS an und veröffentlicht keine HTTP-App',
   () => {
-  const deploy = readFileSync(join(WURZEL, 'deploy-full.sh'), 'utf8');
-  assert.match(deploy, /setup-tls\.sh.*BOT_HUB_DOMAIN/);
-  assert.match(deploy, /BOT_HUB_LE_EMAIL/);
-  assert.doesNotMatch(deploy, /chown -R bot-hub:bot-hub "\$PROJECT_DIR"/);
-  assert.match(deploy, /sudo -u bot-hub-build .*npm ci/);
-  assert.match(deploy, /sudo -u bot-hub-build .*npm run build/);
-});
+    const deploy = readFileSync(join(WURZEL, 'deploy-full.sh'), 'utf8');
+    assert.match(deploy, /setup-tls\.sh.*BOT_HUB_DOMAIN/);
+    assert.match(deploy, /BOT_HUB_LE_EMAIL/);
+    assert.doesNotMatch(deploy, /chown -R bot-hub:bot-hub "\$PROJECT_DIR"/);
+    assert.match(deploy, /sudo -u bot-hub-build .*npm ci/);
+    assert.match(deploy, /sudo -u bot-hub-build .*npm run build/);
+  },
+);
 
 test('keine Vorlage hinterlässt eine Direktive ohne Wert', () => {
   for (const blok of alleBloecke) {
@@ -192,16 +193,17 @@ test('der WebSocket-Hochstieg überlebt die Vorlage', () => {
 test(
   'Uploads haben eine bewusste Körpergrenze, nicht die nginx-Standardgrenze',
   () => {
-  for (const blok of alleBloecke.filter(mitProxy)) {
-    assert.match(
-      blok.gerendert,
-      /\bclient_max_body_size\s+2m\s*;/,
-      `${blok.pfad} → ${blok.ziel} setzt keine Körpergrenze. Der ` +
-        'nginx-Standard (1m) kollidiert mit der hub-eigenen Grenze von 1 MiB ' +
-        'und liefert eine nginx-Fehlerseite statt der Hub-Meldung.',
-    );
-  }
-});
+    for (const blok of alleBloecke.filter(mitProxy)) {
+      assert.match(
+        blok.gerendert,
+        /\bclient_max_body_size\s+2m\s*;/,
+        `${blok.pfad} → ${blok.ziel} setzt keine Körpergrenze. Der ` +
+          'nginx-Standard (1m) kollidiert mit der hub-eigenen Grenze von 1 MiB ' +
+          'und liefert eine nginx-Fehlerseite statt der Hub-Meldung.',
+      );
+    }
+  },
+);
 
 test('Deployment schreibt Proxy-Vertrauen und Vault-Key in die .env', () => {
   const text = readFileSync(join(WURZEL, 'deploy-full.sh'), 'utf8');
@@ -226,13 +228,16 @@ test('Deployment schreibt Proxy-Vertrauen und Vault-Key in die .env', () => {
   );
 });
 
-test('TLS-Setup expandiert Shell-Variablen korrekt und unterstützt ältere nginx-Versionen', () => {
-  const tls = readFileSync(join(WURZEL, 'setup-tls.sh'), 'utf8');
-  assert.match(tls, /^DOMAIN="\$\{1:-\$\{BOT_HUB_DOMAIN:-\}\}"/m);
-  assert.match(tls, /^EMAIL="\$\{2:-\$\{BOT_HUB_LE_EMAIL:-\}\}"/m);
-  assert.match(tls, /dirname "\$\{BASH_SOURCE\[0\]\}"/);
-  assert.match(tls, /listen 443 ssl http2;/);
-  assert.doesNotMatch(tls, /^http2 on;$/m);
-  assert.match(tls, /renewal-hooks\/deploy\/10-bot-hub-reload-nginx/);
-  assert.match(tls, /certbot renew --dry-run/);
-});
+test(
+  'TLS-Setup expandiert Shell-Variablen korrekt und unterstützt ältere nginx-Versionen',
+  () => {
+    const tls = readFileSync(join(WURZEL, 'setup-tls.sh'), 'utf8');
+    assert.match(tls, /^DOMAIN="\$\{1:-\$\{BOT_HUB_DOMAIN:-\}\}"/m);
+    assert.match(tls, /^EMAIL="\$\{2:-\$\{BOT_HUB_LE_EMAIL:-\}\}"/m);
+    assert.match(tls, /dirname "\$\{BASH_SOURCE\[0\]\}"/);
+    assert.match(tls, /listen 443 ssl http2;/);
+    assert.doesNotMatch(tls, /^http2 on;$/m);
+    assert.match(tls, /renewal-hooks\/deploy\/10-bot-hub-reload-nginx/);
+    assert.match(tls, /certbot renew --dry-run/);
+  },
+);
