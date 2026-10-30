@@ -27,22 +27,22 @@ test(
         "BOT_HUB_CONTAINER_IMAGES='{\"python\":\"python:3.12-bookworm\"}'",
         'OTHER_VALUE=keep',
         '',
-      ].join('\\n');
+      ].join('\n');
       const fakeCurl = [
         '#!/bin/sh',
-        'case \" $* \" in',
+        'case " $* " in',
         '  *auth.docker.io/token?*)',
-        \"    printf '{\\\"token\\\":\\\"fixture-token\\\"}\\\\n'\",
+        "    printf '{\"token\":\"fixture-token\"}\\n'",
         '    ;;',
-        '  *\"Authorization: Bearer fixture-token\"*)',
-        \"    printf 'HTTP/1.1 200 OK\\\\r\\\\nDocker-Content-Digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\\r\\\\n\\\\r\\\\n'\",
+        '  *"Authorization: Bearer fixture-token"*)',
+        "    printf 'HTTP/1.1 200 OK\\r\\nDocker-Content-Digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n\\r\\n'",
         '    ;;',
         '  *)',
-        \"    printf 'HTTP/1.1 401 Unauthorized\\\\r\\\\nWWW-Authenticate: Bearer realm=\\\"https://auth.docker.io/token\\\",service=\\\"registry.docker.io\\\",scope=\\\"repository:library/fake:pull\\\"\\\\r\\\\n\\\\r\\\\n'\",
+        "    printf 'HTTP/1.1 401 Unauthorized\\r\\nWWW-Authenticate: Bearer realm=\"https://auth.docker.io/token\",service=\"registry.docker.io\",scope=\"repository:library/fake:pull\"\\r\\n\\r\\n'",
         '    ;;',
         'esac',
         '',
-      ].join('\\n');
+      ].join('\n');
 
       mkdirSync(bin, { mode: 0o700 });
       writeFileSync(curlPath, fakeCurl, { mode: 0o755 });
