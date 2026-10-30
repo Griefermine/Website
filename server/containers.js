@@ -520,10 +520,13 @@ export const validateLocalNetworkInspection = (network) => {
       'Docker-Netz ' + LOCAL_BOT_NETWORK + ' hat keine gültige IPv4-Adresse mit Gateway.',
     );
   const mask = (0xffffffff << (32 - prefix)) >>> 0;
-  const networkAddress = subnetAddress & mask;
-  const broadcastAddress = networkAddress | (~mask >>> 0);
+  // JavaScript bitwise operators return signed 32-bit integers. Normalize
+  // every intermediate address back to unsigned before comparing IPv4 values.
+  const networkAddress = (subnetAddress & mask) >>> 0;
+  const gatewayNetworkAddress = (gatewayAddress & mask) >>> 0;
+  const broadcastAddress = (networkAddress | (~mask >>> 0)) >>> 0;
   if (
-    networkAddress !== (gatewayAddress & mask) ||
+    networkAddress !== gatewayNetworkAddress ||
     gatewayAddress === networkAddress ||
     gatewayAddress === broadcastAddress
   )
