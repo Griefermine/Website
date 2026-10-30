@@ -130,6 +130,32 @@ export const vaultEnabled = (projectRoot, env = process.env) => {
   }
 };
 
+/**
+ * Maßnahme 46 (Auftrag 5.1): `vaultEnabled()` kann zwei völlig verschiedene
+ * Zustände nicht unterscheiden – „niemand hat einen Schlüssel wollten“ und
+ * „ein Schlüssel ist konfiguriert, aber unbrauchbar“ (Datei nicht lesbar,
+ * falsches Format). Genau der zweite Fall ist der gefährliche: der Betreiber
+ * hat `BOT_HUB_KEY_FILE` gesetzt, der Hub-Benutzer darf die root-eigene Datei
+ * nicht lesen – und alle Secrets gingen trotzdem unverschlüsselt auf die
+ * Platte. Diese Funktion würfelt nichts zusammen und wirft nicht; sie nennt
+ * den Grund, damit Vorprüfung und Fehlermeldung damit arbeiten können.
+ */
+export const vaultStatus = (projectRoot, env = process.env) => {
+  const path = vaultKeyPath(projectRoot, env);
+  const konfiguriert = String(env.BOT_HUB_KEY_FILE ?? '').trim() !== '';
+  try {
+    loadVaultKey(projectRoot, env);
+    return { aktiv: true, konfiguriert, pfad: path, grund: '' };
+  } catch (error) {
+    return {
+      aktiv: false,
+      konfiguriert,
+      pfad: path,
+      grund: error.message,
+    };
+  }
+};
+
 /** v2-AAD: Dateiname + Schlüsselname, getrennt durch ein Zeichen, das kein Name enthält. */
 const aad = (vaultId, keyName) =>
   Buffer.from(`${vaultId}\u0000${keyName}`, 'utf8');
