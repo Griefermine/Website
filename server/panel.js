@@ -3029,7 +3029,7 @@ const sessionOf = (bot, runtime) => ({
     guildId: bot.guildId,
     status: bot.status,
   },
-  baseUrl: hubBaseUrl(),
+  baseUrl: runtime ? containerHubUrl() : hubBaseUrl(),
   panelUrl: `${hubBaseUrl()}/api/bots/${bot.id}/panel`,
   manifestPath: relativeManifestPath(bot.panel?.path ?? ''),
   source: bot.panel?.source ?? null,
