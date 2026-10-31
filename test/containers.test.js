@@ -629,18 +629,28 @@ describe('Produktionsnetzwerke isolieren gleichzeitige Container', () => {
 });
 
 describe('Container-URL aktiviert den Weg zum Host', () => {
-  let withHost;
-  before(async () => {
-    process.env.BOT_HUB_CONTAINER_URL = 'http://host.docker.internal:8787';
-    // Frisches Modul, weil die Konfiguration einmalig gelesen wird.
-    const module = await import(`../server/containers.js?v=${Date.now()}`);
-    withHost = module.containerCreateArgs(bot, root);
-    delete process.env.BOT_HUB_CONTAINER_URL;
-  });
-
-  it('mappt host.docker.internal nur auf Wunsch', () => {
-    assert.ok(withHost.includes('--add-host'));
-    assert.ok(withHost.includes('host.docker.internal:host-gateway'));
+  it('weist frei konfigurierten Host-Zugriff im lokalen Profil ab', async () => {
+    const vorherNode = process.env.NODE_ENV;
+    const vorherUrl = process.env.BOT_HUB_CONTAINER_URL;
+    try {
+      process.env.NODE_ENV = 'development';
+      process.env.BOT_HUB_CONTAINER_URL =
+        'http://host.docker.internal:8787';
+      // Frisches Modul, damit der Test auch bei bereits importierten Modulen
+      // die aktuelle Container-Konfiguration prüft.
+      const module = await import(
+        `../server/containers.js?v=${Date.now()}`
+      );
+      assert.throws(
+        () => module.containerCreateArgs(bot, root),
+        /BOT_HUB_CONTAINER_URL ist nicht mehr zulässig/,
+      );
+    } finally {
+      if (vorherNode === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = vorherNode;
+      if (vorherUrl === undefined) delete process.env.BOT_HUB_CONTAINER_URL;
+      else process.env.BOT_HUB_CONTAINER_URL = vorherUrl;
+    }
   });
 });
 
