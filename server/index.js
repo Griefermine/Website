@@ -94,7 +94,9 @@ if (
   try {
     localBotGateway = await validateLocalBotNetwork();
   } catch (error) {
-    console.error(`[hub] ABBRUCH: lokale Docker-Netzwerkisolation: ${error.message}`);
+    console.error(
+      `[hub] ABBRUCH: lokale Docker-Netzwerkisolation: ${error.message}`,
+    );
     process.exit(1);
   }
 }
