@@ -28,6 +28,7 @@ export const LOCAL_BOT_NETWORK = 'bot-hub-local';
 export const LOCAL_BOT_BRIDGE = 'br-bothublocal';
 export const LOCAL_BOT_HUB_PORT = 8788;
 const LOCAL_FIREWALL_HELPER = '/usr/local/sbin/bot-hub-local-firewall';
+let localBotGateway = null;
 const DISCORD_EGRESS_PROXY = 'http://172.30.250.1:3128';
 const DEPENDENCY_EGRESS_PROXY = 'http://172.30.251.1:3128';
 
