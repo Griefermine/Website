@@ -483,7 +483,9 @@ const ipv4Number = (value) => {
   return octets.reduce((result, octet) => result * 256 + octet, 0) >>> 0;
 };
 
-/** Reine Netzwerkkonfigurationsprüfung – ohne Docker- oder Root-Zugriff testbar. */
+/**
+ * Reine Netzwerkkonfigurationsprüfung – ohne Docker- oder Root-Zugriff testbar.
+ */
 export const validateLocalNetworkInspection = (network) => {
   const options = network?.Options ?? {};
   const config = network?.IPAM?.Config;
@@ -500,7 +502,7 @@ export const validateLocalNetworkInspection = (network) => {
     config.length !== 1
   )
     throw new Error(
-      'Docker-Netz ' + LOCAL_BOT_NETWORK + ' fehlt oder entspricht nicht der lokalen Isolationskonfiguration.',
+      `Docker-Netz ${LOCAL_BOT_NETWORK} fehlt oder entspricht nicht der lokalen Isolationskonfiguration.`,
     );
 
   const [addressing] = config;
@@ -518,7 +520,7 @@ export const validateLocalNetworkInspection = (network) => {
     prefix > 30
   )
     throw new Error(
-      'Docker-Netz ' + LOCAL_BOT_NETWORK + ' hat keine gültige IPv4-Adresse mit Gateway.',
+      `Docker-Netz ${LOCAL_BOT_NETWORK} hat keine gültige IPv4-Adresse mit Gateway.`,
     );
   const mask = (0xffffffff << (32 - prefix)) >>> 0;
   // JavaScript bitwise operators return signed 32-bit integers. Normalize
@@ -532,7 +534,7 @@ export const validateLocalNetworkInspection = (network) => {
     gatewayAddress === broadcastAddress
   )
     throw new Error(
-      'Gateway ' + gateway + ' liegt nicht als nutzbare Adresse im Subnetz ' + addressing.Subnet + '.',
+      `Gateway ${gateway} liegt nicht als nutzbare Adresse im Subnetz ${addressing.Subnet}.`,
     );
   return { subnet: addressing.Subnet, gateway };
 };
@@ -567,16 +569,14 @@ export const validateLocalBotNetwork = async () => {
   );
   if (inspected.code !== 0)
     throw new Error(
-      'Docker-Netz ' + LOCAL_BOT_NETWORK +
-        ' fehlt. Führe scripts/setup-local-docker-isolation.sh aus. ' +
-        inspected.stderr.trim(),
+      `Docker-Netz ${LOCAL_BOT_NETWORK} fehlt. Führe scripts/setup-local-docker-isolation.sh aus. ${inspected.stderr.trim()}`,
     );
   let network;
   try {
     network = JSON.parse(inspected.stdout.trim());
   } catch {
     throw new Error(
-      'Docker-Netz ' + LOCAL_BOT_NETWORK + ' lieferte keine lesbare Inspect-Konfiguration.',
+      `Docker-Netz ${LOCAL_BOT_NETWORK} lieferte keine lesbare Inspect-Konfiguration.`,
     );
   }
   const { gateway } = validateLocalNetworkInspection(network);
@@ -628,13 +628,12 @@ export const ensureContainer = async (bot, projectRoot) => {
       // Ein Container aus dem alten bridge-Profil darf nicht weiterlaufen.
       if (bot.child)
         throw new Error(
-          'Container ' + name + ' verwendet eine ältere Netzwerkkonfiguration. Bot stoppen und Hub neu starten, bevor er erneut gestartet wird.',
+          `Container ${name} verwendet eine ältere Netzwerkkonfiguration. Bot stoppen und Hub neu starten, bevor er erneut gestartet wird.`,
         );
       const removed = await run(['rm', '--force', name], { capture: true });
       if (removed.code !== 0 && (await exists(name)))
         throw new Error(
-          'Veralteter Container ' + name + ' konnte nicht entfernt werden: ' +
-            (removed.stderr.trim() || 'Exit-Code ' + removed.code),
+          `Veralteter Container ${name} konnte nicht entfernt werden: ${removed.stderr.trim() || `Exit-Code ${removed.code}`}`,
         );
     }
   }
