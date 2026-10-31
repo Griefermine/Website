@@ -102,6 +102,16 @@ describe('Startschutz für unsichere Konfiguration', () => {
     assert.match(out, /Produktionsbetrieb darf nicht auf 0\.0\.0\.0 lauschen/);
   });
 
+  it('bricht außerhalb der Testumgebung ab, wenn Container abgeschaltet sind', async () => {
+    const { code, out } = await startHub({
+      NODE_ENV: 'development',
+      BOT_HUB_CONTAINER_MODE: 'disabled',
+    });
+    assert.equal(code, 1);
+    assert.match(out, /ABBRUCH: Container sind abgeschaltet/);
+    assert.match(out, /nicht unisoliert auf dem Host laufen/);
+  });
+
   it('startet mit Testmodus, wenn NODE_ENV=test gesetzt ist', async () => {
     const out = await startAndRead({
       NODE_ENV: 'test',
