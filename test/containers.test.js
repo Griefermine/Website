@@ -38,9 +38,8 @@ before(async () => {
     workspaceRoot: 'bots/bot1/workspace',
   };
   containers = await import('../server/containers.js');
-  ({ createInternalBotApiHandler } = await import(
-    '../server/internalBotApi.js'
-  ));
+  ({ createInternalBotApiHandler } =
+    await import('../server/internalBotApi.js'));
   createArgs = containers.containerCreateArgs(bot, root);
 });
 
@@ -98,36 +97,33 @@ describe('Container-Isolation', () => {
     assert.ok(!createArgs.includes('--add-host'));
   });
 
-  it(
-    'verweigert das alte Standardnetz und den frei konfigurierbaren Host-Zugriff',
-    () => {
-      const vorherNode = process.env.NODE_ENV;
-      const vorherNetz = process.env.BOT_HUB_CONTAINER_NETWORK;
-      const vorherUrl = process.env.BOT_HUB_CONTAINER_URL;
-      try {
-        process.env.NODE_ENV = 'development';
-        process.env.BOT_HUB_CONTAINER_NETWORK = 'bridge';
-        assert.throws(
-          () => containers.containerCreateArgs(bot, root),
-          /ausschließlich das isolierte Netzwerk bot-hub-local/,
-        );
+  it('verweigert das alte Standardnetz und den frei konfigurierbaren Host-Zugriff', () => {
+    const vorherNode = process.env.NODE_ENV;
+    const vorherNetz = process.env.BOT_HUB_CONTAINER_NETWORK;
+    const vorherUrl = process.env.BOT_HUB_CONTAINER_URL;
+    try {
+      process.env.NODE_ENV = 'development';
+      process.env.BOT_HUB_CONTAINER_NETWORK = 'bridge';
+      assert.throws(
+        () => containers.containerCreateArgs(bot, root),
+        /ausschließlich das isolierte Netzwerk bot-hub-local/,
+      );
+      delete process.env.BOT_HUB_CONTAINER_NETWORK;
+      process.env.BOT_HUB_CONTAINER_URL = 'http://host.docker.internal:8787';
+      assert.throws(
+        () => containers.containerCreateArgs(bot, root),
+        /BOT_HUB_CONTAINER_URL ist nicht mehr zulässig/,
+      );
+    } finally {
+      if (vorherNode === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = vorherNode;
+      if (vorherNetz === undefined)
         delete process.env.BOT_HUB_CONTAINER_NETWORK;
-        process.env.BOT_HUB_CONTAINER_URL = 'http://host.docker.internal:8787';
-        assert.throws(
-          () => containers.containerCreateArgs(bot, root),
-          /BOT_HUB_CONTAINER_URL ist nicht mehr zulässig/,
-        );
-      } finally {
-        if (vorherNode === undefined) delete process.env.NODE_ENV;
-        else process.env.NODE_ENV = vorherNode;
-        if (vorherNetz === undefined)
-          delete process.env.BOT_HUB_CONTAINER_NETWORK;
-        else process.env.BOT_HUB_CONTAINER_NETWORK = vorherNetz;
-        if (vorherUrl === undefined) delete process.env.BOT_HUB_CONTAINER_URL;
-        else process.env.BOT_HUB_CONTAINER_URL = vorherUrl;
-      }
-    },
-  );
+      else process.env.BOT_HUB_CONTAINER_NETWORK = vorherNetz;
+      if (vorherUrl === undefined) delete process.env.BOT_HUB_CONTAINER_URL;
+      else process.env.BOT_HUB_CONTAINER_URL = vorherUrl;
+    }
+  });
 
   it('prüft die exakten Eigenschaften des lokalen Docker-Netzes', () => {
     const network = {
@@ -145,10 +141,10 @@ describe('Container-Isolation', () => {
         Config: [{ Subnet: '172.25.40.0/24', Gateway: '172.25.40.1' }],
       },
     };
-    assert.deepEqual(
-      containers.validateLocalNetworkInspection(network),
-      { subnet: '172.25.40.0/24', gateway: '172.25.40.1' },
-    );
+    assert.deepEqual(containers.validateLocalNetworkInspection(network), {
+      subnet: '172.25.40.0/24',
+      gateway: '172.25.40.1',
+    });
     for (const mutation of [
       { Internal: true },
       { EnableIPv6: true },
@@ -342,7 +338,10 @@ describe('Lokale Firewall-Einrichtung', () => {
     assert.match(helper, /replace_jump_first INPUT/);
     assert.doesNotMatch(helper, /iptables[^\n]*-F DOCKER-USER/);
     assert.match(setup, /com\.docker\.network\.bridge\.enable_icc=false/);
-    assert.match(setup, /com\.docker\.network\.bridge\.enable_ip_masquerade=true/);
+    assert.match(
+      setup,
+      /com\.docker\.network\.bridge\.enable_ip_masquerade=true/,
+    );
     assert.match(
       setup,
       /ExecStartPost=\/usr\/local\/sbin\/bot-hub-local-firewall apply/,
