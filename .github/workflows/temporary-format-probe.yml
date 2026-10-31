@@ -1,0 +1,33 @@
+name: Temporary formatter probe
+
+on:
+  push:
+    branches: ['security/local-docker-isolation']
+
+permissions:
+  contents: read
+
+jobs:
+  format-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - run: npm ci
+      - name: Format and emit test file
+        shell: bash
+        run: |
+          npx prettier --write test/containers.test.js
+          python3 - <<'PY'
+          import base64
+          from pathlib import Path
+          filename = "test/containers.test.js"
+          raw = base64.b64encode(Path(filename).read_bytes()).decode("ascii")
+          print(f"FORMAT_BEGIN:{filename}")
+          for index in range(0, len(raw), 24000):
+              print(f"FORMAT_CHUNK:{filename}:{index // 24000}:{raw[index:index + 24000]}")
+          print(f"FORMAT_END:{filename}")
+          PY
