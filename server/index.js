@@ -61,9 +61,10 @@ if (process.env.NODE_ENV === 'production' && !containerRuntimeEnabled()) {
   process.exit(1);
 }
 if (!containerRuntimeEnabled() && process.env.NODE_ENV !== 'test') {
-  console.warn(
-    '[hub] WARNUNG: Container sind abgeschaltet. Bots laufen ohne Isolation direkt auf diesem Rechner – nur fuer lokale Entwicklung.',
+  console.error(
+    '[hub] ABBRUCH: Container sind abgeschaltet. Bot-Code darf außerhalb der expliziten Testumgebung nicht unisoliert auf dem Host laufen.',
   );
+  process.exit(1);
 }
 
 const port = Number(process.env.PORT || 8787);
