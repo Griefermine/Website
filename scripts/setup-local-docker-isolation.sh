@@ -27,7 +27,7 @@ case "$TARGET_USER" in
   *[!a-zA-Z0-9_.-]*|'') die "Ungültiger Benutzername." ;;
 esac
 
-for command_name in docker iptables ip python3 sysctl systemctl visudo install; do
+for command_name in docker iptables ip python3 sysctl modprobe systemctl visudo install; do
   command -v "$command_name" >/dev/null 2>&1 || die "$command_name fehlt."
 done
 
@@ -35,6 +35,19 @@ systemctl is-active --quiet docker.service ||
   die "docker.service läuft nicht. Nur native Docker Engine mit systemd wird unterstützt."
 iptables -w -nL DOCKER-USER >/dev/null 2>&1 ||
   die "DOCKER-USER fehlt. Das Docker-iptables-Backend muss aktiviert sein; nftables-Backend und Rootless Docker werden noch nicht unterstützt."
+
+# Peer filtering on Linux bridges only reaches the iptables FORWARD hooks when
+# br_netfilter is loaded and bridge-nf-call-iptables is enabled. Persist this
+# explicit prerequisite; the runtime helper verifies it before every Hub start.
+modprobe br_netfilter ||
+  die "br_netfilter konnte nicht geladen werden; Bridge-Verkehr kann nicht sicher gefiltert werden."
+install -d -o root -g root -m 0755 /etc/modules-load.d /etc/sysctl.d
+printf 'br_netfilter\n' > /etc/modules-load.d/bot-hub-br-netfilter.conf
+chmod 0644 /etc/modules-load.d/bot-hub-br-netfilter.conf
+printf 'net.bridge.bridge-nf-call-iptables = 1\n' > /etc/sysctl.d/99-bot-hub-local-isolation.conf
+chmod 0644 /etc/sysctl.d/99-bot-hub-local-isolation.conf
+sysctl -w net.bridge.bridge-nf-call-iptables=1 >/dev/null ||
+  die "net.bridge.bridge-nf-call-iptables konnte nicht auf 1 gesetzt werden."
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 SOURCE_HELPER="$SCRIPT_DIR/local-docker-firewall.sh"
