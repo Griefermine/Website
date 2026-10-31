@@ -638,13 +638,10 @@ describe('Container-URL aktiviert den Weg zum Host', () => {
     const vorherUrl = process.env.BOT_HUB_CONTAINER_URL;
     try {
       process.env.NODE_ENV = 'development';
-      process.env.BOT_HUB_CONTAINER_URL =
-        'http://host.docker.internal:8787';
+      process.env.BOT_HUB_CONTAINER_URL = 'http://host.docker.internal:8787';
       // Frisches Modul, damit der Test auch bei bereits importierten Modulen
       // die aktuelle Container-Konfiguration prüft.
-      const module = await import(
-        `../server/containers.js?v=${Date.now()}`
-      );
+      const module = await import(`../server/containers.js?v=${Date.now()}`);
       assert.throws(
         () => module.containerCreateArgs(bot, root),
         /BOT_HUB_CONTAINER_URL ist nicht mehr zulässig/,
