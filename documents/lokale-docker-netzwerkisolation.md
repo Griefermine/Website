@@ -74,7 +74,7 @@ Bei jedem lokalen Hub-Start mit aktiviertem Containerbetrieb werden geprüft:
 - genau eine gültige IPv4-Subnetz-/Gateway-Konfiguration vorhanden ist;
 - der root-eigene Firewall-Helfer seine Regeln anwenden und anschließend prüfen kann.
 
-Fehlt das Netzwerk, die Firewall, `DOCKER-USER`, sudo-Berechtigung oder eine erwartete Regel, bricht Bothub vor dem Start der Bot-Container ab. Es gibt keinen Rückfall auf `bridge`.
+Fehlt das Netzwerk, die Firewall, `DOCKER-USER`, sudo-Berechtigung, `net.bridge.bridge-nf-call-iptables=1` oder eine erwartete Regel, bricht Bothub vor dem Start der Bot-Container ab. Es gibt keinen Rückfall auf `bridge`.
 
 Prüfen lässt sich die installierte Richtlinie mit:
 
