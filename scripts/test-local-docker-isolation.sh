@@ -110,8 +110,8 @@ HOST_SERVER_PID=$!
 
 ready=0
 for _ in $(seq 1 40); do
-  if curl --silent --show-error --max-time 1 "http://$GATEWAY:8788/api/hub" >/dev/null 2>&1 &&
-     curl --silent --show-error --max-time 1 "http://$GATEWAY:2222/" >/dev/null 2>&1; then
+  if curl --noproxy '*' --silent --show-error --max-time 1 "http://$GATEWAY:8788/api/hub" >/dev/null 2>&1 &&
+     curl --noproxy '*' --silent --show-error --max-time 1 "http://$GATEWAY:2222/" >/dev/null 2>&1; then
     ready=1
     break
   fi
@@ -126,7 +126,7 @@ docker run --rm --network "$NETWORK" \
   --sysctl net.ipv6.conf.all.disable_ipv6=1 \
   --sysctl net.ipv6.conf.default.disable_ipv6=1 \
   --cap-drop ALL --security-opt no-new-privileges:true \
-  node:22-alpine node -e "
+  node:22-alpine node --input-type=module -e "
     const base = 'http://$GATEWAY:8788';
     const check = async (path, expected) => {
       const response = await fetch(base + path, { signal: AbortSignal.timeout(3000) });
@@ -178,7 +178,7 @@ docker run --rm --network "$NETWORK" \
   --sysctl net.ipv6.conf.all.disable_ipv6=1 \
   --sysctl net.ipv6.conf.default.disable_ipv6=1 \
   --cap-drop ALL --security-opt no-new-privileges:true \
-  node:22-alpine node -e "
+  node:22-alpine node --input-type=module -e "
     const response = await fetch('https://discord.com/api/v10/gateway', { signal: AbortSignal.timeout(12000) });
     if (!response.ok) throw new Error('Discord gateway returned HTTP ' + response.status);
     console.log('PASS: public Discord HTTPS egress works');
