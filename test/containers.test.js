@@ -321,6 +321,7 @@ describe('Lokale Firewall-Einrichtung', () => {
     assert.match(helper, /172\.16\.0\.0\/12/);
     assert.match(helper, /192\.168\.0\.0\/16/);
     assert.match(helper, /169\.254\.0\.0\/16/);
+    assert.match(helper, /168\.63\.129\.16\/32/);
     assert.match(helper, /bot-hub-local-api-egress/);
     assert.match(helper, /replace_jump_first DOCKER-USER/);
     assert.match(helper, /replace_jump_first INPUT/);
