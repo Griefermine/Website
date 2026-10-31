@@ -223,9 +223,7 @@ const botApiPort =
 // ein anderer API-Endpunkt später versehentlich ohne Authentifizierung bleibt,
 // ist er über das Docker-Gateway nicht erreichbar.
 const botApiHandler = createInternalBotApiHandler(handler);
-const botApiServer = botApiGateway
-  ? createServerFactory(botApiHandler)
-  : null;
+const botApiServer = botApiGateway ? createServerFactory(botApiHandler) : null;
 
 // Ein belegter Port ist ein Bedienfehler, kein Absturz. Ohne diese Auswertung
 // steht hier ein halber Seitenfehler-Stack, der mehr irritiert als erklärt –
