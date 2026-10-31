@@ -331,6 +331,7 @@ describe('Lokale Firewall-Einrichtung', () => {
     assert.match(helper, /BOTHUB_LOCAL_EGRESS/);
     assert.match(helper, /BOTHUB_LOCAL_INPUT/);
     assert.match(helper, /DOCKER-USER/);
+    assert.match(helper, /net\.bridge\.bridge-nf-call-iptables/);
     assert.match(helper, /10\.0\.0\.0\/8/);
     assert.match(helper, /172\.16\.0\.0\/12/);
     assert.match(helper, /192\.168\.0\.0\/16/);
