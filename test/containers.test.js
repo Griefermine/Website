@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -125,7 +126,8 @@ describe('Container-Isolation', () => {
         if (vorherUrl === undefined) delete process.env.BOT_HUB_CONTAINER_URL;
         else process.env.BOT_HUB_CONTAINER_URL = vorherUrl;
       }
-    });
+    },
+  );
 
   it('prüft die exakten Eigenschaften des lokalen Docker-Netzes', () => {
     const network = {
@@ -305,6 +307,18 @@ describe('Interner Bot-API-Listener', () => {
 });
 
 describe('Lokale Firewall-Einrichtung', () => {
+  it('prüft die Bash-Syntax der beiden Isolationsskripte', () => {
+    if (process.platform !== 'linux') return;
+    execFileSync('bash', [
+      '-n',
+      join(ROOT, 'scripts/local-docker-firewall.sh'),
+    ]);
+    execFileSync('bash', [
+      '-n',
+      join(ROOT, 'scripts/setup-local-docker-isolation.sh'),
+    ]);
+  });
+
   it('nutzt eigene Ketten, blockiert private Ziele und erhält Docker-Ketten', () => {
     const helper = readFileSync(
       join(ROOT, 'scripts/local-docker-firewall.sh'),
