@@ -313,6 +313,10 @@ describe('Lokale Firewall-Einrichtung', () => {
       '-n',
       join(ROOT, 'scripts/setup-local-docker-isolation.sh'),
     ]);
+    execFileSync('bash', [
+      '-n',
+      join(ROOT, 'scripts/test-local-docker-isolation.sh'),
+    ]);
   });
 
   it('nutzt eigene Ketten, blockiert private Ziele und erhält Docker-Ketten', () => {
