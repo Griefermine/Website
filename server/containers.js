@@ -154,13 +154,19 @@ const containerNetwork = () => {
   if (network !== expected) {
     if (production)
       throw new Error(
-        'In Produktion ist nur das isolierte Netzwerk ' + PRODUCTION_BOT_NETWORK + ' erlaubt.',
+        'In Produktion ist nur das isolierte Netzwerk ' +
+          PRODUCTION_BOT_NETWORK +
+          ' erlaubt.',
       );
     if (!test)
       throw new Error(
-        'Im lokalen Betrieb ist ausschließlich das isolierte Netzwerk ' + LOCAL_BOT_NETWORK + ' erlaubt. Das Standardnetz bridge ist gesperrt.',
+        'Im lokalen Betrieb ist ausschließlich das isolierte Netzwerk ' +
+          LOCAL_BOT_NETWORK +
+          ' erlaubt. Das Standardnetz bridge ist gesperrt.',
       );
-    throw new Error('Im Testbetrieb wird ausschließlich das Testnetz bridge verwendet.');
+    throw new Error(
+      'Im Testbetrieb wird ausschließlich das Testnetz bridge verwendet.',
+    );
   }
   return network;
 };
@@ -448,9 +454,7 @@ const runLocalFirewall = (action) =>
   new Promise((resolve) => {
     const asRoot = process.getuid?.() === 0;
     const command = asRoot ? LOCAL_FIREWALL_HELPER : 'sudo';
-    const args = asRoot
-      ? [action]
-      : ['-n', LOCAL_FIREWALL_HELPER, action];
+    const args = asRoot ? [action] : ['-n', LOCAL_FIREWALL_HELPER, action];
     const child = spawn(command, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -461,9 +465,7 @@ const runLocalFirewall = (action) =>
     child.once('error', (error) =>
       resolve({ code: -1, stdout, stderr: error.message }),
     );
-    child.once('exit', (code) =>
-      resolve({ code: code ?? -1, stdout, stderr }),
-    );
+    child.once('exit', (code) => resolve({ code: code ?? -1, stdout, stderr }));
   });
 
 const ipv4Number = (value) => {
@@ -584,13 +586,17 @@ export const validateLocalBotNetwork = async () => {
   if (applied.code !== 0)
     throw new Error(
       'Die lokale Host-Firewall konnte nicht aktiviert werden. Bot-Container werden nicht gestartet. ' +
-        (applied.stderr.trim() || applied.stdout.trim() || 'Exit-Code ' + applied.code),
+        (applied.stderr.trim() ||
+          applied.stdout.trim() ||
+          'Exit-Code ' + applied.code),
     );
   const checked = await runLocalFirewall('check');
   if (checked.code !== 0)
     throw new Error(
       'Die lokale Host-Firewall konnte nicht verifiziert werden. Bot-Container werden nicht gestartet. ' +
-        (checked.stderr.trim() || checked.stdout.trim() || 'Exit-Code ' + checked.code),
+        (checked.stderr.trim() ||
+          checked.stdout.trim() ||
+          'Exit-Code ' + checked.code),
     );
   localBotGateway = gateway;
   return gateway;
