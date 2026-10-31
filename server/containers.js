@@ -24,6 +24,11 @@ const PRODUCTION_BOT_NETWORK = 'bot-hub-discord';
 const PRODUCTION_DEPENDENCY_NETWORK = 'bot-hub-dependencies';
 export const PRODUCTION_BOT_GATEWAY = '172.30.250.1';
 export const PRODUCTION_BOT_HUB_PORT = 8788;
+export const LOCAL_BOT_NETWORK = 'bot-hub-local';
+export const LOCAL_BOT_BRIDGE = 'br-bothublocal';
+export const LOCAL_BOT_HUB_PORT = 8788;
+const LOCAL_FIREWALL_HELPER = '/usr/local/sbin/bot-hub-local-firewall';
+let localBotGateway = null;
 const DISCORD_EGRESS_PROXY = 'http://172.30.250.1:3128';
 const DEPENDENCY_EGRESS_PROXY = 'http://172.30.251.1:3128';
 
@@ -132,12 +137,13 @@ export const writeWorkspaceFileNoFollow = (pfad, inhalt) => {
 const containerNetwork = () => {
   const configured = String(process.env.BOT_HUB_CONTAINER_NETWORK ?? '').trim();
   const production = process.env.NODE_ENV === 'production';
-  if (production && configured && configured !== PRODUCTION_BOT_NETWORK)
-    throw new Error(
-      `In Produktion ist nur das isolierte Netzwerk ${PRODUCTION_BOT_NETWORK} erlaubt.`,
-    );
-  const network =
-    configured || (production ? PRODUCTION_BOT_NETWORK : 'bridge');
+  const test = process.env.NODE_ENV === 'test';
+  const expected = production
+    ? PRODUCTION_BOT_NETWORK
+    : test
+      ? 'bridge'
+      : LOCAL_BOT_NETWORK;
+  const network = configured || expected;
   if (
     !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$/.test(network) ||
     network.toLowerCase() === 'host'
@@ -145,6 +151,23 @@ const containerNetwork = () => {
     throw new Error(
       'BOT_HUB_CONTAINER_NETWORK muss ein gültiger, vom Host-Netz verschiedener Docker-Netzwerkname sein.',
     );
+  if (network !== expected) {
+    if (production)
+      throw new Error(
+        'In Produktion ist nur das isolierte Netzwerk ' +
+          PRODUCTION_BOT_NETWORK +
+          ' erlaubt.',
+      );
+    if (!test)
+      throw new Error(
+        'Im lokalen Betrieb ist ausschließlich das isolierte Netzwerk ' +
+          LOCAL_BOT_NETWORK +
+          ' erlaubt. Das Standardnetz bridge ist gesperrt.',
+      );
+    throw new Error(
+      'Im Testbetrieb wird ausschließlich das Testnetz bridge verwendet.',
+    );
+  }
   return network;
 };
 
@@ -317,18 +340,30 @@ const sharedVolume = (projectRoot) => {
 };
 
 /**
- * `host.docker.internal` erlaubt einem Bot jeden Dienst auf dem Host – auch
- * SSH und andere lokal laufende Programme. In Produktion ist es deshalb
- * gesperrt; dort gibt es einen getrennten internen Hub-Listener.
+ * Ein frei konfigurierbarer Host-Gateway-Eintrag würde jedem Bot den Zugriff
+ * auf beliebige Host-Dienste erlauben. Der Hub stellt stattdessen einen
+ * eigenen Listener ausschließlich für /api/hub bereit.
  */
 const hostMapping = () => {
-  if (!String(process.env.BOT_HUB_CONTAINER_URL ?? '').trim()) return [];
-  if (process.env.NODE_ENV === 'production')
+  if (
+    process.env.NODE_ENV !== 'test' &&
+    String(process.env.BOT_HUB_CONTAINER_URL ?? '').trim()
+  )
     throw new Error(
-      'BOT_HUB_CONTAINER_URL ist in Produktion gesperrt, damit Bots keine Host-Dienste erreichen.',
+      'BOT_HUB_CONTAINER_URL ist nicht mehr zulässig. Bots erhalten ausschließlich die token-geschützte interne Bot-API.',
     );
-  return ['--add-host', 'host.docker.internal:host-gateway'];
+  return [];
 };
+
+const localIsolationArgs = () =>
+  process.env.NODE_ENV === 'production' || process.env.NODE_ENV === 'test'
+    ? []
+    : [
+        '--sysctl',
+        'net.ipv6.conf.all.disable_ipv6=1',
+        '--sysctl',
+        'net.ipv6.conf.default.disable_ipv6=1',
+      ];
 
 /**
  * Alles, was sich beim Erstellen nicht nachträglich ändern lässt, kommt hier
@@ -346,6 +381,7 @@ const containerSignature = (bot, projectRoot) =>
         sharedVolume(projectRoot).join(' '),
         hostMapping().join(' '),
         containerNetwork(),
+        ...localIsolationArgs(),
         'filesystem:read-only,tmpfs:/tmp:rw,nosuid,size=128m',
         'entrypoint:tail -f /dev/null',
       ].join('\u0000'),
@@ -375,6 +411,7 @@ export const containerCreateArgs = (bot, projectRoot) => [
   process.env.BOT_HUB_CONTAINER_CPUS || '2',
   '--network',
   containerNetwork(),
+  ...localIsolationArgs(),
   '--workdir',
   '/workspace',
   '--label',
@@ -413,6 +450,158 @@ const run = (args, { capture = false } = {}) =>
     );
   });
 
+const runLocalFirewall = (action) =>
+  new Promise((resolve) => {
+    const asRoot = process.getuid?.() === 0;
+    const command = asRoot ? LOCAL_FIREWALL_HELPER : 'sudo';
+    const args = asRoot ? [action] : ['-n', LOCAL_FIREWALL_HELPER, action];
+    const child = spawn(command, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (data) => (stdout += data));
+    child.stderr.on('data', (data) => (stderr += data));
+    child.once('error', (error) =>
+      resolve({ code: -1, stdout, stderr: error.message }),
+    );
+    child.once('exit', (code) => resolve({ code: code ?? -1, stdout, stderr }));
+  });
+
+const ipv4Number = (value) => {
+  const pieces = String(value ?? '').split('.');
+  const octets = pieces.map(Number);
+  if (
+    pieces.length !== 4 ||
+    pieces.some(
+      (piece, index) =>
+        !/^\d{1,3}$/.test(piece) ||
+        !Number.isInteger(octets[index]) ||
+        octets[index] < 0 ||
+        octets[index] > 255,
+    )
+  )
+    return null;
+  return octets.reduce((result, octet) => result * 256 + octet, 0) >>> 0;
+};
+
+/**
+ * Reine Netzwerkkonfigurationsprüfung – ohne Docker- oder Root-Zugriff testbar.
+ */
+export const validateLocalNetworkInspection = (network) => {
+  const options = network?.Options ?? {};
+  const config = network?.IPAM?.Config;
+  if (
+    network?.Name !== LOCAL_BOT_NETWORK ||
+    network?.Driver !== 'bridge' ||
+    network?.Scope !== 'local' ||
+    network?.Internal !== false ||
+    network?.EnableIPv6 !== false ||
+    options['com.docker.network.bridge.name'] !== LOCAL_BOT_BRIDGE ||
+    options['com.docker.network.bridge.enable_icc'] !== 'false' ||
+    options['com.docker.network.bridge.enable_ip_masquerade'] !== 'true' ||
+    !Array.isArray(config) ||
+    config.length !== 1
+  )
+    throw new Error(
+      `Docker-Netz ${LOCAL_BOT_NETWORK} fehlt oder entspricht nicht der lokalen Isolationskonfiguration.`,
+    );
+
+  const [addressing] = config;
+  const subnetMatch = /^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/.exec(
+    String(addressing?.Subnet ?? ''),
+  );
+  const gateway = String(addressing?.Gateway ?? '');
+  const subnetAddress = subnetMatch ? ipv4Number(subnetMatch[1]) : null;
+  const gatewayAddress = ipv4Number(gateway);
+  const prefix = subnetMatch ? Number(subnetMatch[2]) : -1;
+  if (
+    subnetAddress === null ||
+    gatewayAddress === null ||
+    prefix < 1 ||
+    prefix > 30
+  )
+    throw new Error(
+      `Docker-Netz ${LOCAL_BOT_NETWORK} hat keine gültige IPv4-Adresse mit Gateway.`,
+    );
+  const mask = (0xffffffff << (32 - prefix)) >>> 0;
+  // JavaScript bitwise operators return signed 32-bit integers. Normalize
+  // every intermediate address back to unsigned before comparing IPv4 values.
+  const networkAddress = (subnetAddress & mask) >>> 0;
+  const gatewayNetworkAddress = (gatewayAddress & mask) >>> 0;
+  const broadcastAddress = (networkAddress | (~mask >>> 0)) >>> 0;
+  if (
+    networkAddress !== gatewayNetworkAddress ||
+    gatewayAddress === networkAddress ||
+    gatewayAddress === broadcastAddress
+  )
+    throw new Error(
+      `Gateway ${gateway} liegt nicht als nutzbare Adresse im Subnetz ${addressing.Subnet}.`,
+    );
+  return { subnet: addressing.Subnet, gateway };
+};
+
+export const validateLocalBotNetwork = async () => {
+  if (
+    process.env.NODE_ENV === 'production' ||
+    process.env.NODE_ENV === 'test' ||
+    !containerRuntimeEnabled()
+  )
+    return null;
+  if (process.platform !== 'linux')
+    throw new Error(
+      'Die lokale Docker-Netzwerkisolation wird derzeit nur für native Linux-Docker-Engine unterstützt. Docker Desktop und Rootless Docker sind noch nicht freigegeben.',
+    );
+  if (process.getuid?.() === 0)
+    throw new Error(
+      'Bothub darf für die lokale Docker-Isolation nicht als root laufen. Starte den Hub als normalen Linux-Benutzer; Root-Rechte werden nur vom installierten Firewall-Helfer verwendet.',
+    );
+  if (RUNTIME !== 'docker')
+    throw new Error(
+      'Die lokale Netzwerkisolation unterstützt derzeit ausschließlich Docker Engine (BOT_HUB_CONTAINER_RUNTIME=docker).',
+    );
+  if (String(process.env.BOT_HUB_CONTAINER_URL ?? '').trim())
+    throw new Error(
+      'BOT_HUB_CONTAINER_URL ist gesperrt. Bots erhalten die Bot-API über das isolierte Docker-Gateway.',
+    );
+
+  const inspected = await run(
+    ['network', 'inspect', LOCAL_BOT_NETWORK, '--format', '{{json .}}'],
+    { capture: true },
+  );
+  if (inspected.code !== 0)
+    throw new Error(
+      `Docker-Netz ${LOCAL_BOT_NETWORK} fehlt. Führe scripts/setup-local-docker-isolation.sh aus. ${inspected.stderr.trim()}`,
+    );
+  let network;
+  try {
+    network = JSON.parse(inspected.stdout.trim());
+  } catch {
+    throw new Error(
+      `Docker-Netz ${LOCAL_BOT_NETWORK} lieferte keine lesbare Inspect-Konfiguration.`,
+    );
+  }
+  const { gateway } = validateLocalNetworkInspection(network);
+  const applied = await runLocalFirewall('apply');
+  if (applied.code !== 0)
+    throw new Error(
+      'Die lokale Host-Firewall konnte nicht aktiviert werden. Bot-Container werden nicht gestartet. ' +
+        (applied.stderr.trim() ||
+          applied.stdout.trim() ||
+          'Exit-Code ' + applied.code),
+    );
+  const checked = await runLocalFirewall('check');
+  if (checked.code !== 0)
+    throw new Error(
+      'Die lokale Host-Firewall konnte nicht verifiziert werden. Bot-Container werden nicht gestartet. ' +
+        (checked.stderr.trim() ||
+          checked.stdout.trim() ||
+          'Exit-Code ' + checked.code),
+    );
+  localBotGateway = gateway;
+  return gateway;
+};
+
 const exists = async (name) => {
   const result = await run(['container', 'inspect', name]);
   return result.code === 0;
@@ -440,15 +629,19 @@ const containerLabel = async (name) => {
 export const ensureContainer = async (bot, projectRoot) => {
   const name = nameOf(bot);
   if (await exists(name)) {
-    // Container aus älteren Hub-Versionen kennen weder den /shared-Mount noch
-    // das Konfigurations-Label. Sie werden ersetzt, damit die Volume-Liste
-    // beim Create feststeht. Läuft gerade ein Bot darin, wird nicht ersetzt –
-    // ein laufender Prozess soll nicht unter den Füßen weggezogen werden.
-    if (
-      (await containerLabel(name)) !== containerSignature(bot, projectRoot) &&
-      !bot.child
-    )
-      await run(['rm', '--force', name]);
+    const existingSignature = await containerLabel(name);
+    if (existingSignature !== containerSignature(bot, projectRoot)) {
+      // Ein Container aus dem alten bridge-Profil darf nicht weiterlaufen.
+      if (bot.child)
+        throw new Error(
+          `Container ${name} verwendet eine ältere Netzwerkkonfiguration. Bot stoppen und Hub neu starten, bevor er erneut gestartet wird.`,
+        );
+      const removed = await run(['rm', '--force', name], { capture: true });
+      if (removed.code !== 0 && (await exists(name)))
+        throw new Error(
+          `Veralteter Container ${name} konnte nicht entfernt werden: ${removed.stderr.trim() || `Exit-Code ${removed.code}`}`,
+        );
+    }
   }
   if (!(await exists(name))) {
     const result = await run(containerCreateArgs(bot, projectRoot), {
@@ -1044,12 +1237,14 @@ export const dependencyRunArgs = (bot, projectRoot, dir, command, env = {}) => {
 export const containerRuntimeName = () => RUNTIME;
 export const containerHubUrl = () =>
   process.env.NODE_ENV === 'production'
-    ? `http://${PRODUCTION_BOT_GATEWAY}:${PRODUCTION_BOT_HUB_PORT}`
-    : String(
-        process.env.BOT_HUB_CONTAINER_URL ||
+    ? 'http://' + PRODUCTION_BOT_GATEWAY + ':' + PRODUCTION_BOT_HUB_PORT
+    : localBotGateway
+      ? 'http://' + localBotGateway + ':' + LOCAL_BOT_HUB_PORT
+      : String(
           process.env.BOT_HUB_URL ||
-          `http://127.0.0.1:${process.env.PORT || 8787}`,
-      ).replace(/\/+$/, '');
+            'http://127.0.0.1:' + (process.env.PORT || 8787),
+        ).replace(/\/+$/, '');
+
 export const containerRuntimeEnabled = () =>
   process.env.BOT_HUB_TEST_MODE !== '1' &&
   process.env.BOT_HUB_CONTAINER_MODE !== 'disabled';

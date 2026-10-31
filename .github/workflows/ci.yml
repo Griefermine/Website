@@ -147,6 +147,27 @@ jobs:
   # Provisionierer wie im Betrieb) und brauchen deshalb nur Docker, das auf dem
   # Runner vorhanden ist. Ohne diesen Job wäre `npm test` eine Aussage über
   # SQLite – und die Datenbank ist der Teil, der Geheimnisse hält.
+  lokale-netzwerkisolation:
+    name: Lokale Docker-Netzwerkisolation (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Docker-Engine prüfen
+        run: |
+          docker info
+          iptables --version
+          command -v python3
+          command -v curl
+
+      # Dieser Job läuft auf einer wegwerfbaren Linux-VM. Er richtet
+      # ausschließlich projektbezogene Firewall-Ketten ein und entfernt sie
+      # am Ende per EXIT-Trap wieder. So testen wir echte Paketfilterung statt
+      # nur Docker-Konfigurationsstrings zu vergleichen.
+      - name: Reale Netzwerk-Isolation testen
+        run: bash scripts/test-local-docker-isolation.sh
+
   datenbank:
     name: Datenbank-Integration (MySQL)
     runs-on: ubuntu-latest

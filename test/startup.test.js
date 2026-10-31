@@ -48,7 +48,11 @@ const spawnHub = (env) => {
  * Prozess danach beenden. Schneller als auf das (nicht eintretende) Ende.
  */
 const startAndRead = async (env) => {
-  const { child, out } = spawnHub(env);
+  const { child, out } = spawnHub({
+    NODE_ENV: 'test',
+    BOT_HUB_TEST_MODE: '1',
+    ...env,
+  });
   try {
     await Promise.race([
       once(child.stdout, 'data'),
@@ -98,6 +102,16 @@ describe('Startschutz für unsichere Konfiguration', () => {
     assert.match(out, /Produktionsbetrieb darf nicht auf 0\.0\.0\.0 lauschen/);
   });
 
+  it('bricht außerhalb der Testumgebung ab, wenn Container abgeschaltet sind', async () => {
+    const { code, out } = await startHub({
+      NODE_ENV: 'development',
+      BOT_HUB_CONTAINER_MODE: 'disabled',
+    });
+    assert.equal(code, 1);
+    assert.match(out, /ABBRUCH: Container sind abgeschaltet/);
+    assert.match(out, /nicht unisoliert auf dem Host laufen/);
+  });
+
   it('startet mit Testmodus, wenn NODE_ENV=test gesetzt ist', async () => {
     const out = await startAndRead({
       NODE_ENV: 'test',
@@ -107,21 +121,12 @@ describe('Startschutz für unsichere Konfiguration', () => {
     assert.ok(!out.includes('ABBRUCH'));
   });
 
-  it('warnt, wenn Bot-Prozesse den Hub nicht erreichen können', async () => {
-    const ohneUrl = await startAndRead({
+  it('empfiehlt keinen uneingeschränkten Host-Zugriff für Bot-Container', async () => {
+    const out = await startAndRead({
       BOT_HUB_URL: 'http://127.0.0.1:8787',
     });
-    assert.match(ohneUrl, /BOT_HUB_CONTAINER_URL ist nicht gesetzt/);
-    assert.match(ohneUrl, /127\.0\.0\.1 im Container/);
-
-    const mitUrl = await startAndRead({
-      BOT_HUB_URL: 'http://127.0.0.1:8787',
-      BOT_HUB_CONTAINER_URL: 'http://host.docker.internal:8787',
-    });
-    assert.ok(
-      !mitUrl.includes('BOT_HUB_CONTAINER_URL ist nicht gesetzt'),
-      'Hinweis erscheint trotz gesetzter Container-URL',
-    );
+    assert.doesNotMatch(out, /host\.docker\.internal/);
+    assert.doesNotMatch(out, /BOT_HUB_CONTAINER_URL ist nicht gesetzt/);
   });
 });
 
