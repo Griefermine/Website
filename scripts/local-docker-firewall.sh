@@ -23,6 +23,7 @@ network_facts() {
   command -v docker >/dev/null 2>&1 || die "docker fehlt."
   command -v python3 >/dev/null 2>&1 || die "python3 fehlt."
   command -v ip >/dev/null 2>&1 || die "iproute2 fehlt."
+  command -v sysctl >/dev/null 2>&1 || die "sysctl fehlt."
   command -v "$IPT" >/dev/null 2>&1 || die "iptables fehlt."
   local json facts
   json="$(docker network inspect --format '{{json .}}' "$NETWORK" 2>/dev/null)" ||
@@ -75,6 +76,11 @@ PY
   [ "$ICC" = "false" ] || die "Docker-Bridge-Peer-Kommunikation ist nicht abgeschaltet."
   [ "$MASQ" = "true" ] || die "IP-Masquerading muss für öffentlichen Ausgang aktiviert sein."
   ip -o link show dev "$BRIDGE" >/dev/null 2>&1 || die "Bridge-Interface $BRIDGE fehlt."
+  local bridge_nf
+  bridge_nf="$(sysctl -n net.bridge.bridge-nf-call-iptables 2>/dev/null)" ||
+    die "net.bridge.bridge-nf-call-iptables ist nicht verfügbar; br_netfilter muss geladen sein."
+  [ "$bridge_nf" = "1" ] ||
+    die "net.bridge.bridge-nf-call-iptables muss auf 1 stehen, sonst können Bridge-Peer-Regeln umgangen werden."
 
   # Docker's automatic address pool does not know every manually configured
   # VPN/LAN route. Refuse an overlap instead of silently shadowing that route.
