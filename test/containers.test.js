@@ -338,7 +338,7 @@ describe('Lokale Firewall-Einrichtung', () => {
     assert.match(helper, /replace_jump_first INPUT/);
     assert.doesNotMatch(helper, /iptables[^\n]*-F DOCKER-USER/);
     assert.match(setup, /modprobe br_netfilter/);
-    assert.match(setup, /net\.bridge\.bridge-nf-call-iptables=1/);
+    assert.match(setup, /net\.bridge\.bridge-nf-call-iptables\s*=\s*1/);
     assert.match(setup, /com\.docker\.network\.bridge\.enable_icc=false/);
     assert.match(
       setup,
