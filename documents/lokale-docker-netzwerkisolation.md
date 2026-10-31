@@ -53,7 +53,7 @@ Die Bot-Container veröffentlichen keine Ports und erhalten keinen `host.docker.
    sudo BOT_HUB_USER="$USER" bash scripts/setup-local-docker-isolation.sh
    ```
 
-   Das Skript erstellt das Netzwerk, installiert den kleinen Firewall-Helfer root-eigen nach `/usr/local/sbin/bot-hub-local-firewall`, richtet eng begrenzte sudoers-Rechte für `apply` und `check` ein und installiert einen systemd-Drop-in, der die Firewall nach einem Docker-Daemon-Start erneut anwendet. Kann die Firewall dort nicht angewendet werden, gilt der Docker-Dienststart als fehlgeschlagen.
+   Das Skript lädt `br_netfilter`, persistiert das Modul und setzt `net.bridge.bridge-nf-call-iptables=1` über eine eigene Datei in `/etc/sysctl.d/`. Diese Host-weite Kernel-Einstellung sorgt dafür, dass Bridge-Pakete die vorgesehenen iptables-Filter durchlaufen. Anschließend erstellt es das Netzwerk, installiert den root-eigenen Firewall-Helfer unter `/usr/local/sbin/bot-hub-local-firewall`, richtet eng begrenzte sudoers-Rechte für `apply` und `check` ein und installiert einen systemd-Drop-in, der die Firewall nach einem Docker-Daemon-Start erneut anwendet. Kann die Firewall dort nicht angewendet werden, gilt der Docker-Dienststart als fehlgeschlagen.
 
 3. Anschließend Bothub wie gewohnt als normaler Hub-Benutzer starten.
 
