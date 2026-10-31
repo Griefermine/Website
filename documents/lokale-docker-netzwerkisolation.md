@@ -29,6 +29,7 @@ Das Netzwerk heißt `bot-hub-local`, die Linux-Bridge `br-bothublocal`.
 
 Erwartete Docker-Eigenschaften:
 
+<!-- prettier-ignore -->
 | Eigenschaft | Sollwert |
 |---|---|
 | Driver | `bridge` |
