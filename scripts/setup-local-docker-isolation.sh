@@ -27,7 +27,7 @@ case "$TARGET_USER" in
   *[!a-zA-Z0-9_.-]*|'') die "Ungültiger Benutzername." ;;
 esac
 
-for command_name in docker iptables ip python3 systemctl visudo install; do
+for command_name in docker iptables ip python3 sysctl systemctl visudo install; do
   command -v "$command_name" >/dev/null 2>&1 || die "$command_name fehlt."
 done
 
