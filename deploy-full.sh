@@ -123,19 +123,10 @@ log_info "Step 3: Docker installieren..."
 if ! command -v docker &> /dev/null; then
     log_info "Docker wird installiert..."
     
-    # Docker's offizielles GPG-Key hinzufügen
-    install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    chmod a+r /etc/apt/keyrings/docker.gpg
-    
-    # Docker Repository hinzufügen
-    echo \
-      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-      tee /etc/apt/sources.list.d/docker.list > /dev/null
-    
-    apt update
-    apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    # Distributionseigene, von APT signierte Pakete verwenden. Dadurch werden
+    # keine externen Installationsskripte oder ungeprüften Repository-Schlüssel
+    # als root ausgeführt.
+    apt install -y docker.io docker-compose-v2
     
     # Docker für aktuellen User aktivieren (falls nicht root)
     if [ -n "$SUDO_USER" ]; then
@@ -156,18 +147,19 @@ log_info "Step 4: Node.js 22 installieren..."
 if ! command -v node &> /dev/null; then
     log_info "Node.js wird installiert..."
     
-    # NodeSource Repository hinzufügen
-    # Maßnahme 41 (Audit SC-09): curl | bash auf root ist per Definition
-    # Blindvertrauen in den Auslieferer. Getragen wird das bewusst: die
-    # Nodesource-Domäne ist der einzige offizielle Weg, der Key landet als
-    # apt-keyring (nachträglich prüfbar: `apt-key fingerprint` bzw.
-    # `/etc/apt/keyrings/nodesource.gpg`), und alle weiteren Pakete kommen
-    # signiert aus dem so angebundenen Repo. Ein Hash-Pin würde bei jedem
-    # Upstream-Update brechen.
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-    
+    # Nur das distributionseigene, von APT signierte Paket verwenden. Falls
+    # die Distribution keine unterstützte Node.js-Version bereitstellt, wird
+    # der Lauf abgebrochen statt ein fremdes Root-Installationsskript
+    # auszuführen.
     apt install -y nodejs
     
+    NODE_VERSION=$(node -v)
+    MAJOR=$(echo "$NODE_VERSION" | cut -d'v' -f2 | cut -d'.' -f1)
+    if [ "$MAJOR" -lt 22 ]; then
+        log_error "Die Distribution stellt nur Node.js $NODE_VERSION bereit; benötigt wird Node.js 22+."
+        exit 1
+    fi
+
     log_success "Node.js $(node -v) installiert"
 else
     NODE_VERSION=$(node -v)
@@ -176,7 +168,8 @@ else
     # Prüfen, ob Version 22+
     MAJOR=$(echo $NODE_VERSION | cut -d'v' -f2 | cut -d'.' -f1)
     if [ "$MAJOR" -lt 22 ]; then
-        log_warn "Node.js Version ist < 22. Empfohlen wird Node.js 22+"
+        log_error "Node.js Version ist < 22. Bitte eine Distribution mit Node.js 22+ verwenden."
+        exit 1
     fi
 fi
 

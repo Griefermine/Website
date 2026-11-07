@@ -124,16 +124,17 @@ Besuchen Sie: `https://ihre-domain.de`
 ### Docker manuell installieren
 
 ```bash
-curl -fsSL https://get.docker.com -o get-docker.sh
-sudo sh get-docker.sh
+sudo apt update
+sudo apt install -y docker.io docker-compose-v2
 sudo usermod -aG docker $USER
 ```
 
 ### Node.js 22 manuell installieren
 
 ```bash
-curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt update
 sudo apt install -y nodejs
+node --version  # muss 22.x oder höher sein
 ```
 
 ### Docker-Netzwerk manuell einrichten
